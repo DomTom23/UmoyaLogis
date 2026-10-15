@@ -168,15 +168,16 @@ def test_truck_route_and_costs_with_vias():
     assert r0.is_real and len(r0.legs) == len(v.stops) - 1
     req = fake_valhalla.REQUESTS[-1]
     assert req["costing"] == "truck" and req["costing_options"]["truck"]["weight"] == 40
-    assert [p["type"] for p in req["locations"]] == ["break"] * len(v.stops)
+    assert len(fake_valhalla.REQUESTS) == len(v.stops) - 1  # jedno zapytanie na odcinek
+    assert [p["type"] for p in req["locations"]] == ["break", "break"]
     e0 = evaluate_route(v, r0, CostParams())
     assert abs(e0["loaded_km"] + e0["empty_km"] - r0.km) < 1e-6
     # przeciągnięcie fragmentu odcinka 0 -> punkt via, trasa dłuższa, koszty przeliczone
     mid = r0.legs[0].shape[len(r0.legs[0].shape) // 2]
     vias = apply_edit([], {"action": "add_via", "leg": 0, "lat": mid[0] + 3, "lon": mid[1] + 3}, r0)
     r1 = route_for_variant(v, vias, truck, "valhalla", "", url, 65)
-    types = [p["type"] for p in fake_valhalla.REQUESTS[-1]["locations"]]
-    assert types[:3] == ["break", "through", "break"]
+    types = [p["type"] for p in fake_valhalla.REQUESTS[-len(v.stops) + 1]["locations"]]
+    assert types == ["break", "through", "break"]
     e1 = evaluate_route(v, r1, CostParams())
     assert r1.km > r0.km and e1["total"] > e0["total"] and e1["profit"] < e0["profit"]
     # przesunięcie i usunięcie
@@ -251,3 +252,40 @@ def test_clean_edited_recomputes_status_and_drops_blank():
     df.loc[len(df)] = [None] * len(df.columns)  # pusty wiersz dodany w edytorze
     out = clean_edited(df)
     assert len(out) == 2 and list(out.status) == ["OK", "OK"] and out.id.is_unique
+
+
+def test_valhalla_per_leg_requests_and_split_over_limit():
+    srv, url = fake_valhalla.start()
+    from ltl.routing import route_valhalla
+    # trasa łącznie > 1500 km, ale każdy odcinek < 1500 km: osobne zapytania, brak błędu
+    pts = [{"lat": 52.5, "lon": 13.4}, {"lat": 48.9, "lon": 2.35}, {"lat": 45.7, "lon": 4.8}, {"lat": 41.4, "lon": 2.2}]
+    fake_valhalla.REQUESTS.clear()
+    r = route_valhalla(pts, TruckProfile(), url)
+    assert r.is_real and len(r.legs) == 3 and len(fake_valhalla.REQUESTS) == 3 and r.km > 1500
+    # pojedynczy odcinek > 1500 km: dzielony na połowy (Lizbona - Warszawa ~ 2800 km)
+    far = [{"lat": 38.7, "lon": -9.1}, {"lat": 52.2, "lon": 21.0}]
+    r = route_valhalla(far, TruckProfile(), url)
+    assert r.is_real and len(r.legs) == 1 and r.km > 3000 and r.straight_legs == []
+    # odcinek niemożliwy do podzielenia (>1500 km nawet po 3 podziałach nie dotyczy; tu serwer zawsze odrzuca)
+    srv.shutdown()
+
+
+def test_partial_route_falls_back_per_leg():
+    from ltl.routing import route_valhalla, RoutingHTTPError
+    import ltl.routing as rt
+    orig = rt._valhalla_request
+
+    def flaky(group, truck, base_url):
+        if group[0]["lat"] > 60:
+            raise RoutingHTTPError("HTTP 400: brak drogi")
+        return orig(group, truck, base_url)
+
+    srv, url = fake_valhalla.start()
+    rt._valhalla_request = flaky
+    try:
+        pts = [{"lat": 52.5, "lon": 13.4}, {"lat": 48.9, "lon": 2.35}, {"lat": 61.0, "lon": 2.0}, {"lat": 61.5, "lon": 3.0}]
+        r = route_valhalla(pts, TruckProfile(), url)
+        assert r.has_real and not r.is_real and r.straight_legs == [2] and len(r.legs) == 3
+    finally:
+        rt._valhalla_request = orig
+        srv.shutdown()

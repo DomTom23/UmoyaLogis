@@ -28,6 +28,11 @@
   const send = (type, data) => window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, data), "*");
   let map, layer, lastFit = null, args = null;
 
+  function busy(text) {
+    const p = document.getElementById("panel");
+    if (p) p.insertAdjacentHTML("afterbegin", "<div class='banner' id='busy'>" + text + "</div>");
+  }
+
   function emit(ev) {
     ev.nonce = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
     ev.map_id = args.map_id;
@@ -72,9 +77,12 @@
   }
 
   function legLine(shape, i) {
-    const line = L.polyline(shape, {color: "#1f77b4", weight: 6, opacity: .85}).addTo(layer);
+    const straight = (args.straight || []).includes(i);
+    const base = straight ? {color: "#e08a00", weight: 6, opacity: .9, dashArray: "10 8"}
+                          : {color: "#1f77b4", weight: 6, opacity: .85};
+    const line = L.polyline(shape, base).addTo(layer);
     line.on("mouseover", () => line.setStyle({weight: 9, opacity: 1}));
-    line.on("mouseout", () => line.setStyle({weight: 6, opacity: .85}));
+    line.on("mouseout", () => line.setStyle({weight: 6, opacity: base.opacity}));
     line.on("mousedown", (e) => {
       L.DomEvent.stop(e);
       const start = e.containerPoint;
@@ -90,6 +98,9 @@
         map.removeLayer(ghost);
         const ll = map.mouseEventToLatLng(ev);
         if (start.distanceTo(map.mouseEventToContainerPoint(ev)) > 6) {
+          L.marker(ll, {icon: L.divIcon({className: "", iconSize: [14, 14], iconAnchor: [7, 7],
+                        html: "<div class='via'></div>"}), interactive: false}).addTo(layer);
+          busy("Przeliczanie trasy…");
           emit({action: "add_via", leg: i, lat: ll.lat, lon: ll.lng});
         }
       };
@@ -110,9 +121,9 @@
         draggable: true, zIndexOffset: 400,
         icon: L.divIcon({className: "", iconSize: [14, 14], iconAnchor: [7, 7], html: "<div class='via'></div>"})
       }).addTo(layer);
-      m.on("dragend", () => { const ll = m.getLatLng(); emit({action: "move_via", id: v.id, lat: ll.lat, lon: ll.lng}); });
-      m.on("dblclick", () => emit({action: "remove_via", id: v.id}));
-      m.on("contextmenu", () => emit({action: "remove_via", id: v.id}));
+      m.on("dragend", () => { const ll = m.getLatLng(); busy("Przeliczanie trasy…"); emit({action: "move_via", id: v.id, lat: ll.lat, lon: ll.lng}); });
+      m.on("dblclick", () => { busy("Przeliczanie trasy…"); emit({action: "remove_via", id: v.id}); });
+      m.on("contextmenu", () => { busy("Przeliczanie trasy…"); emit({action: "remove_via", id: v.id}); });
       m.bindTooltip("Punkt pośredni (dwuklik = usuń)");
     });
     args.stops.forEach((s, i) => { pin(s, i + 1).addTo(layer); all.push([s.lat, s.lon]); });

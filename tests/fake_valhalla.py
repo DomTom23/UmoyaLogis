@@ -20,6 +20,16 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         REQUESTS.append(body)
         locs = body["locations"]
+        total_m = sum(float(haversine_km(a["lat"], a["lon"], b["lat"], b["lon"])) * 1250
+                      for a, b in zip(locs, locs[1:]))
+        if total_m > 1_500_000:
+            err = json.dumps({"error_code": 154, "error": "Path distance exceeds the max distance limit: "
+                              "1500000 meters", "status_code": 400, "status": "Bad Request"}).encode()
+            self.send_response(400)
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            self.wfile.write(err)
+            return
         legs, cur = [], [locs[0]]
         for p in locs[1:]:
             cur.append(p)

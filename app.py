@@ -49,7 +49,7 @@ def get_route(v, vias, force: bool = False) -> RouteResult:
     if not force and sig in store:
         return store[sig]
     res = route_for_variant(v, vias, truck, provider, ors_key, valhalla_url, speed)
-    if res.is_real:
+    if res.has_real:
         store[sig] = res
     return res
 
@@ -171,7 +171,7 @@ if st.button("Przelicz TOP po rzeczywistych trasach", help="Jedno zapytanie rout
     with st.spinner("Wyznaczanie tras…"):
         for v in variants:
             r = get_route(v, [])
-            if r.is_real:
+            if r.has_real:
                 st.session_state.reroute[_variant_key(v)] = evaluate_route(v, r, cost)
 real = st.session_state.reroute
 if real and all(_variant_key(v) in real for v in variants):
@@ -195,10 +195,15 @@ vias = st.session_state.vias.get(vkey, [])
 route = get_route(v, vias)
 ev = evaluate_route(v, route, cost)
 
-if not route.is_real:
+if not route.has_real:
     why = f" ({route.error})" if route.error else ""
     st.warning(f"Brak routingu po drogach{why}. Pokazana trasa i koszty są orientacyjne "
                f"(linia prosta × {ROAD_FACTOR}).")
+elif route.straight_legs:
+    legs_txt = ", ".join(str(i + 1) for i in route.straight_legs)
+    st.warning(f"Odcinki {legs_txt} liczone linią prostą × {ROAD_FACTOR} - serwer nie wyznaczył drogi "
+               f"({route.error}). Przeciągnij linię tego odcinka na mapie, by dodać punkt pośredni na drodze "
+               "i podzielić go, albo użyj własnego serwera Valhalla (publiczny ma limit 1500 km na zapytanie).")
 else:
     st.success(f"Trasa po drogach dla ciężarówek · {route.provider} · {route.km:,.0f} km · "
                f"{route.hours:.1f} h jazdy wg silnika tras")
