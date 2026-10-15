@@ -222,3 +222,32 @@ def test_timocom_vertical_copy():
     assert (df.iloc[5].weight_t, df.iloc[5].price_eur, df.iloc[5].distance_km) == (23.9, 1460, 547)
     assert (df.iloc[6].weight_t, df.iloc[6].ldm, df.iloc[6].price_eur) == (0.05, 0.5, 600)
     assert df.iloc[8].end_postal == "MK42 7AA" and df.iloc[8].status == "Do negocjacji"
+
+
+# ------------------------------------------------------------ elastyczne wczytywanie
+import io
+from ltl.ingest import clean_edited, parse_sources, read_uploaded
+
+
+def test_ingest_csv_xlsx_and_encodings():
+    csv_semicolon = "start;cel;data;t;ldm;km;cena\nFR 77140 Nemours;GB G1 1 Glasgow;12.03.2026;22,0;13,6;1176;2500,00 EUR\n"
+    df = parse_sources([read_uploaded("o.csv", csv_semicolon.encode("cp1250"))])
+    assert len(df) == 1 and df.iloc[0].price_eur == 2500 and df.iloc[0].end_postal == "G1 1"
+    book = pd.DataFrame([["FR 77140 Nemours", "GB G1 1 Glasgow", "12.03.2026", "22,0", "13,6", "1176", "2500,00 EUR"]])
+    buf = io.BytesIO()
+    book.to_excel(buf, index=False, header=False)
+    df = parse_sources([read_uploaded("o.xlsx", buf.getvalue())])
+    assert len(df) == 1 and df.iloc[0].distance_km == 1176
+
+
+def test_parse_sources_merges_formats_and_renumbers():
+    df = parse_sources([TIMOCOM_TAB, "", TRANSEU])
+    assert len(df) == 4 and df.id.is_unique and set(df.source) == {"Timocom", "Trans.eu"}
+
+
+def test_clean_edited_recomputes_status_and_drops_blank():
+    df = parse_sources([TIMOCOM_TAB])
+    df.loc[1, "price_eur"] = 900.0          # uzupełniona ręcznie cena
+    df.loc[len(df)] = [None] * len(df.columns)  # pusty wiersz dodany w edytorze
+    out = clean_edited(df)
+    assert len(out) == 2 and list(out.status) == ["OK", "OK"] and out.id.is_unique

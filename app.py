@@ -10,7 +10,7 @@ from ltl.costs import CostParams, profit
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.mapview import route_map
 from ltl.optimizer import OptimizerParams, find_best_combinations, variants_to_frame
-from ltl.parsers import parse_orders
+from ltl.ingest import clean_edited, parse_sources, read_uploaded
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
 from ltl.routing import VALHALLA_URL, RouteResult, TruckProfile
 
@@ -28,10 +28,14 @@ def _route_store() -> dict:
     return {}
 
 
-@st.cache_data(show_spinner="Rozpoznawanie zleceń i geokodowanie kodów pocztowych…")
-def _prepare(text: str, online: bool, drop_no_price: bool) -> pd.DataFrame:
-    df = parse_orders(text, "Auto", drop_without_price=drop_no_price)  # źródło zawsze wykrywane automatycznie
-    return add_coordinates(df, _geocoder(online)) if not df.empty else df
+@st.cache_data(show_spinner="Rozpoznawanie zleceń…")
+def _parse(texts: tuple, drop_no_price: bool) -> pd.DataFrame:
+    return parse_sources(list(texts), drop_without_price=drop_no_price)  # format każdego źródła wykrywany automatycznie
+
+
+@st.cache_data(show_spinner="Geokodowanie kodów pocztowych…")
+def _coords(df: pd.DataFrame, online: bool) -> pd.DataFrame:
+    return add_coordinates(df, _geocoder(online))
 
 
 def _variant_key(v) -> str:
@@ -53,8 +57,11 @@ def get_route(v, vias, force: bool = False) -> RouteResult:
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("Dane z giełdy")
-    raw_text = st.text_area("Wklej surowe dane Timocom / Trans.eu (Ctrl+V)", height=260,
+    raw_text = st.text_area("Wklej surowe dane Timocom / Trans.eu (Ctrl+V)", height=220,
                             help="Format (Timocom lub Trans.eu) jest rozpoznawany automatycznie.")
+    files = st.file_uploader("…lub dodaj pliki (txt, csv, tsv, xlsx)", type=["txt", "csv", "tsv", "xlsx", "xls"],
+                             accept_multiple_files=True,
+                             help="Wklejony tekst i pliki są łączone; każde źródło może mieć inny format.")
     online = st.checkbox("Geokoduj kody pocztowe online", value=True,
                          help="zippopotam.us + Nominatim; bez sieci używane są środki krajów (mało dokładne).")
     drop_no_price = st.checkbox("Pomiń zlecenia bez ceny", value=False)
@@ -102,15 +109,37 @@ st.caption(f"Zestaw: 13,6 LDM / 24 t. Ranking wariantów: dystans szacowany (lin
            "trasa wybranego wariantu: rzeczywista, po drogach dla ciężarówek. "
            "Trasa kończy się na ostatnim rozładunku, bez powrotu.")
 
-if not raw_text.strip():
-    st.info("Wklej dane z Timocom lub Trans.eu w panelu bocznym.")
+texts = [raw_text] + [read_uploaded(f.name, f.getvalue()) for f in files]
+if not any(t.strip() for t in texts):
+    st.info("Wklej dane z Timocom lub Trans.eu albo dodaj plik w panelu bocznym.")
     st.stop()
 
-orders = _prepare(raw_text, online, drop_no_price)
-if orders.empty:
+parsed = _parse(tuple(texts), drop_no_price)
+if parsed.empty:
     st.error("Nie rozpoznano żadnych zleceń. Upewnij się, że w danych są kody w formacie „kraj kod” "
              "(np. FR 77140, GB G1 1) dla startu i celu każdego zlecenia.")
     st.stop()
+
+st.subheader(f"Zlecenia ({len(parsed)}) · wykryte źródło: {', '.join(sorted(set(parsed['source'])))}")
+st.caption("Tabelę można poprawiać: popraw błędnie odczytane pola, uzupełnij brakujące ceny, "
+           "dodaj wiersz lub usuń zaznaczony. Zmiany od razu trafiają do optymalizacji.")
+sig = hash(tuple(texts)) ^ int(drop_no_price)
+edited = st.data_editor(
+    parsed, key=f"orders_{sig}", num_rows="dynamic", width="stretch", hide_index=True,
+    disabled=["id", "source", "status", "defaults_used"],
+    column_config={
+        "load_date": st.column_config.DateColumn("load_date"), "unload_date": st.column_config.DateColumn("unload_date"),
+        "weight_t": st.column_config.NumberColumn("weight_t", min_value=0.0, max_value=40.0, format="%.2f"),
+        "ldm": st.column_config.NumberColumn("ldm", min_value=0.0, max_value=13.6, format="%.2f"),
+        "distance_km": st.column_config.NumberColumn("distance_km", min_value=0.0, format="%.0f"),
+        "price_eur": st.column_config.NumberColumn("price_eur", min_value=0.0, format="%.0f"),
+    },
+)
+orders = clean_edited(edited)
+if orders.empty:
+    st.warning("Brak poprawnych wierszy (potrzebne: kraj i kod pocztowy startu oraz celu).")
+    st.stop()
+orders = _coords(orders, online)
 
 est = haversine_km(orders.start_lat, orders.start_lon, orders.end_lat, orders.end_lon) * ROAD_FACTOR
 orders["distance_est_km"] = est.round(0)
@@ -120,12 +149,12 @@ orders["profit_single_eur"] = [
     for p, d in zip(orders["price_eur"], dist_used)
 ]
 
-st.subheader(f"Zlecenia ({len(orders)}) · wykryte źródło: {orders['source'].iloc[0]}")
 if not orders["geo_precise"].all():
     st.warning("Część kodów pocztowych nie została zgeokodowana - użyto środka kraju, "
                "więc odległości i trasy są mocno przybliżone (kolumny *_geo = 'kraj').")
-shown = orders.drop(columns=["start_lat", "start_lon", "end_lat", "end_lon", "geo_precise"])
-st.dataframe(shown, width="stretch", hide_index=True)
+with st.expander("Szczegóły: geokodowanie, dystans szacowany, zysk pojedynczych zleceń"):
+    st.dataframe(orders.drop(columns=["start_lat", "start_lon", "end_lat", "end_lon", "geo_precise"]),
+                 width="stretch", hide_index=True)
 
 variants, stats = find_best_combinations(orders, cost, opt)
 st.subheader("TOP warianty LTL")

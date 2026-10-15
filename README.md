@@ -29,3 +29,9 @@ własny serwer: zmienna `VALHALLA_URL`, OpenRouteService: `ORS_API_KEY`). Po prz
 aplikacja wyznacza trasę ponownie przez nowy punkt i przelicza dystans pełny/pusty, czas i koszty.
 Gdy silnik tras jest nieosiągalny, pokazywana jest trasa orientacyjna (linie proste × 1,3) z ostrzeżeniem.
 Źródło danych (Timocom / Trans.eu) jest zawsze wykrywane automatycznie.
+
+## Wczytywanie danych
+
+Dane można wkleić i/lub dodać jako pliki (txt, csv, tsv, xlsx) - wiele źródeł naraz, każde w swoim
+formacie (Timocom, Trans.eu, także kopia z polami w osobnych liniach). Rozpoznane zlecenia widać w edytowalnej
+tabeli: popraw błędnie odczytane pola, uzupełnij ceny, dodaj lub usuń wiersze - zmiany od razu wchodzą do optymalizacji.
