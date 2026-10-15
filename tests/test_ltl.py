@@ -111,3 +111,94 @@ def test_geocoder_offline_fallback():
     g = Geocoder(online=False, cache_path=None)
     df = add_coordinates(parse_orders(TRANSEU, "Trans.eu"), g)
     assert df.start_lat.notna().all() and not df.geo_precise.any()
+
+
+def test_parser_variants():
+    # kolumny rozdzielone spacjami, kraj-kod bez spacji, waga w kg, cena z symbolem €
+    spaced = "FR77140 Nemours   GB G1 1 Glasgow   12.03.2026   24000 kg   13,6 ldm   1.450 km   € 1.850\n"
+    df = parse_orders(spaced)
+    r = df.iloc[0]
+    assert (r.start_postal, r.end_postal, r.weight_t, r.ldm, r.distance_km, r.price_eur) == ("77140", "G1 1", 24.0, 13.6, 1450, 1850)
+    # obie lokalizacje w jednej komórce, stare oznaczenia krajów, kody wieloczłonowe
+    one = "D-80331 München → NL 1234 AB Utrecht | 10 t | 5,0 m | 900 km | 700 EUR"
+    r = parse_orders(one).iloc[0]
+    assert (r.start_country, r.start_postal, r.start_city) == ("DE", "80331", "München")
+    assert (r.end_country, r.end_postal, r.end_city) == ("NL", "1234 AB", "Utrecht")
+    assert (r.weight_t, r.ldm, r.distance_km, r.price_eur) == (10, 5.0, 900, 700)
+    # liczby bez jednostek w kolumnach (waga, LDM, dystans, cena)
+    bare = "PT 1000-001 Lisboa\tES 28001 Madrid\t14.03.\t12\t6\t640\t520\n"
+    r = parse_orders(bare).iloc[0]
+    assert (r.start_postal, r.weight_t, r.ldm, r.distance_km, r.price_eur) == ("1000-001", 12, 6, 640, 520)
+    assert str(r.load_date).endswith("-03-14")
+
+
+def test_parser_many_blocks_and_noise():
+    text = "Oferty (3)\nSortuj: cena\n" + TRANSEU + "\nStrona 1 z 2\n"
+    df = parse_orders(text)
+    assert list(df.start_postal) == ["44027", "00-001"]
+    assert df.iloc[0].price_eur == 1200
+
+
+# ------------------------------------------------------------ routing / edycja trasy
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import fake_valhalla
+from ltl.route_edit import Via, apply_edit, build_points, evaluate_route, route_for_variant
+from ltl.routing import TruckProfile, compute_route, decode_polyline, encode_polyline
+
+
+def _variant():
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500)]
+    v, _ = find_best_combinations(_orders(rows), CostParams(), OptimizerParams(max_detour_km=800))
+    return v[0]
+
+
+def test_polyline_roundtrip():
+    pts = [(52.5, 13.4), (48.9, 2.35), (-33.86, 151.2)]
+    out = decode_polyline(encode_polyline(pts))
+    assert all(abs(a - c) < 1e-6 and abs(b - d) < 1e-6 for (a, b), (c, d) in zip(pts, out))
+
+
+def test_truck_route_and_costs_with_vias():
+    srv, url = fake_valhalla.start()
+    v = _variant()
+    fake_valhalla.REQUESTS.clear()
+    truck = TruckProfile(gross_weight_t=40, height_m=4.0)
+    r0 = route_for_variant(v, [], truck, "valhalla", "", url, 65)
+    assert r0.is_real and len(r0.legs) == len(v.stops) - 1
+    req = fake_valhalla.REQUESTS[-1]
+    assert req["costing"] == "truck" and req["costing_options"]["truck"]["weight"] == 40
+    assert [p["type"] for p in req["locations"]] == ["break"] * len(v.stops)
+    e0 = evaluate_route(v, r0, CostParams())
+    assert abs(e0["loaded_km"] + e0["empty_km"] - r0.km) < 1e-6
+    # przeciągnięcie fragmentu odcinka 0 -> punkt via, trasa dłuższa, koszty przeliczone
+    mid = r0.legs[0].shape[len(r0.legs[0].shape) // 2]
+    vias = apply_edit([], {"action": "add_via", "leg": 0, "lat": mid[0] + 3, "lon": mid[1] + 3}, r0)
+    r1 = route_for_variant(v, vias, truck, "valhalla", "", url, 65)
+    types = [p["type"] for p in fake_valhalla.REQUESTS[-1]["locations"]]
+    assert types[:3] == ["break", "through", "break"]
+    e1 = evaluate_route(v, r1, CostParams())
+    assert r1.km > r0.km and e1["total"] > e0["total"] and e1["profit"] < e0["profit"]
+    # przesunięcie i usunięcie
+    moved = apply_edit(vias, {"action": "move_via", "id": vias[0].id, "lat": mid[0], "lon": mid[1]}, r1)
+    assert (moved[0].lat, moved[0].lon) == mid
+    assert apply_edit(moved, {"action": "remove_via", "id": moved[0].id}, r1) == []
+    srv.shutdown()
+
+
+def test_routing_fallback_when_unreachable():
+    v = _variant()
+    r = route_for_variant(v, [], TruckProfile(), "valhalla", "", "http://127.0.0.1:9", 65)
+    assert not r.is_real and r.error and r.km > 0 and len(r.legs) == len(v.stops) - 1
+
+
+def test_via_order_follows_leg_shape():
+    v = _variant()
+    r = compute_route(build_points(v, []), TruckProfile(), "none")
+    shape = r.legs[0].shape
+    a, b = shape[-1], shape[0]
+    p1 = ((a[0] * 3 + b[0]) / 4 + 1, (a[1] * 3 + b[1]) / 4)
+    p2 = ((a[0] + b[0] * 3) / 4 + 1, (a[1] + b[1] * 3) / 4)
+    vias = apply_edit([], {"action": "add_via", "leg": 0, "lat": p1[0], "lon": p1[1]}, r)
+    vias = apply_edit(vias, {"action": "add_via", "leg": 0, "lat": p2[0], "lon": p2[1]}, r)
+    assert (vias[0].lat, vias[1].lat) == (p2[0], p1[0])  # p2 jest bliżej początku odcinka

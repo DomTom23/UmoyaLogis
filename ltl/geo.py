@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -53,6 +55,8 @@ class Geocoder:
 
     def __init__(self, online: bool = True, cache_path: Optional[Path] = DEFAULT_CACHE, timeout: float = 3.0):
         self.online = online
+        self.nominatim_ok = online
+        self._last_nominatim = 0.0
         self.timeout = timeout
         self.cache_path = Path(cache_path) if cache_path else None
         self._cache: dict[str, list] = {}
@@ -82,6 +86,23 @@ class Geocoder:
             self.online = False  # brak sieci: nie męczymy się kolejnymi timeoutami
             return None
 
+    def _fetch_nominatim(self, country: str, postal: str) -> Optional[tuple[float, float]]:
+        """Drugie źródło (dokładniejsze dla kodów, których nie zna zippopotam); limit 1 zapytania/s."""
+        wait = 1.1 - (time.monotonic() - self._last_nominatim)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_nominatim = time.monotonic()
+        q = urllib.parse.urlencode({"format": "jsonv2", "limit": 1, "postalcode": postal, "country": country})
+        req = urllib.request.Request(f"https://nominatim.openstreetmap.org/search?{q}",
+                                     headers={"User-Agent": "UmoyaLogis-LTL/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                hits = json.load(resp)
+            return (float(hits[0]["lat"]), float(hits[0]["lon"])) if hits else None
+        except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError):
+            self.nominatim_ok = False
+            return None
+
     def locate(self, country: str, postal: str) -> tuple[float, float, str]:
         code = self._query_code(country, postal)
         key = f"{country}|{code}"
@@ -90,6 +111,12 @@ class Geocoder:
             return lat, lon, "cache"
         if self.online and re.fullmatch(r"[A-Z0-9\-]{2,10}", code):
             hit = self._fetch(country, code)
+            if hit:
+                self._cache[key] = list(hit)
+                self._dirty = True
+                return hit[0], hit[1], "online"
+        if self.nominatim_ok:
+            hit = self._fetch_nominatim(country, postal.strip())
             if hit:
                 self._cache[key] = list(hit)
                 self._dirty = True

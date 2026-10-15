@@ -1,24 +1,32 @@
-"""Mapa Folium dla wybranego wariantu: zielone = załadunek, czerwone = rozładunek."""
+"""Interaktywna mapa wariantu (Leaflet jako komponent Streamlit).
+
+* zielone pinezki = załadunki, czerwone = rozładunki, linia = trasa po drogach (ciężarówka),
+* przeciągnięcie fragmentu linii tworzy punkt pośredni (via); punkty można przesuwać
+  (dragend) i usuwać (dwuklik / PPM); zdarzenia wracają do Pythona, który przelicza trasę i koszty.
+"""
 from __future__ import annotations
 
-import folium
+from pathlib import Path
+
+import streamlit.components.v1 as components
 
 from .optimizer import Variant
+from .route_edit import Via
+from .routing import RouteResult
+
+_component = components.declare_component("ltl_route_map", path=str(Path(__file__).parent / "map_component"))
 
 
-def build_map(variant: Variant) -> folium.Map:
-    pts = [(s.lat, s.lon) for s in variant.stops]
-    m = folium.Map(location=pts[0], zoom_start=5, tiles="OpenStreetMap")
-    folium.PolyLine(pts, color="#1f77b4", weight=4, opacity=0.8,
-                    tooltip=f"{variant.total_km:.0f} km").add_to(m)
-    for n, s in enumerate(variant.stops, start=1):
-        load = s.kind == "L"
-        folium.Marker(
-            (s.lat, s.lon),
-            popup=f"{n}. {'Załadunek' if load else 'Rozładunek'} {s.order_id}<br>{s.country} {s.postal} {s.city}",
-            tooltip=f"{n}. {s.order_id} {'↑' if load else '↓'} {s.country} {s.postal}",
-            icon=folium.Icon(color="green" if load else "red", icon="arrow-up" if load else "arrow-down",
-                             prefix="fa"),
-        ).add_to(m)
-    m.fit_bounds(pts, padding=(30, 30))
-    return m
+def route_map(variant: Variant, route: RouteResult, vias: list[Via], *, map_id: str, fit_id: str,
+              height: int = 600, key: str | None = None):
+    """Rysuje mapę i zwraca ostatnie zdarzenie edycji (dict) lub None."""
+    stops = [{"lat": s.lat, "lon": s.lon, "kind": s.kind,
+              "label": f"{s.order_id} · {s.country} {s.postal} {s.city}".strip()} for s in variant.stops]
+    banner = "" if route.is_real else "Trasa orientacyjna - brak routingu po drogach"
+    return _component(
+        stops=stops,
+        legs=[[list(p) for p in leg.shape] for leg in route.legs],
+        vias=[{"id": v.id, "lat": v.lat, "lon": v.lon} for v in vias],
+        banner=banner, map_id=map_id, fit_id=fit_id, height=height,
+        key=key, default=None,
+    )

@@ -1,14 +1,19 @@
 """Moduł 1: parsowanie surowego tekstu z giełd transportowych (Timocom, Trans.eu).
 
-Oba parsery działają na tej samej zasadzie: tekst jest dzielony na "komórki"
-(tabulacje / nowe linie), a każda komórka jest klasyfikowana wyrażeniami
-regularnymi (lokalizacja, data, waga, LDM, dystans, cena).
+Jeden, tolerancyjny parser rozpoznaje oba układy (źródło wykrywane automatycznie):
+
+* **wiersz** (Timocom, tabela): start i cel w tej samej linii, pozostałe pola w kolumnach
+  rozdzielonych tabulacją / min. 3 spacjami / znakiem "|",
+* **blok** (Trans.eu): start, data, cel, data, "waga t · nadwozie", km, cena w osobnych liniach.
+
+Wyciągane są lokalizacje (kraj + kod pocztowy + miasto), daty, waga, LDM, dystans i cena
+(liczby w formatach 1 200 | 1.200,50 | 1,200.50, waga także w kg).
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from typing import Optional
 
 import pandas as pd
@@ -20,8 +25,10 @@ COUNTRIES = set(
     "AL AT BA BE BG BY CH CY CZ DE DK EE ES FI FR GB GR HR HU IE IS IT LI LT LU "
     "LV MA MD ME MK MT NL NO PL PT RO RS RU SE SI SK TR UA XK".split()
 )
-# kraje, w których kod pocztowy bywa dwuczłonowy ("GB G1 1", "NL 1234 AB")
-_TWO_PART_POSTAL = {"GB", "NL", "IE", "CA"}
+# stare oznaczenia jednoliterowe, akceptowane tylko z myślnikiem: "D-80331"
+_ONE_LETTER = {"D": "DE", "F": "FR", "I": "IT", "A": "AT", "B": "BE", "E": "ES", "H": "HU",
+               "L": "LU", "N": "NO", "P": "PT", "S": "SE", "CH": "CH"}
+_SPACED_5 = {"SE", "CZ", "SK", "GR"}   # "123 45"
 
 COLUMNS = [
     "id", "source", "start_country", "start_postal", "start_city",
@@ -29,15 +36,28 @@ COLUMNS = [
     "weight_t", "ldm", "distance_km", "price_eur", "status", "defaults_used",
 ]
 
-_LOCATION_RE = re.compile(r"^\s*([A-Z]{2})[\s\-:]+(\S.*?)\s*$")
-_DATE_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.?(\d{2,4})?\b")
-_DATE_SLASH_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
-_TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
-_NUM = r"\d[\d\s., ']*"
-_DIST_RE = re.compile(rf"({_NUM}?)\s*km\b", re.I)
-_PRICE_RE = re.compile(rf"({_NUM}?)\s*(?:EUR|€)|(?:EUR|€)\s*({_NUM})", re.I)
-_NEGOTIABLE_RE = re.compile(r"negoc|verhandl|na\s+zapytanie|request|ask|vb\b", re.I)
-_BARE_DECIMAL_RE = re.compile(r"^\d{1,2}[.,]\d{1,2}$")
+_LOC_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:(?P<cc>[A-Z]{2})(?![A-Za-z])|(?P<c1>[A-Z])(?=-\d))[\s\-:]{0,2}"
+    r"(?P<p1>(?=[A-Z0-9\-]*\d)[A-Z0-9][A-Z0-9\-]{1,9})(?![\w:])"
+)
+_P2_RE = re.compile(r" (\d[A-Z]{0,2}|[A-Z]{2}|\d{2})(?![\w:])")
+_CITY_STOP_RE = re.compile(r"\s+[-–—]\s+|[→>|;]|\s\d|\s*\(|\s{2,}")
+
+_NUM = r"\d[\d\s., ']*?"
+_DATE_A = re.compile(r"(?<![\d.,])(\d{1,2})\.(\d{1,2})\.(\d{4}|\d{2})?(?!\d)")
+_DATE_B = re.compile(r"(?<![\d.,])(\d{1,2})\.(0[1-9]|1[0-2])(?![\d.,])")
+_DATE_ISO = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_DATE_SL = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})\b")
+_DIST_RE = re.compile(rf"({_NUM})\s*km\b", re.I)
+_NUM_STRICT = r"\d{1,3}(?:[ .,']\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?"
+_PRICE_RE = re.compile(rf"({_NUM})\s*(?:EUR|€)|(?:EUR|€)\s*({_NUM_STRICT})", re.I)
+_KG_RE = re.compile(rf"(?<![\w.,])({_NUM})\s*kg\b", re.I)
+_TON_RE = re.compile(r"(?<![\w.,])(\d+(?:[.,]\d+)?)\s*(?:t|tn|ton|tony|tons|tonnes)\b(?!\w)", re.I)
+_LDM_RE = re.compile(
+    r"(?<![\w.,])(\d{1,2}(?:[.,]\d{1,2})?)\s*(?:ldm|lm|m\b)|\bldm\s*[:=]?\s*(\d{1,2}(?:[.,]\d{1,2})?)", re.I)
+_BARE_RE = re.compile(r"^\d{1,5}(?:[.,]\d{1,2})?$")
+_NEGOTIABLE_RE = re.compile(r"negoc|verhandl|na\s+zapytanie|request|\bask\b|\bvb\b", re.I)
+_CELL_SPLIT_RE = re.compile(r"\t|\s{3,}|\s\|\s|\|")
 
 
 @dataclass
@@ -52,7 +72,8 @@ class RawOrder:
     distance_km: Optional[float] = None
     price_eur: Optional[float] = None
     negotiable: bool = False
-    seen: list = field(default_factory=list)
+    row: bool = False                       # start i cel w jednej linii
+    loose: list = field(default_factory=list)  # liczby bez jednostek
 
 
 # ---------------------------------------------------------------- helpers
@@ -72,7 +93,6 @@ def parse_number(text: str) -> Optional[float]:
     elif "," in s or "." in s:
         sep = "," if "," in s else "."
         head, _, tail = s.rpartition(sep)
-        # "1.200" / "1,200" (dokładnie 3 cyfry po separatorze, wiele grup) = tysiące
         if s.count(sep) > 1 or (len(tail) == 3 and head and len(head) <= 3 and sep == "."):
             s = s.replace(sep, "")
         else:
@@ -83,201 +103,201 @@ def parse_number(text: str) -> Optional[float]:
         return None
 
 
+def find_locations(text: str) -> list[tuple[int, int, tuple]]:
+    """Wszystkie lokalizacje w tekście: [(początek, koniec, (kraj, kod, miasto)), ...]."""
+    found = []
+    for m in _LOC_RE.finditer(text):
+        country = m.group("cc") or _ONE_LETTER.get(m.group("c1"))
+        if country not in COUNTRIES:
+            continue
+        postal, end = m.group("p1"), m.end()
+        if postal.isdigit() and len(postal) < 3:
+            continue
+        if not any(ch.isdigit() for ch in postal):
+            continue
+        p2 = _P2_RE.match(text, end)
+        if p2:
+            extra = p2.group(1)
+            ok = (
+                (country in ("GB", "IE") and re.fullmatch(r"\d[A-Z]{0,2}|[A-Z]\d{1,2}", extra))
+                or (country == "NL" and re.fullmatch(r"[A-Z]{2}", extra) and postal.isdigit())
+                or (country in _SPACED_5 and postal.isdigit() and len(postal) == 3 and len(extra) == 2 and extra.isdigit())
+            )
+            if ok:
+                postal, end = f"{postal} {extra}", p2.end()
+        found.append((m.start(), end, (country, postal, "")))
+    # miasto = tekst do następnej lokalizacji / separatora
+    out = []
+    for i, (s, e, loc) in enumerate(found):
+        limit = found[i + 1][0] if i + 1 < len(found) else len(text)
+        tail = text[e:limit]
+        cut = _CITY_STOP_RE.search(tail)
+        city = (tail[: cut.start()] if cut else tail).strip(" ,-–—·")
+        if not re.search(r"[^\W\d_]", city) or len(city) > 40:
+            city = ""
+        out.append((s, e, (loc[0], loc[1], city)))
+    return out
+
+
 def parse_location(cell: str) -> Optional[tuple]:
     """'FR 77140 Nemours' -> ('FR', '77140', 'Nemours'); 'GB G1 1' -> ('GB', 'G1 1', '')."""
-    m = _LOCATION_RE.match(cell)
-    if not m or m.group(1) not in COUNTRIES:
-        return None
-    country, rest = m.group(1), m.group(2)
-    tokens = rest.split()
-    if not tokens or not any(ch.isdigit() for ch in tokens[0]):
-        return None
-    postal = tokens[0]
-    idx = 1
-    if country in _TWO_PART_POSTAL and len(tokens) > 1 and re.fullmatch(r"\d[A-Z]{0,2}|[A-Z]{2}", tokens[1]):
-        postal += " " + tokens[1]
-        idx = 2
-    city = " ".join(tokens[idx:])
-    return country, postal, city
+    locs = find_locations(cell)
+    return locs[0][2] if locs else None
 
 
-def parse_date(text: str, today: Optional[date] = None) -> Optional[date]:
-    today = today or date.today()
-    m = _DATE_SLASH_RE.search(text)
-    if m:
-        try:
-            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            return None
-    m = _DATE_RE.search(text)
-    if not m:
-        return None
-    day, month, year = int(m.group(1)), int(m.group(2)), m.group(3)
-    if year is None:
-        y = today.year
-    else:
-        y = int(year)
-        if y < 100:
-            y += 2000
+def _mk_date(d: int, m: int, y: Optional[str], today: date) -> Optional[date]:
+    year = today.year if not y else int(y) + (2000 if len(y) == 2 else 0)
     try:
-        return date(y, month, day)
+        return date(year, m, d)
     except ValueError:
         return None
 
 
-def _find_dates(cell: str) -> list[date]:
-    out = []
-    for m in list(_DATE_SLASH_RE.finditer(cell)) + list(_DATE_RE.finditer(cell)):
-        d = parse_date(m.group(0))
-        if d:
+def find_dates(text: str, today: Optional[date] = None) -> list[date]:
+    today = today or date.today()
+    hits = []
+    for m in _DATE_ISO.finditer(text):
+        hits.append((m.start(), _mk_date(int(m[3]), int(m[2]), m[1], today)))
+    for m in _DATE_A.finditer(text):
+        hits.append((m.start(), _mk_date(int(m[1]), int(m[2]), m[3], today)))
+    for m in _DATE_B.finditer(text):
+        hits.append((m.start(), _mk_date(int(m[1]), int(m[2]), None, today)))
+    for m in _DATE_SL.finditer(text):
+        hits.append((m.start(), _mk_date(int(m[1]), int(m[2]), m[3], today)))
+    seen, out = set(), []
+    for pos, d in sorted(hits, key=lambda h: h[0]):
+        if d and (pos not in seen):
+            seen.add(pos)
             out.append(d)
     return out
 
 
-def _first_number(regex: re.Pattern, cell: str) -> Optional[float]:
-    m = regex.search(cell)
-    if not m:
-        return None
+def parse_date(text: str, today: Optional[date] = None) -> Optional[date]:
+    d = find_dates(text, today)
+    return d[0] if d else None
+
+
+def _group_number(m: re.Match) -> Optional[float]:
     for g in m.groups():
         if g and g.strip():
             return parse_number(g)
     return None
 
 
-def _split_cells(text: str) -> list[str]:
-    cells = []
-    for line in text.replace("\r", "").split("\n"):
-        for c in line.split("\t"):
-            c = c.strip()
-            if c:
-                cells.append(c)
-    return cells
-
-
 # ------------------------------------------------------- cell classifier
 
-def _absorb(order: RawOrder, cell: str) -> None:
-    """Przypisuje pola z komórki (lub linii) do zlecenia. Pierwsze trafienie wygrywa."""
-    # dystans i cena najpierw, żeby "1250 km" nie było brane za wagę itd.
-    if order.distance_km is None:
-        v = _first_number(_DIST_RE, cell)
-        if v is not None:
-            order.distance_km = v
-    if order.price_eur is None:
-        v = _first_number(_PRICE_RE, cell)
-        if v is not None:
-            order.price_eur = v
-    if _NEGOTIABLE_RE.search(cell) and order.price_eur is None:
+def _absorb(order: RawOrder, cell: str, *, phase: str) -> None:
+    """Przypisuje pola z fragmentu tekstu do zlecenia. Pierwsze trafienie wygrywa.
+
+    phase: 'row' (dowolna liczba dat: załadunek, rozładunek) | 'load' | 'unload'.
+    """
+    cell = cell.strip()
+    if not cell:
+        return
+    if order.distance_km is None and (m := _DIST_RE.search(cell)):
+        order.distance_km = _group_number(m)
+    if order.price_eur is None and (m := _PRICE_RE.search(cell)):
+        order.price_eur = _group_number(m)
+    if order.price_eur is None and _NEGOTIABLE_RE.search(cell):
         order.negotiable = True
 
-    stripped = _DIST_RE.sub(" ", _PRICE_RE.sub(" ", cell))
-    if order.ldm is None:
-        m = re.search(rf"({_NUM}?)\s*(?:ldm|m\s*ład\w*)\b|\b(\d{{1,2}}[.,]\d{{1,2}})\s*m\b", stripped, re.I)
-        if m:
-            order.ldm = parse_number(m.group(1) or m.group(2))
-    if order.weight_t is None:
-        # tylko jednostki 't' / 'ton' - "24 t · Plandeka", "24,0 t"
-        m = re.search(r"(?<![\w.,])(\d+(?:[.,]\d+)?)\s*(?:t|ton|tony|tons)\b(?!\w)", stripped, re.I)
-        if m:
-            order.weight_t = parse_number(m.group(1))
+    rest = _DIST_RE.sub(" ", _PRICE_RE.sub(" ", cell))
+    if order.weight_t is None and (m := _KG_RE.search(rest)):
+        kg = parse_number(m.group(1))
+        order.weight_t = kg / 1000 if kg else None
+        rest = _KG_RE.sub(" ", rest)
+    if order.weight_t is None and (m := _TON_RE.search(rest)):
+        order.weight_t = parse_number(m.group(1))
+    if order.ldm is None and (m := _LDM_RE.search(rest)):
+        order.ldm = _group_number(m)
+    rest_ton = _TON_RE.sub(" ", _LDM_RE.sub(" ", rest))
 
-    for d in _find_dates(cell):
-        if order.load_date is None:
-            order.load_date = d
-        elif order.unload_date is None:
-            order.unload_date = d
+    dates = find_dates(cell)
+    if dates:
+        if phase == "load":
+            order.load_date = order.load_date or dates[0]
+        elif phase == "unload":
+            order.unload_date = order.unload_date or dates[0]
+        else:
+            for d in dates:
+                if order.load_date is None:
+                    order.load_date = d
+                elif order.unload_date is None:
+                    order.unload_date = d
+    elif _BARE_RE.match(rest_ton.strip()):
+        order.loose.append(parse_number(rest_ton))
 
 
-# ---------------------------------------------------------------- Timocom
+def _resolve_loose(o: RawOrder) -> None:
+    """Liczby bez jednostek (kolumny tabeli Timocom): waga, LDM (małe), dystans, cena (duże)."""
+    small = [x for x in o.loose if x is not None and x <= 40]
+    big = [x for x in o.loose if x is not None and x > 40]
+    if o.weight_t is None and small:
+        o.weight_t = small.pop(0)
+    if o.ldm is None and small:
+        o.ldm = small.pop(0)
+    if o.distance_km is None and big:
+        o.distance_km = big.pop(0)
+    if o.price_eur is None and big and not o.negotiable:
+        o.price_eur = big.pop(0)
 
-def _parse_timocom_row(cells: list[str]) -> Optional[RawOrder]:
-    order = RawOrder()
-    loose = []
-    for cell in cells:
-        loc = parse_location(cell)
-        if loc:
-            if order.start is None:
-                order.start = loc
-            elif order.end is None:
-                order.end = loc
+
+# --------------------------------------------------------------- parser
+
+def parse_raw(text: str) -> list[RawOrder]:
+    """Rozpoznaje zlecenia w układzie wierszowym i blokowym (także mieszanym)."""
+    text = text.replace("\r", "").replace(" ", " ").replace(" ", " ")
+    orders: list[RawOrder] = []
+    cur: Optional[RawOrder] = None
+
+    for line in text.split("\n"):
+        if not line.strip():
             continue
-        before = (order.load_date, order.weight_t, order.ldm, order.distance_km, order.price_eur)
-        _absorb(order, cell)
-        if before == (order.load_date, order.weight_t, order.ldm, order.distance_km, order.price_eur):
-            loose.append(cell)
-    # samotne liczby w kolumnach, np. "24,0" (waga) i "13,60" (LDM) - Timocom w tabeli
-    # często podaje je bez jednostek; kolejność kolumn: waga, metry ładowe.
-    bare = [parse_number(c) for c in loose if _BARE_DECIMAL_RE.match(c)]
-    bare = [b for b in bare if b is not None]
-    if order.weight_t is None and bare:
-        order.weight_t = bare.pop(0)
-    if order.ldm is None and bare:
-        order.ldm = bare.pop(0)
-    if order.start and order.end:
-        return order
-    return None
+        cells = [c.strip() for c in _CELL_SPLIT_RE.split(line) if c.strip()]
+        locs, rests = [], []
+        for cell in cells:
+            found = find_locations(cell)
+            locs += [f[2] for f in found]
+            # usuń lokalizacje, resztę komórki oddaj klasyfikatorowi
+            pieces, pos = [], 0
+            for s, e, _ in found:
+                pieces.append(cell[pos:s])
+                pos = e
+            pieces.append(cell[pos:])
+            rests.append(" ".join(p for p in pieces if p.strip()))
 
-
-def _parse_timocom_stream(cells: list[str]) -> list[RawOrder]:
-    """Tryb dla wklejki, w której pola leżą w osobnych liniach (bez tabulacji)."""
-    orders, cur = [], None
-    for cell in cells:
-        loc = parse_location(cell)
-        if loc:
+        if len(locs) >= 2:                      # wiersz tabeli
+            cur = RawOrder(start=locs[0], end=locs[1], row=True)
+            orders.append(cur)
+            phase = "row"
+        elif len(locs) == 1:                    # blok: start albo cel
             if cur is None or (cur.start and cur.end):
-                if cur is not None:
-                    orders.append(cur)
-                cur = RawOrder(start=loc)
-            elif cur.end is None:
-                cur.end = loc
-            continue
-        if cur is not None:
-            _absorb(cur, cell)
-    if cur is not None:
-        orders.append(cur)
-    return [o for o in orders if o.start and o.end]
+                cur = RawOrder(start=locs[0])
+                orders.append(cur)
+            else:
+                cur.end = locs[0]
+            phase = "load" if cur.end is None else "unload"
+        else:
+            if cur is None:
+                continue
+            phase = "row" if cur.row else ("load" if cur.end is None else "unload")
+        for r in rests:
+            _absorb(cur, r, phase=phase)
+
+    done = []
+    for o in orders:
+        if o.start and o.end and o.start[:2] != o.end[:2]:
+            _resolve_loose(o)
+            done.append(o)
+    return done
 
 
 def parse_timocom(text: str) -> list[RawOrder]:
-    lines = [ln for ln in text.replace("\r", "").split("\n") if ln.strip()]
-    if any("\t" in ln for ln in lines):
-        orders = []
-        for ln in lines:
-            row = _parse_timocom_row([c.strip() for c in ln.split("\t") if c.strip()])
-            if row:
-                orders.append(row)
-        if orders:
-            return orders
-    return _parse_timocom_stream(_split_cells(text))
+    return [o for o in parse_raw(text) if o.row]
 
-
-# ---------------------------------------------------------------- Trans.eu
 
 def parse_transeu(text: str) -> list[RawOrder]:
-    """Bloki: adres startu, data/czas, adres celu, data/czas, 'waga t · nadwozie', km, cena."""
-    orders, cur = [], None
-    for cell in _split_cells(text):
-        loc = parse_location(cell)
-        if loc:
-            if cur is None or (cur.start and cur.end):
-                if cur is not None:
-                    orders.append(cur)
-                cur = RawOrder(start=loc)
-            elif cur.end is None:
-                cur.end = loc
-            continue
-        if cur is None:
-            continue
-        if cur.end is not None and cur.unload_date is None and _find_dates(cell) and cur.load_date:
-            cur.unload_date = _find_dates(cell)[0]
-            continue
-        if cur.start and cur.end is None and _find_dates(cell) and cur.load_date is None:
-            cur.load_date = _find_dates(cell)[0]
-            continue
-        _absorb(cur, cell)
-    if cur is not None:
-        orders.append(cur)
-    return [o for o in orders if o.start and o.end]
+    return [o for o in parse_raw(text) if not o.row]
 
 
 # --------------------------------------------------------------- DataFrame
@@ -332,14 +352,11 @@ def to_dataframe(
 
 
 def parse_orders(text: str, source: str = "Auto", **kwargs) -> pd.DataFrame:
-    """source: 'Timocom' | 'Trans.eu' | 'Auto' (wybiera parser, który znajdzie więcej zleceń)."""
+    """Źródło ('Timocom' / 'Trans.eu') jest wykrywane automatycznie (source='Auto')."""
     if not text or not text.strip():
         return pd.DataFrame(columns=COLUMNS)
-    if source == "Timocom":
-        return to_dataframe(parse_timocom(text), "Timocom", **kwargs)
-    if source == "Trans.eu":
-        return to_dataframe(parse_transeu(text), "Trans.eu", **kwargs)
-    # Timocom wkleja się jako tabela (tabulacje), Trans.eu jako bloki w liniach
-    if "\t" in text:
-        return to_dataframe(parse_timocom(text), "Timocom", **kwargs)
-    return to_dataframe(parse_transeu(text), "Trans.eu", **kwargs)
+    raw = parse_raw(text)
+    if source == "Auto":
+        rows = sum(o.row for o in raw)
+        source = "Timocom" if rows >= len(raw) - rows else "Trans.eu"
+    return to_dataframe(raw, source, **kwargs)

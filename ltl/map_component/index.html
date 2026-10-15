@@ -1,0 +1,140 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="leaflet.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; font-family: system-ui, sans-serif; }
+  #map { position: absolute; inset: 0; background: #e8eef3; }
+  .pin { width: 26px; height: 26px; border-radius: 50%; color: #fff; font: 700 12px/26px system-ui;
+         text-align: center; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+  .pin.L { background: #1a9850; } .pin.U { background: #d73027; }
+  .via { width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 3px solid #1f4e9c;
+         box-shadow: 0 1px 3px rgba(0,0,0,.5); cursor: grab; }
+  .ghost { width: 14px; height: 14px; border-radius: 50%; background: #ffd24d; border: 3px solid #1f4e9c; }
+  .panel { background: rgba(255,255,255,.93); padding: 6px 9px; border-radius: 6px; font-size: 12px;
+           box-shadow: 0 1px 5px rgba(0,0,0,.3); line-height: 1.4; }
+  .panel button { font: inherit; cursor: pointer; margin-top: 4px; }
+  .banner { color: #8a4b00; font-weight: 600; }
+  .leaflet-interactive { cursor: crosshair; }
+  .leaflet-bar a, .leaflet-bar a:hover { background: #fff; color: #222; text-decoration: none; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="leaflet.js"></script>
+<script>
+(function () {
+  const send = (type, data) => window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, data), "*");
+  let map, layer, lastFit = null, args = null;
+
+  function emit(ev) {
+    ev.nonce = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    ev.map_id = args.map_id;
+    send("streamlit:setComponentValue", {value: ev, dataType: "json"});
+  }
+
+  function init() {
+    map = L.map("map", {zoomControl: true, doubleClickZoom: false}).setView([50, 10], 5);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 18, attribution: "© OpenStreetMap"
+    }).addTo(map);
+    layer = L.layerGroup().addTo(map);
+
+    const Panel = L.Control.extend({
+      options: {position: "topright"},
+      onAdd: function () {
+        const d = L.DomUtil.create("div", "panel");
+        d.id = "panel";
+        L.DomEvent.disableClickPropagation(d);
+        return d;
+      }
+    });
+    new Panel().addTo(map);
+  }
+
+  function updatePanel() {
+    const p = document.getElementById("panel");
+    let html = "<b>Edycja trasy</b><br>Przeciągnij fragment linii, aby zmienić przebieg.<br>" +
+               "Punkt pośredni: przeciągnij = przesuń, dwuklik = usuń.";
+    if (args.banner) html += "<div class='banner'>" + args.banner + "</div>";
+    html += "<br><button id='reset'>Wyczyść punkty pośrednie</button>";
+    p.innerHTML = html;
+    document.getElementById("reset").onclick = () => emit({action: "reset"});
+  }
+
+  function pin(stop, n) {
+    const icon = L.divIcon({className: "", iconSize: [26, 26], iconAnchor: [13, 13],
+      html: "<div class='pin " + stop.kind + "'>" + n + "</div>"});
+    const m = L.marker([stop.lat, stop.lon], {icon, zIndexOffset: 500});
+    m.bindTooltip(n + ". " + (stop.kind === "L" ? "Załadunek " : "Rozładunek ") + stop.label);
+    return m;
+  }
+
+  function legLine(shape, i) {
+    const line = L.polyline(shape, {color: "#1f77b4", weight: 6, opacity: .85}).addTo(layer);
+    line.on("mouseover", () => line.setStyle({weight: 9, opacity: 1}));
+    line.on("mouseout", () => line.setStyle({weight: 6, opacity: .85}));
+    line.on("mousedown", (e) => {
+      L.DomEvent.stop(e);
+      const start = e.containerPoint;
+      const ghost = L.marker(e.latlng, {
+        icon: L.divIcon({className: "", iconSize: [14, 14], iconAnchor: [7, 7], html: "<div class='ghost'></div>"}),
+        interactive: false
+      }).addTo(map);
+      map.dragging.disable();
+      const move = (ev) => ghost.setLatLng(ev.latlng);
+      const up = (ev) => {
+        map.off("mousemove", move);
+        map.dragging.enable();
+        map.removeLayer(ghost);
+        const ll = map.mouseEventToLatLng(ev);
+        if (start.distanceTo(map.mouseEventToContainerPoint(ev)) > 6) {
+          emit({action: "add_via", leg: i, lat: ll.lat, lon: ll.lng});
+        }
+      };
+      map.on("mousemove", move);
+      document.addEventListener("mouseup", up, {once: true});
+    });
+    return line;
+  }
+
+  function render() {
+    layer.clearLayers();
+    const all = [];
+    args.legs.forEach((shape, i) => {
+      if (shape.length > 1) { legLine(shape, i); shape.forEach(p => all.push(p)); }
+    });
+    args.vias.forEach((v) => {
+      const m = L.marker([v.lat, v.lon], {
+        draggable: true, zIndexOffset: 400,
+        icon: L.divIcon({className: "", iconSize: [14, 14], iconAnchor: [7, 7], html: "<div class='via'></div>"})
+      }).addTo(layer);
+      m.on("dragend", () => { const ll = m.getLatLng(); emit({action: "move_via", id: v.id, lat: ll.lat, lon: ll.lng}); });
+      m.on("dblclick", () => emit({action: "remove_via", id: v.id}));
+      m.on("contextmenu", () => emit({action: "remove_via", id: v.id}));
+      m.bindTooltip("Punkt pośredni (dwuklik = usuń)");
+    });
+    args.stops.forEach((s, i) => { pin(s, i + 1).addTo(layer); all.push([s.lat, s.lon]); });
+    if (args.fit_id !== lastFit && all.length) {
+      map.fitBounds(all, {padding: [30, 30]});
+      lastFit = args.fit_id;
+    }
+    updatePanel();
+  }
+
+  window.addEventListener("message", (e) => {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    args = e.data.args;
+    if (!map) init();
+    document.body.style.height = args.height + "px";
+    send("streamlit:setFrameHeight", {height: args.height});
+    map.invalidateSize();
+    render();
+  });
+  send("streamlit:componentReady", {apiVersion: 1});
+  send("streamlit:setFrameHeight", {height: 600});
+})();
+</script>
+</body>
+</html>
