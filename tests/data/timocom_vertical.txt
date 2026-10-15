@@ -1,0 +1,141 @@
+Miejsce początkowe
+Miejsce docelowe
+Typy nadwozia
+km
+Opis pojazdu
+Firma
+FR
+77140 
+Nemours
+07.10
+GB
+G1 1 
+Glasgow
+09.10
+22,00
+Plandeka, Firanka (Tautliner), Mega
+13,60
+1176
+-
+2500,00 EUR
+Optima Logistics Group S.A.
+FR
+91300 
+Massy
+07.10
+GB
+LS25 2 
+Leeds (Garforth)
+08.10 +1
+20,00
+Plandeka, Firanka (Tautliner), Mega
+13,60
+772
+-
+2300,00 EUR
+Optima Logistics Group S.A.
+FR
+78440 
+Gargenville
+07.10 +1
+GB
+LE67 3 
+Coalville
+08.10 +1
+1,70
+Firanka (Tautliner)
+6,70
+649
+-
+1900,00 EUR
+Jp Logistic sp. z o.o.
+FR
+93200 
+Saint-Denis
+07.10
+GB
+B3 3 
+Birmingham
+08.10 +1
+2,00
+Plandeka, Firanka (Tautliner), Mega
+6,70
+645
+-
+-
+MIT UNS SPEDITION GMBH
+FR
+59273 
+Fretin
+07.10
+GB
+LU71 
+Leighton Buzzard
+08.10
+24,00
+Firanka (Tautliner)
+13,60
+372
+-
+1500,00 EUR
+"ADAR" sp. z o.o.
+FR
+02200 
+Soissons
+07.10
+GB
+NN11 3 
+Banbury
+08.10
+23,90
+Plandeka, Firanka (Tautliner)
+13,60
+547
+Maty antypoślizgowe, Lokalizacja GPS, Pasy mocujące, Osłona krawędzi
+1460,00 EUR
+LKW WALTER Internationale Transportorganisation AG
+FR
+77100 
+Meaux
+07.10
+GB
+NN11 4 
+Daventry
+08.10
+0,05
+Plandeka, Jumbo, Chłodnia, Firanka (Tautliner), Furgon (Van), Skrzynia, Mega
+0,50
+583
+-
+600,00 EUR
+Interlogis Poland sp. z o.o.
+FR
+95000 
+Cergy
+07.10
+GB
+NN13 7 
+Brackley
+08.10
+0,05
+Plandeka, Jumbo, Chłodnia, Firanka (Tautliner), Furgon (Van), Skrzynia, Mega
+0,50
+564
+-
+-
+Interlogis Poland sp. z o.o.
+FR
+91000 
+Évry-Courcouronnes (Évry)
+07.10
+GB
+MK42 7AA 
+Kempston
+08.10
+0,05
+Plandeka, Jumbo, Chłodnia, Firanka (Tautliner), Furgon (Van), Skrzynia, Mega
+0,50
+589
+-
+-
+Interlogis Poland sp. z o.o.

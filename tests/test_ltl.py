@@ -202,3 +202,23 @@ def test_via_order_follows_leg_shape():
     vias = apply_edit([], {"action": "add_via", "leg": 0, "lat": p1[0], "lon": p1[1]}, r)
     vias = apply_edit(vias, {"action": "add_via", "leg": 0, "lat": p2[0], "lon": p2[1]}, r)
     assert (vias[0].lat, vias[1].lat) == (p2[0], p1[0])  # p2 jest bliżej początku odcinka
+
+
+def test_timocom_vertical_copy():
+    """Kopia z Timocom: każde pole w osobnej linii (kraj / kod / miasto / data / ...)."""
+    text = (pathlib.Path(__file__).parent / "data" / "timocom_vertical.txt").read_text()
+    df = parse_orders(text)
+    assert len(df) == 9 and set(df.source) == {"Timocom"}
+    a = df.iloc[0]
+    assert (a.start_country, a.start_postal, a.start_city) == ("FR", "77140", "Nemours")
+    assert (a.end_country, a.end_postal, a.end_city) == ("GB", "G1 1", "Glasgow")
+    assert (a.weight_t, a.ldm, a.distance_km, a.price_eur) == (22, 13.6, 1176, 2500)
+    assert (str(a.load_date)[5:], str(a.unload_date)[5:]) == ("10-07", "10-09")
+    assert df.iloc[1].end_postal == "LS25 2"
+    r = df.iloc[2]
+    assert (r.weight_t, r.ldm, r.distance_km, r.price_eur) == (1.7, 6.7, 649, 1900)
+    assert df.iloc[3].status == "Do negocjacji" and df.iloc[3].distance_km == 645
+    assert df.iloc[4].end_postal == "LU71" and df.iloc[4].price_eur == 1500
+    assert (df.iloc[5].weight_t, df.iloc[5].price_eur, df.iloc[5].distance_km) == (23.9, 1460, 547)
+    assert (df.iloc[6].weight_t, df.iloc[6].ldm, df.iloc[6].price_eur) == (0.05, 0.5, 600)
+    assert df.iloc[8].end_postal == "MK42 7AA" and df.iloc[8].status == "Do negocjacji"

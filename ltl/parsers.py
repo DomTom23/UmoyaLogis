@@ -73,6 +73,7 @@ class RawOrder:
     price_eur: Optional[float] = None
     negotiable: bool = False
     row: bool = False                       # start i cel w jednej linii
+    vertical: bool = False                  # kraj / kod / miasto w osobnych liniach (kopia z Timocom)
     loose: list = field(default_factory=list)  # liczby bez jednostek
 
 
@@ -244,9 +245,33 @@ def _resolve_loose(o: RawOrder) -> None:
 
 # --------------------------------------------------------------- parser
 
+def _join_vertical(text: str) -> tuple[str, bool]:
+    """Skleja lokalizacje rozbite na linie: 'FR' / '77140' / 'Nemours' -> 'FR 77140 Nemours'."""
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    out, i, joined = [], 0, False
+    while i < len(lines):
+        ln = lines[i]
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        first = nxt.split()[0] if nxt.split() else ""
+        if ln in COUNTRIES and any(c.isdigit() for c in first) and len(first) >= 2 and not find_dates(nxt) \
+                and not re.search(r"\b(?:km|kg|eur|ldm)\b|€", nxt, re.I):
+            merged, i, joined = f"{ln} {nxt}", i + 2, True
+            city = lines[i] if i < len(lines) else ""
+            if city and city not in COUNTRIES and not re.search(r"\d", city.split("(")[0]) \
+                    and re.search(r"[^\W\d_]", city) and len(city) <= 50:
+                merged += f" {city}"
+                i += 1
+            out.append(merged)
+        else:
+            out.append(ln)
+            i += 1
+    return "\n".join(out), joined
+
+
 def parse_raw(text: str) -> list[RawOrder]:
     """Rozpoznaje zlecenia w układzie wierszowym i blokowym (także mieszanym)."""
     text = text.replace("\r", "").replace(" ", " ").replace(" ", " ")
+    text, vertical = _join_vertical(text)
     orders: list[RawOrder] = []
     cur: Optional[RawOrder] = None
 
@@ -288,6 +313,7 @@ def parse_raw(text: str) -> list[RawOrder]:
     for o in orders:
         if o.start and o.end and o.start[:2] != o.end[:2]:
             _resolve_loose(o)
+            o.vertical = vertical and not o.row
             done.append(o)
     return done
 
@@ -358,5 +384,6 @@ def parse_orders(text: str, source: str = "Auto", **kwargs) -> pd.DataFrame:
     raw = parse_raw(text)
     if source == "Auto":
         rows = sum(o.row for o in raw)
-        source = "Timocom" if rows >= len(raw) - rows else "Trans.eu"
+        vertical = sum(o.vertical for o in raw)
+        source = "Timocom" if rows + vertical >= len(raw) - rows - vertical else "Trans.eu"
     return to_dataframe(raw, source, **kwargs)
