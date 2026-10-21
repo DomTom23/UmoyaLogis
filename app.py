@@ -16,6 +16,7 @@ from ltl.ranking import Ranked, rank_by_real_routes, ranked_to_frame, variant_ke
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
 from ltl.routing import VALHALLA_URL, RouteOptions, RouteResult, TruckProfile
 from ltl.sample import SAMPLE_TEXT
+from ltl.storage import InvalidName, NameExists, Store
 
 st.set_page_config(page_title="Optymalizator Tras LTL", page_icon="🚛", layout="wide")
 
@@ -56,6 +57,11 @@ def _geocoder(online: bool) -> Geocoder:
 def _route_store() -> dict:
     """Pamięć podręczna tras (zapisywane są trasy, w których choć część odcinków pochodzi z routingu)."""
     return {}
+
+
+@st.cache_resource
+def _store() -> Store:
+    return Store()
 
 
 @st.cache_data(show_spinner="Rozpoznawanie zleceń…")
@@ -164,7 +170,7 @@ def _load_example() -> None:
 
 
 def _clear_all() -> None:
-    for k in ("analysis", "raw_text", "vias", "ranked", "seen_nonce"):
+    for k in ("analysis", "raw_text", "vias", "ranked", "seen_nonce", "loaded_name", "save_name"):
         st.session_state.pop(k, None)
     st.session_state.uploader_n += 1
 
@@ -179,15 +185,48 @@ with st.container(border=True):
                                     accept_multiple_files=True, key=f"files_{st.session_state.uploader_n}",
                                     help="Wklejony tekst i pliki są łączone; każde źródło może mieć inny format.")
         o1, o2 = st.columns(2)
-        online = o1.checkbox("Ustal położenie kodów pocztowych przez internet", value=True,
+        online = o1.checkbox("Ustal położenie kodów pocztowych przez internet", value=True, key="opt_online",
                              help="zippopotam.us i Nominatim. Bez tego używane są środki krajów (mało dokładne).")
-        drop_no_price = o2.checkbox("Pomiń oferty bez ceny", value=False)
+        drop_no_price = o2.checkbox("Pomiń oferty bez ceny", value=False, key="opt_drop")
         submitted = st.form_submit_button("🔍 Szukaj doładunków", type="primary", width="stretch")
     b1, b2, _ = st.columns([1, 1, 4])
     b1.button("📋 Wczytaj przykład", on_click=_load_example, width="stretch")
     b2.button("🗑️ Wyczyść", on_click=_clear_all, width="stretch")
 
+def _load_saved(name: str) -> None:
+    try:
+        df = _store().load_orders(name)
+    except KeyError:
+        st.toast(f"Nie znaleziono tabeli „{name}”.", icon="⚠️")
+        return
+    prev = st.session_state.get("analysis", {}).get("id", 0)
+    st.session_state.analysis = {"id": prev + 1, "df": df, "texts": (), "drop": False,
+                                 "online": st.session_state.get("opt_online", True)}
+    st.session_state.pop("ranked", None)
+    st.session_state.loaded_name = st.session_state.save_name = name
+    st.toast(f"Wczytano tabelę „{name}” ({len(df)} zleceń).", icon="📂")
+
+
+def _delete_saved(name: str) -> None:
+    if _store().delete("orders", name):
+        st.toast(f"Usunięto tabelę „{name}”.", icon="🗑️")
+
+
+with st.expander(f"📂 Zapisane tabele zleceń ({len(_store().list_tables('orders'))})"):
+    saved = _store().list_tables("orders")
+    if saved.empty:
+        st.caption("Nic jeszcze nie zapisano. Po wczytaniu danych użyj „Zapisz tabelę” w kroku 2.")
+    else:
+        info = {r.name: f"{r.name} · {r.n_rows} zleceń · {r.updated_at.replace('T', ' ')}" for r in saved.itertuples()}
+        choice = st.selectbox("Wybierz zapisaną tabelę", list(info), format_func=info.get, key="saved_choice")
+        c_load, c_del, c_ok = st.columns([1, 1, 2])
+        c_load.button("📂 Wczytaj", on_click=_load_saved, args=(choice,), width="stretch", key="btn_load_saved")
+        confirm = c_ok.checkbox("Potwierdzam usunięcie", key="confirm_delete")
+        c_del.button("🗑️ Usuń", on_click=_delete_saved, args=(choice,), width="stretch", disabled=not confirm,
+                     key="btn_del_saved")
+
 if submitted:
+    st.session_state.pop("loaded_name", None)
     texts = [raw_text] + [read_uploaded(f.name, f.getvalue()) for f in files]
     if any(t.strip() for t in texts):
         prev = st.session_state.get("analysis", {}).get("id", 0)
@@ -206,7 +245,7 @@ if not analysis:
             "4. **Dopracuj trasę** na mapie: przeciągnij fragment linii, a koszty przeliczą się same.")
     st.stop()
 
-parsed = _parse(analysis["texts"], analysis["drop"])
+parsed = analysis["df"] if "df" in analysis else _parse(analysis["texts"], analysis["drop"])
 if parsed.empty:
     st.error("Nie rozpoznano żadnych zleceń. W danych muszą być kody w formacie „kraj kod” "
              "(np. FR 77140, GB G1 1) dla miejsca załadunku i rozładunku każdej oferty.")
@@ -215,7 +254,8 @@ if parsed.empty:
 # --------------------------------------------------------- krok 2: zlecenia
 with st.container(border=True):
     step(2, "Sprawdź zlecenia",
-         f"Rozpoznano {len(parsed)} ofert (źródło: {', '.join(sorted(set(parsed['source'])))}). "
+         f"{'Wczytano zapisaną tabelę „' + st.session_state['loaded_name'] + '”: ' if st.session_state.get('loaded_name') else 'Rozpoznano '}"
+         f"{len(parsed)} ofert (źródło: {', '.join(sorted(set(parsed['source'])) or ['—'])}). "
          "Kliknij komórkę, aby poprawić wartość; wiersze można dodawać i usuwać. Zmiany od razu wchodzą do wyników.")
     edited = st.data_editor(
         parsed, key=f"orders_{analysis['id']}", num_rows="dynamic", width="stretch", hide_index=True,
@@ -247,6 +287,22 @@ with st.container(border=True):
     if orders.empty:
         st.warning("Brak poprawnych wierszy - potrzebne są kraj i kod pocztowy załadunku oraz rozładunku.")
         st.stop()
+
+    with st.form("save_orders_form", border=False):
+        f1, f2, f3 = st.columns([3, 2, 1])
+        save_name = f1.text_input("Nazwa tabeli", key="save_name", placeholder="np. Tydzień 42 - Francja → UK",
+                                  help="Zapisuje tabelę z Twoimi poprawkami; można ją później wczytać w kroku 1.")
+        overwrite = f2.checkbox("Nadpisz, jeśli nazwa już istnieje", key="save_overwrite")
+        save_clicked = f3.form_submit_button("💾 Zapisz tabelę", width="stretch")
+    if save_clicked:
+        try:
+            saved_as = _store().save_orders(save_name, orders, overwrite=overwrite)
+            st.session_state.loaded_name = saved_as
+            st.success(f"Zapisano tabelę „{saved_as}” ({len(orders)} zleceń).")
+        except NameExists:
+            st.warning(f"Tabela „{save_name.strip()}” już istnieje - zaznacz „Nadpisz” albo wybierz inną nazwę.")
+        except InvalidName as e:
+            st.warning(str(e))
     orders = _coords(orders, analysis["online"])
 
     est = haversine_km(orders.start_lat, orders.start_lon, orders.end_lat, orders.end_lon) * ROAD_FACTOR
@@ -329,6 +385,32 @@ with st.container(border=True):
     st.caption(f"Sprawdzono {stats['evaluated']} kombinacji z {stats['candidates']} ofert; na drogach policzono "
                f"{len(candidates)} najlepszych. ▲ załadunek, ▼ rozładunek. Liczba zleceń nie jest ograniczona - "
                "limitem jest naczepa (13,6 LDM / 24 t w każdym punkcie trasy).")
+
+    with st.expander("💾 Zapisz ranking pod nazwą / zobacz zapisane rankingi"):
+        with st.form("save_ranking_form", border=False):
+            r1, r2, r3 = st.columns([3, 2, 1])
+            rk_name = r1.text_input("Nazwa rankingu", key="rk_name", placeholder="np. Ranking tydzień 42",
+                                    help="Zapisuje widoczną powyżej tabelę wariantów (wartości z chwili zapisu).")
+            rk_over = r2.checkbox("Nadpisz, jeśli nazwa już istnieje", key="rk_over")
+            rk_click = r3.form_submit_button("💾 Zapisz ranking", width="stretch")
+        if rk_click:
+            try:
+                st.success(f"Zapisano ranking „{_store().save_ranking(rk_name, frame, overwrite=rk_over)}”.")
+            except NameExists:
+                st.warning(f"Ranking „{rk_name.strip()}” już istnieje - zaznacz „Nadpisz” albo zmień nazwę.")
+            except InvalidName as e:
+                st.warning(str(e))
+        saved_rk = _store().list_tables("ranking")
+        if saved_rk.empty:
+            st.caption("Brak zapisanych rankingów.")
+        else:
+            rk_info = {r.name: f"{r.name} · {r.n_rows} wariantów · {r.updated_at.replace('T', ' ')}"
+                       for r in saved_rk.itertuples()}
+            rk_pick = st.selectbox("Zapisane rankingi", list(rk_info), format_func=rk_info.get, key="rk_pick")
+            st.dataframe(_store().load_ranking(rk_pick), width="stretch", hide_index=True)
+            if st.button("🗑️ Usuń ten ranking", key="rk_delete"):
+                _store().delete("ranking", rk_pick)
+                st.rerun()
 
 selected = event.selection.rows[0] if event.selection.rows else 0
 v = ranked[min(selected, len(ranked) - 1)].variant

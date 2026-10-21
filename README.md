@@ -52,3 +52,10 @@ bez skrótów klawiszowych) → **2 Zlecenia** (edytowalna tabela) → **3 Najle
 * Informacje o trasie: Eurotunel / prom przez La Manche, inne promy, płatne tunele alpejskie (Mont Blanc, Fréjus,
   Tauern, Katschberg, Arlberg, Karawanki…). Opłaty (opcjonalne, domyślnie 0) ustawia się w panelu bocznym.
   Wykrywanie opiera się na przebiegu trasy i przybliżonych współrzędnych - to ostrzeżenie, nie gwarancja.
+
+## Baza danych
+
+Zapisane tabele trafiają do SQLite (`data/umoyalogis.db`, katalog `data/` jest poza gitem; inną ścieżkę ustawia
+zmienna `LTL_DB_PATH`). W kroku 2 można zapisać tabelę zleceń (z Twoimi poprawkami) pod własną nazwą - zapis pod
+istniejącą nazwą wymaga zaznaczenia „Nadpisz”. W kroku 3 można zapisać ranking wariantów. Zapisane tabele zleceń
+wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląda i usuwa w kroku 3.

@@ -391,3 +391,36 @@ def test_rank_by_real_routes_and_unavailable_routing():
     dead = lambda v: route_for_variant(v, [], TruckProfile(), "valhalla", "", "http://127.0.0.1:9", 65)
     assert rank_by_real_routes(cands, CostParams(), dead, top_n=3) is None
     srv.shutdown()
+
+
+# ------------------------------------------------------------ baza danych
+from ltl.storage import InvalidName, NameExists, Store
+
+
+def test_store_orders_roundtrip_overwrite_delete(tmp_path):
+    st = Store(tmp_path / "t.db")
+    df = parse_sources([TIMOCOM_TAB, TRANSEU])
+    assert st.save_orders("  Tydzień  42 ", df) == "Tydzień 42"
+    out = st.load_orders("Tydzień 42")
+    assert len(out) == len(df) and list(out.columns) == list(df.columns)
+    assert list(out.id) == list(df.id) and list(out.start_postal) == list(df.start_postal)
+    assert out.price_eur.fillna(-1).tolist() == df.price_eur.fillna(-1).tolist()
+    assert str(out.load_date.iloc[0]) == str(df.load_date.iloc[0]) and out.status.tolist() == df.status.tolist()
+    with pytest.raises(NameExists):
+        st.save_orders("Tydzień 42", df)
+    st.save_orders("Tydzień 42", df.head(1), overwrite=True)
+    assert len(st.load_orders("Tydzień 42")) == 1 and st.list_tables("orders").n_rows.tolist() == [1]
+    st.save_ranking("Tydzień 42", pd.DataFrame({"#": [1], "Zysk (EUR)": [500.0]}))   # ten sam napis, inny rodzaj
+    assert st.load_ranking("Tydzień 42")["Zysk (EUR)"].tolist() == [500.0]
+    assert st.delete("orders", "Tydzień 42") and not st.exists("orders", "Tydzień 42")
+    assert st.exists("ranking", "Tydzień 42") and not st.delete("orders", "Tydzień 42")
+    for bad in ("", "   ", "x" * 200):
+        with pytest.raises(InvalidName):
+            st.save_orders(bad, df)
+    with pytest.raises(KeyError):
+        st.load_orders("brak")
+
+
+def test_store_persists_between_instances(tmp_path):
+    Store(tmp_path / "p.db").save_orders("A", parse_sources([TIMOCOM_TAB]))
+    assert len(Store(tmp_path / "p.db").load_orders("A")) == 2
