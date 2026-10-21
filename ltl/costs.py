@@ -16,6 +16,8 @@ class CostParams:
     max_drive_h_week: float = 56.0     # limit jazdy na tydzień
     handling_h_per_stop: float = 1.0   # załadunek / rozładunek
     weekly_rest_days: float = 2.0      # ~45 h odpoczynku po wyczerpaniu 56 h
+    channel_crossing_eur: float = 0.0  # opłata za Eurotunel / prom przez La Manche (za jedną przeprawę)
+    alpine_tunnel_eur: float = 0.0     # opłata za płatny tunel alpejski (za jeden tunel)
 
 
 def trip_time(distance_km: float, n_stops: int, p: CostParams) -> dict:

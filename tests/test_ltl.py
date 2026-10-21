@@ -76,6 +76,16 @@ def test_costs():
     assert trip_time(65 * 120, 2, p)["days"] > trip_time(65 * 56, 2, p)["days"] + 6  # tygodniowy odpoczynek
 
 
+import pytest
+import ltl.routing as _rt
+
+
+@pytest.fixture(autouse=True)
+def _clear_route_cache():
+    _rt._LEG_CACHE.clear()
+    _rt._NO_EXCLUDE.clear()
+
+
 def _orders(rows):
     df = pd.DataFrame(rows, columns=["id", "slat", "slon", "elat", "elon", "ldm", "weight_t", "price_eur"])
     df = df.rename(columns={"slat": "start_lat", "slon": "start_lon", "elat": "end_lat", "elon": "end_lon"})
@@ -176,7 +186,7 @@ def test_truck_route_and_costs_with_vias():
     mid = r0.legs[0].shape[len(r0.legs[0].shape) // 2]
     vias = apply_edit([], {"action": "add_via", "leg": 0, "lat": mid[0] + 3, "lon": mid[1] + 3}, r0)
     r1 = route_for_variant(v, vias, truck, "valhalla", "", url, 65)
-    types = [p["type"] for p in fake_valhalla.REQUESTS[-len(v.stops) + 1]["locations"]]
+    types = [p["type"] for p in fake_valhalla.REQUESTS[-1]["locations"]]  # reszta odcinków z cache
     assert types == ["break", "through", "break"]
     e1 = evaluate_route(v, r1, CostParams())
     assert r1.km > r0.km and e1["total"] > e0["total"] and e1["profit"] < e0["profit"]
@@ -275,10 +285,10 @@ def test_partial_route_falls_back_per_leg():
     import ltl.routing as rt
     orig = rt._valhalla_request
 
-    def flaky(group, truck, base_url):
+    def flaky(group, truck, base_url, *a):
         if group[0]["lat"] > 60:
             raise RoutingHTTPError("HTTP 400: brak drogi")
-        return orig(group, truck, base_url)
+        return orig(group, truck, base_url, *a)
 
     srv, url = fake_valhalla.start()
     rt._valhalla_request = flaky
@@ -289,3 +299,95 @@ def test_partial_route_falls_back_per_leg():
     finally:
         rt._valhalla_request = orig
         srv.shutdown()
+
+
+def test_no_order_limit_fills_trailer():
+    # 9 małych zleceń (2 LDM / 2 t) na tej samej trasie Berlin->Paryż: naczepa mieści 6 (12 LDM)
+    rows = [(f"S{i}", 52.5 + i * 0.02, 13.4, 48.9 + i * 0.02, 2.35, 2.0, 2.0, 300) for i in range(9)]
+    v, st = find_best_combinations(_orders(rows), CostParams(), OptimizerParams(max_detour_km=300))
+    assert v and len(v[0].order_ids) == 6
+    assert v[0].peak_ldm <= 13.6 and abs(v[0].peak_ldm - 12.0) < 1e-6
+    assert all(x.peak_ldm <= 13.6 + 1e-9 and x.peak_weight_t <= 24 + 1e-9 for x in v)
+
+
+def test_weight_limit_binds_before_ldm():
+    rows = [(f"H{i}", 52.5 + i * 0.02, 13.4, 48.9 + i * 0.02, 2.35, 1.0, 10.0, 400) for i in range(6)]
+    v, _ = find_best_combinations(_orders(rows), CostParams(), OptimizerParams(max_detour_km=300))
+    assert len(v[0].order_ids) == 2 and v[0].peak_weight_t == 20.0   # 3x10 t > 24 t
+
+
+# ------------------------------------------------------------ Szwajcaria, przeprawy, tunele, ranking po drogach
+from ltl.crossings import detect_crossings
+from ltl.ranking import rank_by_real_routes, ranked_to_frame
+from ltl.regions import shape_in_switzerland
+from ltl.routing import Leg, RouteOptions, RouteResult, route_valhalla
+
+
+def test_switzerland_avoided_with_detour_and_flagged_when_unavoidable():
+    srv, url = fake_valhalla.start()
+    paris, milan = {"lat": 48.86, "lon": 2.35}, {"lat": 45.46, "lon": 9.19}
+    through_ch = route_valhalla([paris, milan], TruckProfile(), url, 65, RouteOptions(avoid_switzerland=False))
+    assert shape_in_switzerland(through_ch.legs[0].shape)              # prosta linia Paryż-Mediolan idzie przez CH
+    avoided = route_valhalla([paris, milan], TruckProfile(), url, 65, RouteOptions(avoid_switzerland=True))
+    assert avoided.is_real and not shape_in_switzerland(avoided.legs[0].shape) and avoided.switzerland_legs == []
+    assert avoided.km >= through_ch.km
+    # oba końce w Szwajcarii: nie da się ominąć -> ostrzeżenie
+    bern, zurich = {"lat": 46.95, "lon": 7.45}, {"lat": 47.38, "lon": 8.54}
+    r = route_valhalla([bern, zurich], TruckProfile(), url, 65, RouteOptions())
+    assert r.switzerland_legs == [0]
+    assert any(c.kind == "switzerland" for c in detect_crossings(r))
+    srv.shutdown()
+
+
+def _leg(points, maneuvers=()):
+    import numpy as np
+    pts = np.asarray(points, float)   # zagęszczenie jak w prawdziwej linii trasy (punkty co ~0.5 km)
+    if not maneuvers or maneuvers[0].get("type") != 28:
+        dense = [pts[0]]
+        for a, b in zip(pts, pts[1:]):
+            n = max(2, int(np.hypot(*(b - a)) * 111 / 0.5))
+            dense += [a + (b - a) * t for t in np.linspace(0, 1, n)[1:]]
+        points = [tuple(p) for p in dense]
+    return Leg(shape=points, km=100, hours=1, maneuvers=list(maneuvers))
+
+
+def test_detect_channel_ferry_tunnel_and_alpine_tunnels():
+    ferry = _leg([(50.9, 1.8), (50.967, 1.853), (51.127, 1.333), (51.2, 1.2)], [
+        {"type": 28, "names": [], "instruction": "Take the ferry", "begin": (50.967, 1.853), "end": (50.967, 1.853)},
+        {"type": 29, "names": [], "instruction": "", "begin": (51.127, 1.333), "end": (51.127, 1.333)}])
+    c = detect_crossings(RouteResult(legs=[ferry], is_real=True))
+    assert [(x.kind, x.name) for x in c] == [("channel_ferry", "prom Calais–Dover")]
+    tunnel = _leg([(50.92, 1.80), (50.93, 1.81), (51.09, 1.13), (51.1, 1.1)])
+    assert [x.kind for x in detect_crossings(RouteResult(legs=[tunnel]))] == ["channel_tunnel"]
+    alps = _leg([(45.9, 6.8), (45.8667, 6.90), (45.8, 7.0)])
+    assert [x.name for x in detect_crossings(RouteResult(legs=[alps]))] == ["Tunel Mont Blanc (FR–IT)"]
+    named = _leg([(47.5, 12.0), (47.6, 12.1)], [{"type": 8, "names": ["Tauerntunnel"], "instruction": "", "begin": (47.5, 12.0), "end": (47.6, 12.1)}])
+    assert [x.kind for x in detect_crossings(RouteResult(legs=[named]))] == ["alpine_tunnel"]
+    plain = _leg([(52.5, 13.4), (52.4, 13.0)])
+    assert detect_crossings(RouteResult(legs=[plain])) == []
+
+
+def test_crossing_fees_in_evaluation():
+    v = _variant()
+    ferry_route = RouteResult(legs=[_leg([(50.967, 1.853), (51.127, 1.333)], [
+        {"type": 28, "names": [], "instruction": "", "begin": (50.967, 1.853), "end": (50.967, 1.853)},
+        {"type": 29, "names": [], "instruction": "", "begin": (51.127, 1.333), "end": (51.127, 1.333)}])
+        for _ in range(len(v.stops) - 1)], is_real=True)
+    base = evaluate_route(v, ferry_route, CostParams())
+    priced = evaluate_route(v, ferry_route, CostParams(channel_crossing_eur=250))
+    assert priced["fees"] == 250 * len(priced["crossings"]) > 0
+    assert abs((base["profit"] - priced["profit"]) - priced["fees"]) < 1e-6
+
+
+def test_rank_by_real_routes_and_unavailable_routing():
+    srv, url = fake_valhalla.start()
+    rows = [(f"S{i}", 52.5 + i * 0.02, 13.4, 48.9 + i * 0.02, 2.35, 2.0, 2.0, 300) for i in range(6)]
+    cands, _ = find_best_combinations(_orders(rows), CostParams(), OptimizerParams(max_detour_km=300, top_n=8))
+    fn = lambda v: route_for_variant(v, [], TruckProfile(), "valhalla", "", url, 65)
+    ranked = rank_by_real_routes(cands, CostParams(), fn, top_n=3)
+    assert len(ranked) == 3 and ranked[0].ev["profit"] >= ranked[1].ev["profit"] >= ranked[2].ev["profit"]
+    frame = ranked_to_frame(ranked)
+    assert {"Zapełnienie (LDM)", "Przeprawy i tunele", "Zysk (EUR)"} <= set(frame.columns)
+    dead = lambda v: route_for_variant(v, [], TruckProfile(), "valhalla", "", "http://127.0.0.1:9", 65)
+    assert rank_by_real_routes(cands, CostParams(), dead, top_n=3) is None
+    srv.shutdown()

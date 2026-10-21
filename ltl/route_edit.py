@@ -12,7 +12,8 @@ import numpy as np
 
 from .costs import CostParams, profit
 from .optimizer import Variant
-from .routing import RouteResult, TruckProfile, compute_route
+from .crossings import detect_crossings
+from .routing import RouteOptions, RouteResult, TruckProfile, compute_route
 
 _ids = itertools.count(1)
 
@@ -71,8 +72,9 @@ def apply_edit(vias: list[Via], event: dict, route: RouteResult | None) -> list[
 
 
 def route_for_variant(variant: Variant, vias: list[Via], truck: TruckProfile, provider: str,
-                      ors_key: str, valhalla_url: str, speed: float) -> RouteResult:
-    return compute_route(build_points(variant, vias), truck, provider, ors_key, valhalla_url, speed)
+                      ors_key: str, valhalla_url: str, speed: float,
+                      opts: RouteOptions = RouteOptions()) -> RouteResult:
+    return compute_route(build_points(variant, vias), truck, provider, ors_key, valhalla_url, speed, opts)
 
 
 def evaluate_route(variant: Variant, route: RouteResult, cost: CostParams) -> dict:
@@ -91,5 +93,11 @@ def evaluate_route(variant: Variant, route: RouteResult, cost: CostParams) -> di
             empty += leg.km
         visit(variant.stops[i + 1])
     c = profit(variant.revenue, route.km, len(variant.stops), cost)
-    c.update(loaded_km=loaded, empty_km=empty, total_km=route.km, route_hours=route.hours)
+    crossings = detect_crossings(route)
+    fees = sum(cost.channel_crossing_eur for x in crossings if x.kind in ("channel_tunnel", "channel_ferry")) \
+        + sum(cost.alpine_tunnel_eur for x in crossings if x.kind == "alpine_tunnel")
+    c["fees"] = fees
+    c["total"] += fees
+    c["profit"] -= fees
+    c.update(loaded_km=loaded, empty_km=empty, total_km=route.km, route_hours=route.hours, crossings=crossings)
     return c

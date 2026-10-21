@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
 from .geo import ROAD_FACTOR, haversine_km
+from .regions import detour_candidates, shape_in_switzerland, switzerland_exclusion_polygon
 
 VALHALLA_URL = os.environ.get("VALHALLA_URL", "https://valhalla1.openstreetmap.de")
 ORS_URL = "https://api.openrouteservice.org"
@@ -33,12 +35,19 @@ class TruckProfile:
     hazmat: bool = False
 
 
+@dataclass(frozen=True)
+class RouteOptions:
+    avoid_switzerland: bool = True     # trasa nie może przebiegać przez Szwajcarię
+
+
 @dataclass
 class Leg:
     """Odcinek między dwoma kolejnymi punktami zatrzymania (załadunek/rozładunek)."""
     shape: list            # [(lat, lon), ...]
     km: float
     hours: float
+    maneuvers: list = field(default_factory=list)   # [{'type', 'names', 'instruction', 'begin', 'end'}]
+    via_switzerland: bool = False                   # nie udało się ominąć Szwajcarii
 
 
 @dataclass
@@ -48,6 +57,10 @@ class RouteResult:
     is_real: bool = False          # wszystkie odcinki po drogach
     error: str = ""
     straight_legs: list = field(default_factory=list)  # numery odcinków liczonych linią prostą
+
+    @property
+    def switzerland_legs(self) -> list:
+        return [i for i, leg in enumerate(self.legs) if leg.via_switzerland]
 
     @property
     def has_real(self) -> bool:
@@ -149,10 +162,29 @@ def _straight_leg(group: list[dict], speed: float = 65.0) -> Leg:
 
 
 def _merge(a: Leg, b: Leg) -> Leg:
-    return Leg(shape=a.shape + b.shape[1:], km=a.km + b.km, hours=a.hours + b.hours)
+    return Leg(shape=a.shape + b.shape[1:], km=a.km + b.km, hours=a.hours + b.hours,
+               maneuvers=a.maneuvers + b.maneuvers, via_switzerland=a.via_switzerland or b.via_switzerland)
 
 
-def _valhalla_request(group, truck, base_url) -> Leg:
+_LEG_CACHE: dict = {}
+_NO_EXCLUDE: set = set()      # serwery, które odrzuciły opcję exclude_polygons
+_LOCK = threading.Lock()
+
+
+def _parse_valhalla_leg(leg: dict) -> Leg:
+    shape = decode_polyline(leg["shape"], 6)
+    maneuvers = []
+    for m in leg.get("maneuvers", []):
+        bi, ei = m.get("begin_shape_index", 0), m.get("end_shape_index", 0)
+        maneuvers.append({
+            "type": m.get("type", 0), "names": m.get("street_names", []), "instruction": m.get("instruction", ""),
+            "begin": shape[min(bi, len(shape) - 1)], "end": shape[min(ei, len(shape) - 1)],
+        })
+    return Leg(shape=shape, km=float(leg["summary"]["length"]), hours=float(leg["summary"]["time"]) / 3600.0,
+               maneuvers=maneuvers)
+
+
+def _valhalla_request(group, truck, base_url, exclude_ch: bool = False) -> Leg:
     payload = {
         "locations": [{"lat": p["lat"], "lon": p["lon"], "type": "break" if i in (0, len(group) - 1) else "through"}
                       for i, p in enumerate(group)],
@@ -163,11 +195,18 @@ def _valhalla_request(group, truck, base_url) -> Leg:
         }},
         "directions_options": {"units": "kilometers"},
     }
-    data = _post(base_url.rstrip("/") + "/route", payload)
+    url = base_url.rstrip("/") + "/route"
+    use_exclude = exclude_ch and base_url not in _NO_EXCLUDE
     try:
-        legs = [Leg(shape=decode_polyline(leg["shape"], 6),
-                    km=float(leg["summary"]["length"]), hours=float(leg["summary"]["time"]) / 3600.0)
-                for leg in data["trip"]["legs"]]
+        data = _post(url, {**payload, "exclude_polygons": switzerland_exclusion_polygon()} if use_exclude else payload)
+    except RoutingHTTPError as e:
+        if not use_exclude or e.too_long:
+            raise
+        if any(w in str(e).lower() for w in ("exclude", "polygon")):
+            _NO_EXCLUDE.add(base_url)       # serwer nie obsługuje wyłączania obszarów
+        data = _post(url, payload)          # ponów bez wyłączenia (Szwajcarię wykryjemy i ominiemy objazdem)
+    try:
+        legs = [_parse_valhalla_leg(leg) for leg in data["trip"]["legs"]]
     except (KeyError, TypeError) as e:
         raise RoutingError(f"nieoczekiwana odpowiedź Valhalla: {str(data)[:200]}") from e
     out = legs[0]
@@ -176,14 +215,14 @@ def _valhalla_request(group, truck, base_url) -> Leg:
     return out
 
 
-def _valhalla_leg(group, truck, base_url, depth: int = 0) -> Leg:
+def _valhalla_leg(group, truck, base_url, exclude_ch: bool = False, depth: int = 0) -> Leg:
     """Jeden odcinek; gdy przekracza limit serwera (publiczny Valhalla: 1500 km), dzielony na połowy.
 
     Punkt podziału: środkowy punkt pośredni (via) odcinka albo punkt na linii prostej
     (serwer przyciąga go do najbliższej drogi; kilka prób, gdy trafi w morze / bezdroża).
     """
     try:
-        return _valhalla_request(group, truck, base_url)
+        return _valhalla_request(group, truck, base_url, exclude_ch)
     except RoutingHTTPError as e:
         if not e.too_long or depth >= 3:
             raise
@@ -199,21 +238,60 @@ def _valhalla_leg(group, truck, base_url, depth: int = 0) -> Leg:
             splits.append(([a, mid], [mid, b]))
     for left, right in splits:
         try:
-            return _merge(_valhalla_leg(left, truck, base_url, depth + 1),
-                          _valhalla_leg(right, truck, base_url, depth + 1))
+            return _merge(_valhalla_leg(left, truck, base_url, exclude_ch, depth + 1),
+                          _valhalla_leg(right, truck, base_url, exclude_ch, depth + 1))
         except RoutingHTTPError:
             continue
     raise first_err
 
 
+def _avoid_switzerland(group: list[dict], leg: Leg, route_fn) -> Leg:
+    """Gdy odcinek przechodzi przez Szwajcarię: próbuje objazdu przez punkty pośrednie (Lyon, Mediolan,
+    Monachium…) i wybiera najkrótszy wariant bez Szwajcarii. Nie udało się -> oznacza odcinek ostrzeżeniem."""
+    if len(group) == 2 and not shape_in_switzerland([(g["lat"], g["lon"]) for g in group]):
+        best = None
+        for _, lat, lon in detour_candidates(group[0], group[1]):
+            via = {"lat": lat, "lon": lon}
+            try:
+                cand = _merge(route_fn([group[0], via]), route_fn([via, group[1]]))
+            except RoutingHTTPError:
+                continue
+            if not shape_in_switzerland(cand.shape) and (best is None or cand.km < best.km):
+                best = cand
+        if best is not None:
+            return best
+    leg.via_switzerland = True
+    return leg
+
+
+def _cached(key, fn):
+    with _LOCK:
+        hit = _LEG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    val = fn()
+    with _LOCK:
+        _LEG_CACHE[key] = val
+    return val
+
+
+def _leg_key(kind, base, truck, opts, group):
+    return (kind, base, truck, opts, tuple((round(p["lat"], 5), round(p["lon"], 5)) for p in group))
+
+
 def route_valhalla(points: list[dict], truck: TruckProfile, base_url: str = VALHALLA_URL,
-                   avg_speed_kmh: float = 65.0) -> RouteResult:
+                   avg_speed_kmh: float = 65.0, opts: RouteOptions = RouteOptions()) -> RouteResult:
     """points: [{'lat', 'lon', 'type': 'break'|'through'}]. Każdy odcinek liczony osobno
     (limit serwera dotyczy jednego zapytania); odcinek, którego nie da się wyznaczyć, jest linią prostą."""
     legs, failed, errors = [], [], []
     for i, group in enumerate(_groups(points)):
         try:
-            legs.append(_valhalla_leg(group, truck, base_url))
+            def build(group=group):
+                leg = _valhalla_leg(group, truck, base_url, opts.avoid_switzerland)
+                if opts.avoid_switzerland and shape_in_switzerland(leg.shape):
+                    leg = _avoid_switzerland(group, leg, lambda g: _valhalla_leg(g, truck, base_url, True))
+                return leg
+            legs.append(_cached(_leg_key("valhalla", base_url, truck, opts, group), build))
         except RoutingHTTPError as e:
             legs.append(_straight_leg(group, avg_speed_kmh))
             failed.append(i)
@@ -225,28 +303,39 @@ def route_valhalla(points: list[dict], truck: TruckProfile, base_url: str = VALH
                        error="; ".join(errors), straight_legs=failed)
 
 
-def route_ors(points: list[dict], truck: TruckProfile, api_key: str, avg_speed_kmh: float = 65.0) -> RouteResult:
+def _ors_request(g, truck, api_key) -> Leg:
+    payload = {
+        "coordinates": [[p["lon"], p["lat"]] for p in g],
+        "units": "km",
+        "options": {"profile_params": {"restrictions": {
+            "weight": truck.gross_weight_t, "axleload": truck.axle_load_t, "height": truck.height_m,
+            "width": truck.width_m, "length": truck.length_m}}},
+    }
+    data = _post(f"{ORS_URL}/v2/directions/driving-hgv", payload, {"Authorization": api_key})
+    try:
+        r = data["routes"][0]
+        return Leg(shape=decode_polyline(r["geometry"], 5), km=float(r["summary"]["distance"]),
+                   hours=float(r["summary"]["duration"]) / 3600.0)
+    except (KeyError, IndexError, TypeError) as e:
+        raise RoutingError(f"nieoczekiwana odpowiedź ORS: {e}") from e
+
+
+def route_ors(points: list[dict], truck: TruckProfile, api_key: str, avg_speed_kmh: float = 65.0,
+              opts: RouteOptions = RouteOptions()) -> RouteResult:
     """OpenRouteService driving-hgv. Odcinki liczone osobno dla kolejnych punktów 'break'."""
     legs, failed, errors = [], [], []
     for i, g in enumerate(_groups(points)):
-        payload = {
-            "coordinates": [[p["lon"], p["lat"]] for p in g],
-            "units": "km",
-            "options": {"profile_params": {"restrictions": {
-                "weight": truck.gross_weight_t, "axleload": truck.axle_load_t, "height": truck.height_m,
-                "width": truck.width_m, "length": truck.length_m}}},
-        }
+        def build(g=g):
+            leg = _ors_request(g, truck, api_key)
+            if opts.avoid_switzerland and shape_in_switzerland(leg.shape):
+                leg = _avoid_switzerland(g, leg, lambda grp: _ors_request(grp, truck, api_key))
+            return leg
         try:
-            data = _post(f"{ORS_URL}/v2/directions/driving-hgv", payload, {"Authorization": api_key})
-            r = data["routes"][0]
-            legs.append(Leg(shape=decode_polyline(r["geometry"], 5), km=float(r["summary"]["distance"]),
-                            hours=float(r["summary"]["duration"]) / 3600.0))
+            legs.append(_cached(_leg_key("ors", "", truck, opts, g), build))
         except RoutingHTTPError as e:
             legs.append(_straight_leg(g, avg_speed_kmh))
             failed.append(i)
             errors.append(f"odcinek {i + 1}: {e}")
-        except (KeyError, IndexError, TypeError) as e:
-            raise RoutingError(f"nieoczekiwana odpowiedź ORS: {e}") from e
     if len(failed) == len(legs):
         return RouteResult(legs=legs, provider="linia prosta ×1,3 (brak routingu)", is_real=False,
                            error="; ".join(errors), straight_legs=failed)
@@ -263,15 +352,15 @@ def route_straight(points: list[dict], avg_speed_kmh: float = 65.0, error: str =
 
 def compute_route(points: list[dict], truck: TruckProfile, provider: str = "valhalla",
                   ors_key: str = "", valhalla_url: str = VALHALLA_URL,
-                  avg_speed_kmh: float = 65.0) -> RouteResult:
+                  avg_speed_kmh: float = 65.0, opts: RouteOptions = RouteOptions()) -> RouteResult:
     """Liczy trasę wybranym dostawcą; przy błędzie zwraca fallback z opisem błędu."""
     try:
         if provider == "ors":
             if not ors_key:
                 raise RoutingError("brak klucza API OpenRouteService")
-            return route_ors(points, truck, ors_key, avg_speed_kmh)
+            return route_ors(points, truck, ors_key, avg_speed_kmh, opts)
         if provider == "valhalla":
-            return route_valhalla(points, truck, valhalla_url, avg_speed_kmh)
+            return route_valhalla(points, truck, valhalla_url, avg_speed_kmh, opts)
     except RoutingError as e:
         return route_straight(points, avg_speed_kmh, error=str(e))
     return route_straight(points, avg_speed_kmh)

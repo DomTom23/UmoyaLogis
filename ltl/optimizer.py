@@ -4,7 +4,9 @@ Założenia:
 * trasa startuje w pierwszym załadunku, kończy się na ostatnim rozładunku (bez powrotu),
 * dowolna kolejność punktów, byle załadunek zlecenia poprzedzał jego rozładunek
   (obejmuje A1->A2->B1->B2 oraz A1->B1->A2->B2),
-* w żadnym momencie ładunek na naczepie nie przekracza max LDM / max tonażu,
+* w żadnym momencie ładunek na naczepie nie przekracza max LDM / max tonażu; liczba zleceń nie jest
+  ograniczona - program dokłada kolejne zlecenia, dopóki mieszczą się na naczepie i w limicie odchylenia
+  (wyszukiwanie wiązkowe z wstawianiem punktów w najtańsze miejsce trasy),
 * odchylenie (detour) = dystans trasy - dystans najdłuższego zlecenia w kombinacji;
   kombinacje powyżej limitu są odrzucane,
 * odległości: haversine * 1.3 (ltl.geo).
@@ -32,8 +34,9 @@ class OptimizerParams:
     max_detour_km: float = 300.0
     max_ldm: float = 13.6
     max_weight_t: float = 24.0
-    max_orders: int = 3              # ile zleceń w jednym wariancie (2-4)
     top_n: int = 10
+    beam_width: int = 12             # ile najlepszych częściowych wariantów rozwijać na każdym poziomie
+    hard_cap_orders: int = 14        # bezpiecznik techniczny (naczepa 13,6 LDM rzadko pomieści więcej)
     max_load_date_gap_days: Optional[int] = 3
     candidate_limit: int = 150
     max_evaluations: int = 300_000   # bezpiecznik czasu obliczeń
@@ -63,6 +66,8 @@ class Variant:
     detour_km: float
     days: float
     drive_h: float
+    peak_ldm: float = 0.0
+    peak_weight_t: float = 0.0
 
     @property
     def profit_per_day(self) -> float:
@@ -113,10 +118,56 @@ def _date_ok(a, b, gap) -> bool:
     return abs((a - b).days) <= gap
 
 
+def _insert(seq, j, D, ldm, wt, max_ldm, max_wt):
+    """Najtańsze dołożenie zlecenia j (punkty 2j, 2j+1) do istniejącej kolejności `seq`.
+
+    Zwraca (nowa kolejność, przyrost dystansu) albo None, gdy nie mieści się na naczepie.
+    Kolejność jest sprawdzana dla każdej pozycji załadunku i rozładunku (załadunek przed rozładunkiem).
+    """
+    L = len(seq)
+    la_l, la_w = [0.0], [0.0]
+    for p in seq:
+        sign = 1.0 if p % 2 == 0 else -1.0
+        la_l.append(la_l[-1] + sign * ldm[p // 2])
+        la_w.append(la_w[-1] + sign * wt[p // 2])
+    P, Q = 2 * j, 2 * j + 1
+    dl, dw = ldm[j], wt[j]
+
+    def d(a, b):
+        return 0.0 if a is None or b is None else float(D[a, b])
+
+    best = None
+    for i in range(L + 1):
+        prev_i = seq[i - 1] if i > 0 else None
+        next_i = seq[i] if i < L else None
+        pd_ = d(prev_i, P) + d(P, next_i) - d(prev_i, next_i)
+        run_l = run_w = -1e18
+        for k in range(i, L + 1):
+            run_l, run_w = max(run_l, la_l[k]), max(run_w, la_w[k])
+            if run_l + dl > max_ldm + 1e-9 or run_w + dw > max_wt + 1e-9:
+                break
+            if k == i:
+                delta = d(prev_i, P) + d(P, Q) + d(Q, next_i) - d(prev_i, next_i)
+            else:
+                prev_k, next_k = seq[k - 1], (seq[k] if k < L else None)
+                delta = pd_ + d(prev_k, Q) + d(Q, next_k) - d(prev_k, next_k)
+            if best is None or delta < best[0]:
+                best = (delta, i, k)
+    if best is None:
+        return None
+    delta, i, k = best
+    return seq[:i] + [P] + seq[i:k] + [Q] + seq[k:], delta
+
+
 def find_best_combinations(
     orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams
 ) -> tuple[list[Variant], dict]:
-    """Zwraca (TOP warianty, statystyki). `orders` musi mieć kolumny współrzędnych (ltl.geo.add_coordinates)."""
+    """Zwraca (TOP warianty, statystyki). `orders` musi mieć kolumny współrzędnych (ltl.geo.add_coordinates).
+
+    Dla każdego "głównego" (najdłuższego) zlecenia m dokładamy kolejne zlecenia z puli zgodnych (limit
+    odchylenia względem m): na każdym poziomie rozwijamy `beam_width` najzyskowniejszych zestawów, więc
+    wypełnienie naczepy rośnie tak długo, jak zysk albo zapełnienie na to pozwalają.
+    """
     stats = {"candidates": 0, "evaluated": 0, "truncated": False}
     df = orders[(orders["price_eur"].notna())].copy()
     df = df[(df["ldm"] <= opt.max_ldm + 1e-9) & (df["weight_t"] <= opt.max_weight_t + 1e-9)]
@@ -144,61 +195,83 @@ def find_best_combinations(
     ldm, wt = df["ldm"].to_numpy(float), df["weight_t"].to_numpy(float)
     price = df["price_eur"].to_numpy(float)
     ldates = list(df["load_date"])
-    max_k = max(2, min(opt.max_orders, 4))
 
     # "główne" = najdłuższe; rozstrzyganie remisów indeksem
     rank = sorted(range(n), key=lambda i: (-single[i], i))
     pos = {i: r for r, i in enumerate(rank)}
 
+    def pair_ok(a, b):
+        return _date_ok(ldates[a], ldates[b], opt.max_load_date_gap_days)
+
     compat: dict[int, list[int]] = {}
     for m in range(n):
         lst = []
         for j in range(n):
-            if j == m or pos[j] < pos[m]:  # j musi być krótsze od m
-                continue
-            if not _date_ok(ldates[m], ldates[j], opt.max_load_date_gap_days):
+            if j == m or pos[j] < pos[m] or not pair_ok(m, j):
                 continue
             r = _best_route([m, j], D, ldm, wt, opt.max_ldm, opt.max_weight_t)
             if r and r[0] - single[m] <= opt.max_detour_km:
                 lst.append(j)
         compat[m] = lst
 
-    results: list[tuple[float, tuple, float, list]] = []
-    seen_eval = 0
+    def score(idx, total):
+        return profit(float(sum(price[i] for i in idx)), total, 2 * len(idx), cost)["profit"]
+
+    best: dict[frozenset, tuple] = {}     # zestaw -> (zysk, indeksy, kolejność punktów, dystans)
+    evals = 0
     for m in range(n):
         if stats["truncated"]:
             break
-        cand = compat[m]
-        for size in range(1, max_k):
-            for sub in combinations(cand, size):
-                if seen_eval >= opt.max_evaluations:
-                    stats["truncated"] = True
+        frontier = {frozenset([m]): ([2 * m, 2 * m + 1], float(single[m]))}
+        for _level in range(2, opt.hard_cap_orders + 1):
+            new: dict[frozenset, tuple] = {}
+            for key, (seq, total) in frontier.items():
+                for j in compat[m]:
+                    if j in key or not all(pair_ok(j, x) for x in key):
+                        continue
+                    evals += 1
+                    if evals > opt.max_evaluations:
+                        stats["truncated"] = True
+                        break
+                    ins = _insert(seq, j, D, ldm, wt, opt.max_ldm, opt.max_weight_t)
+                    if ins is None:
+                        continue
+                    nseq, delta = ins
+                    ntotal = total + delta
+                    if ntotal - single[m] > opt.max_detour_km:
+                        continue
+                    fk = key | {j}
+                    if fk in new and new[fk][1] <= ntotal:
+                        continue
+                    new[fk] = (nseq, ntotal)
+                if stats["truncated"]:
                     break
-                seen_eval += 1
-                idx = [m, *sub]
-                if any(not _date_ok(ldates[a], ldates[b], opt.max_load_date_gap_days)
-                       for a, b in combinations(idx, 2)):
-                    continue
-                r = _best_route(idx, D, ldm, wt, opt.max_ldm, opt.max_weight_t)
-                if not r:
-                    continue
-                total, seq = r
-                detour = total - single[m]
-                if detour > opt.max_detour_km:
-                    continue
-                revenue = float(sum(price[i] for i in idx))
-                pr = profit(revenue, total, 2 * len(idx), cost)["profit"]
-                results.append((pr, tuple(idx), total, seq))
+            if not new:
+                break
+            scored = []
+            for fk, (nseq, ntotal) in new.items():
+                if len(fk) <= 3:  # małe zestawy: dokładna kolejność
+                    r = _best_route(sorted(fk), D, ldm, wt, opt.max_ldm, opt.max_weight_t)
+                    if r and r[0] < ntotal:
+                        ntotal, nseq = r[0], r[1]
+                        new[fk] = (nseq, ntotal)
+                scored.append((score(fk, ntotal), fk))
+            for pr, fk in scored:
+                if fk not in best or best[fk][0] < pr:
+                    best[fk] = (pr, tuple(sorted(fk)), new[fk][0], new[fk][1])
+            scored.sort(key=lambda t: -t[0])
+            frontier = {fk: new[fk] for _, fk in scored[: opt.beam_width]}
             if stats["truncated"]:
                 break
-    stats["evaluated"] = seen_eval
+    stats["evaluated"] = evals
 
-    results.sort(key=lambda t: -t[0])
-    variants = [_build_variant(df, D, single, r, cost) for r in results[: opt.top_n]]
+    ranked = sorted(best.values(), key=lambda t: -t[0])[: opt.top_n]
+    variants = [_build_variant(df, D, single, (pr, idx, total, seq), cost, ldm, wt)
+                for pr, idx, seq, total in ranked]
     return variants, stats
 
 
-def _build_variant(df, D, single, res, cost: CostParams) -> Variant:
+def _build_variant(df, D, single, res, cost: CostParams, ldm=None, wt=None) -> Variant:
     pr, idx, total, seq = res
     stops, loaded, empty = [], 0.0, 0.0
     on_board = set()
@@ -218,13 +291,19 @@ def _build_variant(df, D, single, res, cost: CostParams) -> Variant:
             else:
                 empty += leg
         on_board.add(i) if not is_unload else on_board.discard(i)
+    peak_l = peak_w = cur_l = cur_w = 0.0
+    for p in seq:
+        sign = 1.0 if p % 2 == 0 else -1.0
+        cur_l += sign * float(df.iloc[p // 2]["ldm"])
+        cur_w += sign * float(df.iloc[p // 2]["weight_t"])
+        peak_l, peak_w = max(peak_l, cur_l), max(peak_w, cur_w)
     revenue = float(sum(df.iloc[i]["price_eur"] for i in idx))
     c = profit(revenue, total, len(seq), cost)
     main = max(single[i] for i in idx)
     return Variant(
         order_ids=[df.iloc[i]["id"] for i in idx], stops=stops, revenue=revenue, cost=c,
         profit=c["profit"], total_km=total, loaded_km=loaded, empty_km=empty,
-        detour_km=total - main, days=c["days"], drive_h=c["drive_h"],
+        detour_km=total - main, days=c["days"], drive_h=c["drive_h"], peak_ldm=peak_l, peak_weight_t=peak_w,
     )
 
 
@@ -235,7 +314,10 @@ def variants_to_frame(variants: list[Variant]) -> pd.DataFrame:
         rows.append({
             "#": rank,
             "Zlecenia": " + ".join(v.order_ids),
+            "Liczba": len(v.order_ids),
             "Trasa": route,
+            "Zapełnienie (LDM)": round(v.peak_ldm, 1),
+            "Ładunek (t)": round(v.peak_weight_t, 1),
             "Przychód (EUR)": round(v.revenue, 0),
             "Koszty (EUR)": round(v.cost["total"], 0),
             "Zysk (EUR)": round(v.profit, 0),

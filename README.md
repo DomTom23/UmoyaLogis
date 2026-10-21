@@ -41,3 +41,14 @@ tabeli: popraw błędnie odczytane pola, uzupełnij ceny, dodaj lub usuń wiersz
 Strona prowadzi krok po kroku: **1 Dane** (wklej / pliki / przykład, szukanie przyciskiem „Szukaj doładunków” -
 bez skrótów klawiszowych) → **2 Zlecenia** (edytowalna tabela) → **3 Najlepsze doładunki** → **4 Trasa i koszty**
 (mapa z edycją). Ustawienia (koszty, limity wyszukiwania, routing) są w panelu bocznym i działają od razu.
+
+## Ranking po drogach, Szwajcaria, przeprawy, tunele
+
+* Warianty są od razu liczone po rzeczywistych trasach (najlepsi kandydaci wg szacunku, równolegle, z cache odcinków)
+  i sortowani po rzeczywistym zysku. Liczba zleceń w wariancie nie jest ograniczona - limitem jest naczepa
+  (13,6 LDM / 24 t sprawdzane w każdym punkcie trasy); wyszukiwanie wiązkowe dokłada kolejne zlecenia.
+* Szwajcaria jest omijana: próba `exclude_polygons` (własny serwer Valhalla), a gdy serwer tego nie obsługuje -
+  wykrycie przejazdu i objazd przez punkty pośrednie (Lyon, Mediolan, Monachium…). Gdy się nie da, trasa jest oznaczona.
+* Informacje o trasie: Eurotunel / prom przez La Manche, inne promy, płatne tunele alpejskie (Mont Blanc, Fréjus,
+  Tauern, Katschberg, Arlberg, Karawanki…). Opłaty (opcjonalne, domyślnie 0) ustawia się w panelu bocznym.
+  Wykrywanie opiera się na przebiegu trasy i przybliżonych współrzędnych - to ostrzeżenie, nie gwarancja.

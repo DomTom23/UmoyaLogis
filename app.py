@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pandas as pd
 import streamlit as st
@@ -10,9 +11,10 @@ from ltl.costs import CostParams, profit
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.ingest import clean_edited, parse_sources, read_uploaded
 from ltl.mapview import route_map
-from ltl.optimizer import OptimizerParams, find_best_combinations, variants_to_frame
+from ltl.optimizer import OptimizerParams, find_best_combinations
+from ltl.ranking import Ranked, rank_by_real_routes, ranked_to_frame, variant_key
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
-from ltl.routing import VALHALLA_URL, RouteResult, TruckProfile
+from ltl.routing import VALHALLA_URL, RouteOptions, RouteResult, TruckProfile
 from ltl.sample import SAMPLE_TEXT
 
 st.set_page_config(page_title="Optymalizator Tras LTL", page_icon="🚛", layout="wide")
@@ -34,6 +36,10 @@ def step(n: int, title: str, hint: str = "") -> None:
     st.markdown(f"<div class='step'><span class='n'>{n}</span>{title}</div>", unsafe_allow_html=True)
     if hint:
         st.markdown(f"<div class='hint'>{hint}</div>", unsafe_allow_html=True)
+
+
+def plural(n: int) -> str:
+    return "zlecenie" if n == 1 else "zlecenia" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "zleceń"
 
 
 def eur(x: float) -> str:
@@ -67,19 +73,19 @@ def _search(orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams):
     return find_best_combinations(orders, cost, opt)
 
 
-def _variant_key(v) -> str:
-    return "|".join(f"{s.order_id}{s.kind}" for s in v.stops)
+_variant_key = variant_key
+ROUTE_STORE = _route_store()   # pobrane w głównym wątku - używane też z wątków rankingu
 
 
 def get_route(v, vias) -> RouteResult:
-    store = _route_store()
+    """Trasa po drogach; udane wyniki pamiętane, niepowodzenia tylko przez 2 minuty (potem ponowna próba)."""
     sig = (_variant_key(v), tuple((x.leg, round(x.lat, 5), round(x.lon, 5)) for x in vias),
-           provider, truck, valhalla_url, ors_key)
-    if sig in store:
-        return store[sig]
-    res = route_for_variant(v, vias, truck, provider, ors_key, valhalla_url, speed)
-    if res.has_real:
-        store[sig] = res
+           provider, truck, valhalla_url, ors_key, route_opts)
+    hit = ROUTE_STORE.get(sig)
+    if hit and (hit[1].has_real or time.time() - hit[0] < 120):
+        return hit[1]
+    res = route_for_variant(v, vias, truck, provider, ors_key, valhalla_url, speed, route_opts)
+    ROUTE_STORE[sig] = (time.time(), res)
     return res
 
 
@@ -96,16 +102,28 @@ with st.sidebar:
                                    help="Auto + kierowca za jeden dzień pracy.")
         speed = st.number_input("Średnia prędkość (km/h)", 40.0, 90.0, 65.0, 1.0,
                                 help="Służy do szacowania czasu przejazdu i liczby dni pracy (limit 9 h jazdy dziennie).")
+        channel_fee = st.number_input("Przeprawa przez La Manche (EUR)", 0.0, 2000.0, 0.0, 10.0,
+                                      help="Eurotunel lub prom, za jedną przeprawę. Wpisz własną stawkę - "
+                                           "0 oznacza, że opłata nie jest doliczana (trasa i tak jest oznaczona).")
+        tunnel_fee = st.number_input("Płatny tunel alpejski (EUR)", 0.0, 1000.0, 0.0, 10.0,
+                                     help="Za jeden tunel (Mont Blanc, Fréjus, Tauern…). 0 = nie doliczaj.")
 
     with st.expander("🔎 Szukanie doładunków", expanded=True):
         max_detour = st.slider("Maks. odchylenie trasy (km)", 0, 1000, 300, 10,
                                help="O ile km trasa połączonych zleceń może być dłuższa od najdłuższego z nich.")
-        max_orders = st.slider("Maks. zleceń w wariancie", 2, 4, 3)
         date_gap = st.number_input("Maks. różnica dat załadunku (dni)", 0, 14, 3,
                                    help="0 = bez limitu.")
         top_n = st.slider("Ile wariantów pokazać", 3, 20, 10)
+        n_check = st.slider("Ile kandydatów sprawdzić na drogach", 10, 40, 20,
+                            help="Najlepsze warianty wg szacunku są liczone po rzeczywistych trasach, a ranking "
+                                 "układany od nowa. Więcej = dokładniej, ale dłużej (publiczny serwer tras).")
+        st.caption("Liczba zleceń w wariancie nie jest ograniczona - program ładuje tyle, ile mieści "
+                   "się na naczepie (13,6 LDM / 24 t) i w limicie odchylenia.")
 
     with st.expander("🛣️ Trasy po drogach"):
+        avoid_ch = st.checkbox("Omijaj Szwajcarię", value=True,
+                               help="Trasa nie przejedzie przez Szwajcarię; jeśli serwer jej nie wyłącza, "
+                                    "aplikacja szuka objazdu (przez Francję / Włochy / Austrię / Niemcy).")
         provider_label = st.selectbox("Silnik tras", [
             "Valhalla - ciężarówka (bez klucza)", "OpenRouteService - HGV (klucz API)", "Brak (linie proste)"])
         provider = {"V": "valhalla", "O": "ors"}.get(provider_label[0], "none")
@@ -125,8 +143,10 @@ with st.sidebar:
         )
 
 cost = CostParams(day_cost_eur=day_cost, avg_speed_kmh=speed, fuel_l_per_100km=consumption,
-                  fuel_price_eur=fuel_price, toll_eur_per_km=toll)
-opt = OptimizerParams(max_detour_km=max_detour, max_orders=max_orders, top_n=top_n,
+                  fuel_price_eur=fuel_price, toll_eur_per_km=toll,
+                  channel_crossing_eur=channel_fee, alpine_tunnel_eur=tunnel_fee)
+route_opts = RouteOptions(avoid_switzerland=avoid_ch)
+opt = OptimizerParams(max_detour_km=max_detour, top_n=max(n_check, top_n),   # kandydaci do sprawdzenia na drogach
                       max_load_date_gap_days=int(date_gap) or None)
 
 # ------------------------------------------------------------------ nagłówek
@@ -144,7 +164,7 @@ def _load_example() -> None:
 
 
 def _clear_all() -> None:
-    for k in ("analysis", "raw_text", "vias", "reroute", "seen_nonce"):
+    for k in ("analysis", "raw_text", "vias", "ranked", "seen_nonce"):
         st.session_state.pop(k, None)
     st.session_state.uploader_n += 1
 
@@ -172,7 +192,7 @@ if submitted:
     if any(t.strip() for t in texts):
         prev = st.session_state.get("analysis", {}).get("id", 0)
         st.session_state.analysis = {"id": prev + 1, "texts": tuple(texts), "drop": drop_no_price, "online": online}
-        st.session_state.reroute = {}
+        st.session_state.pop("ranked", None)
     else:
         st.warning("Wklej oferty albo dodaj plik, a potem kliknij „Szukaj doładunków”.")
 
@@ -251,56 +271,67 @@ with st.container(border=True):
                            "distance_est_km": "Dystans szac. (km)", "profit_single_eur": "Zysk samodzielnie (EUR)",
                            "start_geo": "Pozycja zał.", "end_geo": "Pozycja rozł."})
 
-variants, stats = _search(orders, cost, opt)
+candidates, stats = _search(orders, cost, opt)
 
 # ------------------------------------------------------- krok 3: warianty
 with st.container(border=True):
-    step(3, "Najlepsze doładunki", "Kombinacje zleceń na jednej naczepie, od najbardziej zyskownej. "
-                                   "Kliknij wiersz, aby zobaczyć trasę.")
+    step(3, "Najlepsze doładunki", "Kombinacje zleceń na jednej naczepie, od najbardziej zyskownej - liczone po "
+                                   "rzeczywistych trasach. Kliknij wiersz, aby zobaczyć trasę.")
     if stats["truncated"]:
-        st.warning("Przerwano wyszukiwanie po limicie obliczeń - zmniejsz odchylenie lub liczbę zleceń w wariancie.")
-    if not variants:
+        st.warning("Przerwano wyszukiwanie po limicie obliczeń - zmniejsz odchylenie albo liczbę ofert.")
+    if not candidates:
         st.info("Nie znaleziono doładunków spełniających warunki. Potrzeba co najmniej 2 ofert z ceną, "
                 "a ich trasy muszą mieścić się w limicie odchylenia - spróbuj go zwiększyć w ustawieniach.")
         st.stop()
 
-    st.session_state.setdefault("reroute", {})
-    real = st.session_state.reroute
-    if st.button("🛣️ Przelicz ranking po rzeczywistych drogach",
-                 help="Wyznacza trasę po drogach dla każdego wariantu (jedno zapytanie na wariant)."):
-        with st.spinner("Wyznaczanie tras…"):
-            for v in variants:
-                r = get_route(v, [])
-                if r.has_real:
-                    st.session_state.reroute[_variant_key(v)] = evaluate_route(v, r, cost)
-        real = st.session_state.reroute
-    ranked_real = bool(real) and all(_variant_key(v) in real for v in variants)
-    if ranked_real:
-        variants.sort(key=lambda v: -real[_variant_key(v)]["profit"])
+    # ranking po trasach rzeczywistych: liczony od razu, pamiętany do zmiany danych lub ustawień
+    sig = (analysis["id"], hash(orders.drop(columns=["start_geo", "end_geo"]).to_csv()), cost, opt, provider,
+           valhalla_url, ors_key, truck, route_opts, top_n)
+    cache = st.session_state.get("ranked")
+    if not cache or cache["sig"] != sig:
+        bar = st.progress(0.0, text="Wyznaczanie tras po drogach dla najlepszych wariantów…")
+        ranked = rank_by_real_routes(
+            candidates, cost, lambda x: get_route(x, []), top_n, workers=4,
+            progress=lambda done, total: bar.progress(done / total, text=f"Trasy po drogach: {done}/{total}"))
+        bar.empty()
+        estimated = ranked is None
+        if estimated:  # routing niedostępny: ranking szacunkowy (linie proste)
+            ranked = [Ranked(x, (r := route_for_variant(x, [], truck, "none", "", valhalla_url, speed, route_opts)),
+                             evaluate_route(x, r, cost)) for x in candidates[:top_n]]
+        cache = st.session_state.ranked = {"sig": sig, "ranked": ranked, "estimated": estimated}
+    ranked, estimated = cache["ranked"], cache["estimated"]
+    if estimated:
+        st.warning("Silnik tras jest niedostępny - ranking jest szacunkowy (linia prosta × "
+                   f"{ROAD_FACTOR}). Sprawdź ustawienia „Trasy po drogach” w panelu bocznym.")
 
-    best = variants[0]
-    best_profit = real[_variant_key(best)]["profit"] if ranked_real else best.profit
-    st.markdown(f"<div class='best'>🏆 <b>Najlepszy wariant: {' + '.join(best.order_ids)}</b> · zysk "
-                f"<b>{eur(best_profit)}</b> · {best.days:.1f} dnia · {best_profit / max(best.days, 1):,.0f} EUR/dzień"
-                f"{' (trasa po drogach)' if ranked_real else ' (szacunek)'}</div>",
+    best = ranked[0]
+    bv, bev = best.variant, best.ev
+    st.markdown(f"<div class='best'>🏆 <b>Najlepszy wariant: {len(bv.order_ids)} {plural(len(bv.order_ids))} "
+                f"({' + '.join(bv.order_ids)})</b> · zysk <b>{eur(bev['profit'])}</b> · {bev['days']:.1f} dnia · "
+                f"{bev['profit'] / max(bev['days'], 1):,.0f} EUR/dzień · naczepa {bv.peak_ldm:.1f}/13,6 LDM, "
+                f"{bv.peak_weight_t:.1f}/24 t{'' if estimated else ' (trasa po drogach)'}</div>",
                 unsafe_allow_html=True)
 
-    frame = variants_to_frame(variants)
-    if ranked_real:
-        frame["Zysk po drogach (EUR)"] = [round(real[_variant_key(v)]["profit"], 0) for v in variants]
-        frame["Dystans po drogach (km)"] = [round(real[_variant_key(v)]["total_km"], 0) for v in variants]
-        frame["#"] = range(1, len(frame) + 1)
-    money = {c: st.column_config.NumberColumn(c, format="%d") for c in frame.columns if "EUR" in c or "km" in c}
+    frame = ranked_to_frame(ranked)
+    money = {c: st.column_config.NumberColumn(c, format="%d") for c in frame.columns if "EUR" in c or "km" in c.lower()}
     event = st.dataframe(frame, width="stretch", hide_index=True, on_select="rerun", selection_mode="single-row",
-                         key="variants_table", column_config={"#": st.column_config.NumberColumn("#", width="small"),
-                                                              "Trasa": st.column_config.TextColumn(width="large"),
-                                                              **money})
-    st.caption(f"Sprawdzono {stats['evaluated']} kombinacji z {stats['candidates']} zleceń. "
-               "▲ załadunek, ▼ rozładunek. Dystanse w rankingu są szacunkowe (linia prosta × "
-               f"{ROAD_FACTOR}), dokładne po wyborze wariantu.")
+                         key="variants_table", column_config={
+                             "#": st.column_config.NumberColumn("#", width="small"),
+                             "Liczba": st.column_config.NumberColumn("Liczba", width="small",
+                                                                     help="Ile zleceń jedzie na naczepie."),
+                             "Zapełnienie (LDM)": st.column_config.NumberColumn("LDM", format="%.1f",
+                                                                                help="Maks. zajęte metry ładowne."),
+                             "Ładunek (t)": st.column_config.NumberColumn("Ładunek (t)", format="%.1f",
+                                                                          help="Maks. masa ładunku na naczepie."),
+                             "Trasa": st.column_config.TextColumn(width="large"),
+                             "Przeprawy i tunele": st.column_config.TextColumn(width="large"),
+                             **money})
+    st.caption(f"Sprawdzono {stats['evaluated']} kombinacji z {stats['candidates']} ofert; na drogach policzono "
+               f"{len(candidates)} najlepszych. ▲ załadunek, ▼ rozładunek. Liczba zleceń nie jest ograniczona - "
+               "limitem jest naczepa (13,6 LDM / 24 t w każdym punkcie trasy).")
 
 selected = event.selection.rows[0] if event.selection.rows else 0
-v = variants[selected]
+v = ranked[min(selected, len(ranked) - 1)].variant
 vkey = _variant_key(v)
 st.session_state.setdefault("vias", {})
 st.session_state.setdefault("seen_nonce", set())
@@ -327,17 +358,37 @@ with st.container(border=True):
         st.success(f"Trasa po drogach dla ciężarówek ({route.provider}): {route.km:,.0f} km, "
                    f"{route.hours:.1f} h jazdy.")
 
+    # przeprawy, płatne tunele, Szwajcaria
+    crossings = ev["crossings"]
+    for c in crossings:
+        if c.kind in ("channel_tunnel", "channel_ferry"):
+            fee = f" Doliczono {eur(channel_fee)}." if channel_fee else " Opłata nie jest wliczona (ustaw ją w panelu bocznym)."
+            st.info(f"{c.icon} **Trasa przebiega przez kanał La Manche: {c.name}.**{fee}")
+        elif c.kind == "ferry":
+            st.info(f"{c.icon} **Trasa zawiera przeprawę promową:** {c.name}. Koszt przeprawy nie jest wliczony.")
+        elif c.kind == "alpine_tunnel":
+            fee = f" Doliczono {eur(tunnel_fee)}." if tunnel_fee else " Opłata nie jest wliczona (ustaw ją w panelu bocznym)."
+            st.warning(f"{c.icon} **Płatny tunel w Alpach: {c.name}.**{fee}")
+        elif c.kind == "switzerland":
+            st.error(f"{c.icon} **Trasa przebiega przez Szwajcarię** - nie udało się jej ominąć na odcinku "
+                     f"{c.leg + 1}. Przeciągnij linię na obejście (np. przez Francję lub Austrię).")
+    if not crossings and route.has_real:
+        st.caption("Na trasie nie wykryto przepraw promowych ani płatnych tuneli alpejskich "
+                   "(wykrywanie na podstawie przebiegu trasy, przybliżone).")
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Zysk", eur(ev["profit"]), f"{ev['profit'] - v.profit:+,.0f} vs szacunek",
               help="Przychód minus koszty operacyjne.")
     c2.metric("Przychód", eur(ev["revenue"]), help="Suma cen wszystkich zleceń w wariancie.")
-    c3.metric("Koszty", eur(ev["total"]), help="Paliwo + myto + praca (dni × koszt dnia).")
+    c3.metric("Koszty", eur(ev["total"]), help="Paliwo + myto + praca (dni × koszt dnia) + opłaty za przeprawy.")
     c4.metric("Km pełne / puste", f"{ev['loaded_km']:,.0f} / {ev['empty_km']:,.0f}",
               help="Pełne: z ładunkiem. Puste: między rozładunkiem a kolejnym załadunkiem.")
     c5.metric("Czas", f"{ev['days']:.1f} dnia", f"jazda {ev['drive_h']:.1f} h", delta_color="off",
               help="Dni pracy z limitem 9 h dziennie i odpoczynkiem tygodniowym.")
-    st.caption(f"Koszty: paliwo {eur(ev['fuel'])} + myto {eur(ev['tolls'])} + praca {eur(ev['labor'])} "
-               f"({ev['days']:.1f} dnia × {day_cost:,.0f} EUR)")
+    st.caption(f"Koszty: paliwo {eur(ev['fuel'])} + myto {eur(ev['tolls'])} + praca {eur(ev['labor'])}"
+               f"{' + przeprawy ' + eur(ev['fees']) if ev['fees'] else ''} "
+               f"({ev['days']:.1f} dnia × {day_cost:,.0f} EUR). Naczepa: maks. {v.peak_ldm:.1f} LDM, "
+               f"{v.peak_weight_t:.1f} t.")
 
     event_map = route_map(v, route, vias, map_id=vkey, fit_id=vkey, height=620, key=f"map_{vkey}")
     if event_map and event_map.get("map_id") == vkey and event_map["nonce"] not in st.session_state.seen_nonce:
