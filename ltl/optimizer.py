@@ -231,7 +231,7 @@ def _build_variant(df, D, single, res, cost: CostParams) -> Variant:
 def variants_to_frame(variants: list[Variant]) -> pd.DataFrame:
     rows = []
     for rank, v in enumerate(variants, start=1):
-        route = " → ".join(f"{s.order_id}{'+' if s.kind == 'L' else '-'}:{s.country} {s.postal}" for s in v.stops)
+        route = " → ".join(f"{'▲' if s.kind == 'L' else '▼'} {s.order_id} {s.country} {s.postal}" for s in v.stops)
         rows.append({
             "#": rank,
             "Zlecenia": " + ".join(v.order_ids),

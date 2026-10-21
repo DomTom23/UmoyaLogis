@@ -35,3 +35,9 @@ Gdy silnik tras jest nieosiągalny, pokazywana jest trasa orientacyjna (linie pr
 Dane można wkleić i/lub dodać jako pliki (txt, csv, tsv, xlsx) - wiele źródeł naraz, każde w swoim
 formacie (Timocom, Trans.eu, także kopia z polami w osobnych liniach). Rozpoznane zlecenia widać w edytowalnej
 tabeli: popraw błędnie odczytane pola, uzupełnij ceny, dodaj lub usuń wiersze - zmiany od razu wchodzą do optymalizacji.
+
+## Interfejs
+
+Strona prowadzi krok po kroku: **1 Dane** (wklej / pliki / przykład, szukanie przyciskiem „Szukaj doładunków” -
+bez skrótów klawiszowych) → **2 Zlecenia** (edytowalna tabela) → **3 Najlepsze doładunki** → **4 Trasa i koszty**
+(mapa z edycją). Ustawienia (koszty, limity wyszukiwania, routing) są w panelu bocznym i działają od razu.
