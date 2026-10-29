@@ -33,7 +33,7 @@ _SPACED_5 = {"SE", "CZ", "SK", "GR"}   # "123 45"
 COLUMNS = [
     "id", "source", "start_country", "start_postal", "start_city",
     "end_country", "end_postal", "end_city", "load_date", "unload_date",
-    "weight_t", "ldm", "distance_km", "price_eur", "status", "defaults_used",
+    "weight_t", "ldm", "distance_km", "price_eur", "client", "status", "defaults_used",
 ]
 
 _LOC_RE = re.compile(
@@ -75,6 +75,8 @@ class RawOrder:
     row: bool = False                       # start i cel w jednej linii
     vertical: bool = False                  # kraj / kod / miasto w osobnych liniach (kopia z Timocom)
     loose: list = field(default_factory=list)  # liczby bez jednostek
+    texts: list = field(default_factory=list)  # teksty, których nie rozpoznano jako pola (kandydaci na zleceniodawcę)
+    client: str = ""
 
 
 # ---------------------------------------------------------------- helpers
@@ -133,10 +135,16 @@ def find_locations(text: str) -> list[tuple[int, int, tuple]]:
         limit = found[i + 1][0] if i + 1 < len(found) else len(text)
         tail = text[e:limit]
         cut = _CITY_STOP_RE.search(tail)
-        city = (tail[: cut.start()] if cut else tail).strip(" ,-–—·")
+        raw_city = tail[: cut.start()] if cut else tail
+        city = raw_city.strip(" ,-–—·")
         if not re.search(r"[^\W\d_]", city) or len(city) > 40:
-            city = ""
-        out.append((s, e, (loc[0], loc[1], city)))
+            city, consumed = "", 0
+        else:
+            consumed = len(raw_city)
+            if cut:   # "Leeds (Garforth)": dopisek w nawiasie też należy do lokalizacji
+                par = re.match(r"\s*\([^)]*\)", tail[cut.start():])
+                consumed += par.end() if par else 0
+        out.append((s, e + consumed, (loc[0], loc[1], city)))
     return out
 
 
@@ -191,30 +199,45 @@ def _absorb(order: RawOrder, cell: str, *, phase: str) -> None:
     """Przypisuje pola z fragmentu tekstu do zlecenia. Pierwsze trafienie wygrywa.
 
     phase: 'row' (dowolna liczba dat: załadunek, rozładunek) | 'load' | 'unload'.
+    Fragment, w którym nic nie rozpoznano, a są litery, trafia do `order.texts` (kandydat na zleceniodawcę).
     """
     cell = cell.strip()
     if not cell:
         return
-    if order.distance_km is None and (m := _DIST_RE.search(cell)):
-        order.distance_km = _group_number(m)
-    if order.price_eur is None and (m := _PRICE_RE.search(cell)):
-        order.price_eur = _group_number(m)
-    if order.price_eur is None and _NEGOTIABLE_RE.search(cell):
-        order.negotiable = True
+    hit = False
+    if m := _DIST_RE.search(cell):
+        hit = True
+        if order.distance_km is None:
+            order.distance_km = _group_number(m)
+    if m := _PRICE_RE.search(cell):
+        hit = True
+        if order.price_eur is None:
+            order.price_eur = _group_number(m)
+    if _NEGOTIABLE_RE.search(cell):
+        hit = True
+        if order.price_eur is None:
+            order.negotiable = True
 
     rest = _DIST_RE.sub(" ", _PRICE_RE.sub(" ", cell))
-    if order.weight_t is None and (m := _KG_RE.search(rest)):
-        kg = parse_number(m.group(1))
-        order.weight_t = kg / 1000 if kg else None
+    if m := _KG_RE.search(rest):
+        hit = True
+        if order.weight_t is None:
+            kg = parse_number(m.group(1))
+            order.weight_t = kg / 1000 if kg else None
         rest = _KG_RE.sub(" ", rest)
-    if order.weight_t is None and (m := _TON_RE.search(rest)):
-        order.weight_t = parse_number(m.group(1))
-    if order.ldm is None and (m := _LDM_RE.search(rest)):
-        order.ldm = _group_number(m)
+    if m := _TON_RE.search(rest):
+        hit = True
+        if order.weight_t is None:
+            order.weight_t = parse_number(m.group(1))
+    if m := _LDM_RE.search(rest):
+        hit = True
+        if order.ldm is None:
+            order.ldm = _group_number(m)
     rest_ton = _TON_RE.sub(" ", _LDM_RE.sub(" ", rest))
 
     dates = find_dates(cell)
     if dates:
+        hit = True
         if phase == "load":
             order.load_date = order.load_date or dates[0]
         elif phase == "unload":
@@ -226,7 +249,22 @@ def _absorb(order: RawOrder, cell: str, *, phase: str) -> None:
                 elif order.unload_date is None:
                     order.unload_date = d
     elif _BARE_RE.match(rest_ton.strip()):
+        hit = True
         order.loose.append(parse_number(rest_ton))
+    if not hit and re.search(r"[^\W\d_]", cell):
+        order.texts.append(cell)
+
+
+_NOISE_RE = re.compile(r"^(strona|page|seite|wyniki|sortuj|filtr|firma|oferty)\b|\b\d+\s*(z|of|/)\s*\d+\b", re.I)
+
+
+def _pick_client(texts: list[str]) -> str:
+    """Zleceniodawca = ostatni nierozpoznany tekst zlecenia (w ofertach Timocom kolumna „Firma” jest ostatnia)."""
+    for t in reversed(texts):
+        t = t.strip()
+        if len(t) >= 2 and re.search(r"[^\W\d_]{2}", t) and not _NOISE_RE.search(t):
+            return t
+    return ""
 
 
 def _resolve_loose(o: RawOrder) -> None:
@@ -313,6 +351,7 @@ def parse_raw(text: str) -> list[RawOrder]:
     for o in orders:
         if o.start and o.end and o.start[:2] != o.end[:2]:
             _resolve_loose(o)
+            o.client = _pick_client(o.texts)
             o.vertical = vertical and not o.row
             done.append(o)
     return done
@@ -371,6 +410,7 @@ def to_dataframe(
             "weight_t": round(weight, 2), "ldm": round(ldm, 2),
             "distance_km": o.distance_km,
             "price_eur": price,
+            "client": o.client,
             "status": "OK" if price is not None else "Do negocjacji",
             "defaults_used": ", ".join(used),
         })

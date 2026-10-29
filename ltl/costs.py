@@ -14,7 +14,7 @@ class CostParams:
     toll_eur_per_km: float = 0.20
     max_drive_h_day: float = 9.0       # limit jazdy na dobę
     max_drive_h_week: float = 56.0     # limit jazdy na tydzień
-    handling_h_per_stop: float = 1.0   # załadunek / rozładunek
+    handling_h_per_stop: float = 2.0   # każdy załadunek / rozładunek
     weekly_rest_days: float = 2.0      # ~45 h odpoczynku po wyczerpaniu 56 h
     channel_crossing_eur: float = 0.0  # opłata za Eurotunel / prom przez La Manche (za jedną przeprawę)
     alpine_tunnel_eur: float = 0.0     # opłata za płatny tunel alpejski (za jeden tunel)

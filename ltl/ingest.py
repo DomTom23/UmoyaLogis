@@ -60,7 +60,7 @@ def clean_edited(df: pd.DataFrame) -> pd.DataFrame:
             else df[c].fillna("").astype(str).str.strip()
     df = df[(df["start_country"] != "") & (df["start_postal"] != "")
             & (df["end_country"] != "") & (df["end_postal"] != "")].reset_index(drop=True)
-    for c in ("start_city", "end_city", "source", "defaults_used"):
+    for c in ("start_city", "end_city", "source", "defaults_used", "client"):
         df[c] = df[c].fillna("").astype(str)
     for c in ("weight_t", "ldm", "distance_km", "price_eur"):
         df[c] = pd.to_numeric(df[c], errors="coerce")

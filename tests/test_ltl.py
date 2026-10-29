@@ -304,9 +304,11 @@ def test_partial_route_falls_back_per_leg():
 def test_no_order_limit_fills_trailer():
     # 9 małych zleceń (2 LDM / 2 t) na tej samej trasie Berlin->Paryż: naczepa mieści 6 (12 LDM)
     rows = [(f"S{i}", 52.5 + i * 0.02, 13.4, 48.9 + i * 0.02, 2.35, 2.0, 2.0, 300) for i in range(9)]
-    v, st = find_best_combinations(_orders(rows), CostParams(), OptimizerParams(max_detour_km=300))
+    v, st = find_best_combinations(_orders(rows), CostParams(), OptimizerParams(max_detour_km=300, hard_cap_orders=8))
     assert v and len(v[0].order_ids) == 6
     assert v[0].peak_ldm <= 13.6 and abs(v[0].peak_ldm - 12.0) < 1e-6
+    v4, _ = find_best_combinations(_orders(rows), CostParams(), OptimizerParams(max_detour_km=300, hard_cap_orders=4))
+    assert max(len(x.order_ids) for x in v4) == 4
     assert all(x.peak_ldm <= 13.6 + 1e-9 and x.peak_weight_t <= 24 + 1e-9 for x in v)
 
 
@@ -331,11 +333,21 @@ def test_switzerland_avoided_with_detour_and_flagged_when_unavoidable():
     avoided = route_valhalla([paris, milan], TruckProfile(), url, 65, RouteOptions(avoid_switzerland=True))
     assert avoided.is_real and not shape_in_switzerland(avoided.legs[0].shape) and avoided.switzerland_legs == []
     assert avoided.km >= through_ch.km
-    # oba końce w Szwajcarii: nie da się ominąć -> ostrzeżenie
+    # załadunek i rozładunek w Szwajcarii są dozwolone: bez ostrzeżenia
     bern, zurich = {"lat": 46.95, "lon": 7.45}, {"lat": 47.38, "lon": 8.54}
     r = route_valhalla([bern, zurich], TruckProfile(), url, 65, RouteOptions())
-    assert r.switzerland_legs == [0]
-    assert any(c.kind == "switzerland" for c in detect_crossings(r))
+    assert r.switzerland_legs == [] and not any(c.kind == "switzerland" for c in detect_crossings(r))
+    r = route_valhalla([paris, bern], TruckProfile(), url, 65, RouteOptions())     # rozładunek w CH
+    assert r.switzerland_legs == [] and not any(c.kind == "switzerland" for c in detect_crossings(r))
+    # tranzyt bez możliwości objazdu -> ostrzeżenie
+    _rt.detour_candidates = lambda *a, **k: []
+    try:
+        _rt._LEG_CACHE.clear()
+        r = route_valhalla([paris, milan], TruckProfile(), url, 65, RouteOptions())
+        assert r.switzerland_legs == [0] and any(c.kind == "switzerland" for c in detect_crossings(r))
+    finally:
+        import importlib
+        _rt.detour_candidates = importlib.import_module("ltl.regions").detour_candidates
     srv.shutdown()
 
 
@@ -424,3 +436,117 @@ def test_store_orders_roundtrip_overwrite_delete(tmp_path):
 def test_store_persists_between_instances(tmp_path):
     Store(tmp_path / "p.db").save_orders("A", parse_sources([TIMOCOM_TAB]))
     assert len(Store(tmp_path / "p.db").load_orders("A")) == 2
+
+
+# ------------------------------------------------------------ zleceniodawca, ceny szacunkowe, historia, czas pracy
+from ltl.pricing import DEFAULT_RULES, apply_price_rules, frame_to_rules, rules_to_frame
+from ltl.costs import trip_time
+
+
+def test_client_extracted_from_vertical_and_row_formats():
+    text = (pathlib.Path(__file__).parent / "data" / "timocom_vertical.txt").read_text()
+    df = parse_orders(text)
+    assert df.client.tolist() == [
+        "Optima Logistics Group S.A.", "Optima Logistics Group S.A.", "Jp Logistic sp. z o.o.",
+        "MIT UNS SPEDITION GMBH", '"ADAR" sp. z o.o.', "LKW WALTER Internationale Transportorganisation AG",
+        "Interlogis Poland sp. z o.o.", "Interlogis Poland sp. z o.o.", "Interlogis Poland sp. z o.o."]
+    row = "FR 77140 Nemours\tGB G1 1 Glasgow\t07.10\t22,00\tPlandeka, Mega\t13,60\t1176\t-\t2500,00 EUR\tOptima Logistics Group S.A.\n"
+    r = parse_orders(row).iloc[0]
+    assert r.client == "Optima Logistics Group S.A." and r.price_eur == 2500 and r.distance_km == 1176
+    # brak firmy i śmieci z paginacji nie są zleceniodawcą
+    assert parse_orders(TRANSEU + "\nStrona 1 z 2\n").client.tolist() == ["", ""]
+
+
+def test_price_rules_estimates_and_minimums():
+    rows = [("CH", "FR", 4.0, None), ("CH", "FR", 3.0, None), ("FR", "CH", 2.0, None), ("FR", "CH", 1.9, None),
+            ("FR", "GB", 2.0, None), ("FR", "GB", 1.0, None), ("GB", "FR", 4.0, None), ("GB", "FR", 3.0, None),
+            ("FR", "DE", 13.6, None), ("FR", "CH", 1.0, 900.0), ("GB", "CH", 4.0, None)]
+    df = pd.DataFrame(rows, columns=["start_country", "end_country", "ldm", "price_eur"])
+    out = apply_price_rules(df, DEFAULT_RULES)
+    assert out.price_used_eur.fillna(-1).tolist() == [600, -1, 500, -1, 600, -1, 600, -1, -1, 900, 1000]
+    assert out.price_kind.tolist() == ["szacunek", "brak", "szacunek", "brak", "szacunek", "brak", "szacunek",
+                                       "brak", "brak", "oferta", "szacunek"]   # GB->CH: wyższa stawka (250 > 150)
+    assert "poniżej minimum" in out.price_note.iloc[1] and "pasującej reguły" in out.price_note.iloc[8]
+    assert (apply_price_rules(df, DEFAULT_RULES, enabled=False).price_kind != "szacunek").all()
+    assert frame_to_rules(rules_to_frame(DEFAULT_RULES)) == DEFAULT_RULES
+
+
+def test_stop_handling_is_two_hours_per_loading_and_unloading():
+    p = CostParams()
+    assert p.handling_h_per_stop == 2.0
+    t = trip_time(0, 12, p)             # 6 zleceń = 12 przystanków po 2 h = 24 h pracy -> 3 dni po 9 h
+    assert t["work_h"] == 24 and t["days"] == 3
+    assert OptimizerParams().hard_cap_orders == 6
+
+
+def test_estimated_prices_enter_variants_only_when_eligible():
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 8, 1500), ("B", 52.4, 13.5, 48.8, 2.30, 4.0, 6, None),
+            ("C", 52.45, 13.45, 48.85, 2.32, 1.0, 1, None)]
+    df = _orders(rows)
+    for c in ("start_country", "end_country"):
+        df[c] = ["DE", "DE", "DE"]
+    df["end_country"] = ["FR", "GB", "GB"]
+    priced = apply_price_rules(df, DEFAULT_RULES)       # B: GB, 4 LDM x 300 = 1200 (ok); C: 1 x 300 = 300 (za mało)
+    priced["price_eur"] = priced["price_used_eur"]
+    v, _ = find_best_combinations(priced, CostParams(), OptimizerParams(max_detour_km=500))
+    assert v and set(v[0].order_ids) == {"A", "B"} and all("C" not in x.order_ids for x in v)
+
+
+def test_history_dedup_filters_and_updates(tmp_path):
+    st = Store(tmp_path / "h.db")
+    df = parse_orders((pathlib.Path(__file__).parent / "data" / "timocom_vertical.txt").read_text())
+    assert st.record_offers(df, "2026-10-01T10:00:00") == {"new": 9, "repeated": 0}
+    assert st.record_offers(df, "2026-10-02T10:00:00") == {"new": 0, "repeated": 9}      # bez duplikatów
+    changed = df.copy()
+    changed.loc[0, "price_eur"] = 2600.0                                                     # inna cena = nowy wpis
+    assert st.record_offers(changed, "2026-10-03T10:00:00") == {"new": 1, "repeated": 8}
+    h = st.query_history()
+    assert len(h) == 10 and h.seen_count.max() == 3
+    assert len(st.query_history(clients=["Interlogis Poland sp. z o.o."])) == 3
+    assert len(st.query_history(text="walter")) == 1 and len(st.query_history(text="leeds")) == 1
+    assert len(st.query_history(to_countries=["GB"], from_countries=["FR"])) == 10
+    assert len(st.query_history(date_from="2026-10-03")) == 1 and len(st.query_history(date_to="2026-10-01")) == 9
+    row = h[h.client.str.contains("ADAR")].iloc[[0]].copy()
+    row["realized_price_eur"], row["outcome"], row["note"] = 1450.0, "zrealizowane", "telefonicznie"
+    assert st.update_history(row[["id", "realized_price_eur", "outcome", "note"]]) == 1
+    done = st.query_history(outcome="zrealizowane")
+    assert len(done) == 1 and done.realized_price_eur.iloc[0] == 1450 and done.note.iloc[0] == "telefonicznie"
+    assert st.history_clients()[0] == "Interlogis Poland sp. z o.o."
+    assert st.delete_history(list(done.id)) == 1 and len(st.query_history()) == 9
+
+
+def test_store_migrates_old_database_without_client(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as c:
+        c.executescript("""CREATE TABLE saved_tables (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+            name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, n_rows INTEGER NOT NULL,
+            note TEXT NOT NULL DEFAULT '', UNIQUE (kind, name));
+            CREATE TABLE saved_orders (table_id INTEGER NOT NULL, row_no INTEGER NOT NULL, order_no TEXT, source TEXT,
+            start_country TEXT, start_postal TEXT, start_city TEXT, end_country TEXT, end_postal TEXT, end_city TEXT,
+            load_date TEXT, unload_date TEXT, weight_t REAL, ldm REAL, distance_km REAL, price_eur REAL,
+            status TEXT, defaults_used TEXT, PRIMARY KEY (table_id, row_no));""")
+    st = Store(path)
+    st.save_orders("nowa", parse_sources([TIMOCOM_TAB]))
+    assert "client" in st.load_orders("nowa").columns
+
+
+def test_filter_and_merge_edits_keep_hidden_rows():
+    from ltl.ordertable import filter_orders, merge_edits
+    full = parse_orders((pathlib.Path(__file__).parent / "data" / "timocom_vertical.txt").read_text())
+    inter = filter_orders(full, clients=["Interlogis Poland sp. z o.o."])
+    assert inter.id.tolist() == ["T7", "T8", "T9"]
+    assert filter_orders(full, text="LEEDS").id.tolist() == ["T2"] and filter_orders(full, text="walter").id.tolist() == ["T6"]
+    assert filter_orders(full, only_no_price=True).id.tolist() == ["T4", "T8", "T9"]
+    edited = inter.copy()
+    edited.loc[edited.id == "T8", "price_eur"] = 650.0                      # uzupełniona cena
+    edited = edited[edited.id != "T9"]                                      # usunięty wiersz
+    edited.loc[len(edited) + 100] = [None] * len(edited.columns)            # nowy wiersz bez numeru
+    edited.loc[edited.id.isna(), ["start_country", "start_postal", "end_country", "end_postal", "client"]] = \
+        ["FR", "75001", "GB", "SW1A 1AA", "Nowy Klient"]
+    merged = merge_edits(full, inter.id.tolist(), edited)
+    assert len(merged) == 9 and "T9" not in merged.id.tolist()               # 9 - 1 usunięty + 1 dodany
+    assert merged.loc[merged.id == "T8", "price_eur"].iloc[0] == 650
+    assert merged.loc[merged.id == "T1", "client"].iloc[0] == "Optima Logistics Group S.A."   # ukryte wiersze zostają
+    new = merged[merged.id.str.startswith("M")].iloc[0]
+    assert new.client == "Nowy Klient" and merged.id.is_unique

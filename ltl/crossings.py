@@ -6,7 +6,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from .geo import haversine_km
-from .regions import (ALPINE_TOLL_TUNNELS, CHANNEL_FERRIES, EUROTUNNEL, OTHER_FERRIES, shape_in_switzerland)
+from .regions import (ALPINE_TOLL_TUNNELS, CHANNEL_FERRIES, EUROTUNNEL, OTHER_FERRIES, in_switzerland,
+                      shape_in_switzerland)
 from .routing import RouteResult
 
 FERRY_ENTER, FERRY_EXIT = 28, 29      # typy manewrów Valhalla
@@ -95,6 +96,7 @@ def detect_crossings(route: RouteResult) -> list[Crossing]:
             if any(k in names for k in keywords) or (center and _near(shape, center, radius)):
                 add("alpine_tunnel", name, i)
 
-        if leg.via_switzerland or shape_in_switzerland(leg.shape):
-            add("switzerland", "trasa przebiega przez Szwajcarię", i)
+        ends_in_ch = bool(in_switzerland([shape[0, 0], shape[-1, 0]], [shape[0, 1], shape[-1, 1]]).any())
+        if leg.via_switzerland or (shape_in_switzerland(leg.shape) and not ends_in_ch):
+            add("switzerland", "trasa przebiega przez Szwajcarię", i)   # załadunek/rozładunek w CH jest dozwolony
     return list(found.values())

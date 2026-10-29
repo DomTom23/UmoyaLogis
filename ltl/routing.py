@@ -19,7 +19,8 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from .geo import ROAD_FACTOR, haversine_km
-from .regions import detour_candidates, shape_in_switzerland, switzerland_exclusion_polygon
+from .regions import (detour_candidates, in_switzerland, shape_in_switzerland,
+                      switzerland_exclusion_polygon)
 
 VALHALLA_URL = os.environ.get("VALHALLA_URL", "https://valhalla1.openstreetmap.de")
 ORS_URL = "https://api.openrouteservice.org"
@@ -245,10 +246,16 @@ def _valhalla_leg(group, truck, base_url, exclude_ch: bool = False, depth: int =
     raise first_err
 
 
+def _endpoints_in_ch(group: list[dict]) -> bool:
+    """Załadunek lub rozładunek w Szwajcarii jest dozwolony - tylko tranzyt przez nią jest omijany."""
+    ends = [group[0], group[-1]]
+    return bool(in_switzerland([e["lat"] for e in ends], [e["lon"] for e in ends]).any())
+
+
 def _avoid_switzerland(group: list[dict], leg: Leg, route_fn) -> Leg:
     """Gdy odcinek przechodzi przez Szwajcarię: próbuje objazdu przez punkty pośrednie (Lyon, Mediolan,
     Monachium…) i wybiera najkrótszy wariant bez Szwajcarii. Nie udało się -> oznacza odcinek ostrzeżeniem."""
-    if len(group) == 2 and not shape_in_switzerland([(g["lat"], g["lon"]) for g in group]):
+    if len(group) == 2:
         best = None
         for _, lat, lon in detour_candidates(group[0], group[1]):
             via = {"lat": lat, "lon": lon}
@@ -287,8 +294,9 @@ def route_valhalla(points: list[dict], truck: TruckProfile, base_url: str = VALH
     for i, group in enumerate(_groups(points)):
         try:
             def build(group=group):
-                leg = _valhalla_leg(group, truck, base_url, opts.avoid_switzerland)
-                if opts.avoid_switzerland and shape_in_switzerland(leg.shape):
+                avoid = opts.avoid_switzerland and not _endpoints_in_ch(group)
+                leg = _valhalla_leg(group, truck, base_url, avoid)
+                if avoid and shape_in_switzerland(leg.shape):
                     leg = _avoid_switzerland(group, leg, lambda g: _valhalla_leg(g, truck, base_url, True))
                 return leg
             legs.append(_cached(_leg_key("valhalla", base_url, truck, opts, group), build))
@@ -327,7 +335,7 @@ def route_ors(points: list[dict], truck: TruckProfile, api_key: str, avg_speed_k
     for i, g in enumerate(_groups(points)):
         def build(g=g):
             leg = _ors_request(g, truck, api_key)
-            if opts.avoid_switzerland and shape_in_switzerland(leg.shape):
+            if opts.avoid_switzerland and not _endpoints_in_ch(g) and shape_in_switzerland(leg.shape):
                 leg = _avoid_switzerland(g, leg, lambda grp: _ors_request(grp, truck, api_key))
             return leg
         try:

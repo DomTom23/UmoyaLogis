@@ -12,11 +12,13 @@ from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.ingest import clean_edited, parse_sources, read_uploaded
 from ltl.mapview import route_map
 from ltl.optimizer import OptimizerParams, find_best_combinations
+from ltl.ordertable import filter_orders, merge_edits
+from ltl.pricing import DEFAULT_RULES, RULE_COLUMNS, DIRECTION_LABELS, apply_price_rules, frame_to_rules, rules_to_frame
 from ltl.ranking import Ranked, rank_by_real_routes, ranked_to_frame, variant_key
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
 from ltl.routing import VALHALLA_URL, RouteOptions, RouteResult, TruckProfile
 from ltl.sample import SAMPLE_TEXT
-from ltl.storage import InvalidName, NameExists, Store
+from ltl.storage import OUTCOMES, InvalidName, NameExists, Store
 
 st.set_page_config(page_title="Optymalizator Tras LTL", page_icon="🚛", layout="wide")
 
@@ -108,6 +110,9 @@ with st.sidebar:
                                    help="Auto + kierowca za jeden dzień pracy.")
         speed = st.number_input("Średnia prędkość (km/h)", 40.0, 90.0, 65.0, 1.0,
                                 help="Służy do szacowania czasu przejazdu i liczby dni pracy (limit 9 h jazdy dziennie).")
+        handling_h = st.number_input("Czas na załadunek / rozładunek (h)", 0.0, 8.0, 2.0, 0.5,
+                                     help="Liczony dla każdego załadunku i każdego rozładunku; wlicza się do czasu "
+                                          "pracy i liczby dni (koszt dnia pracy).")
         channel_fee = st.number_input("Przeprawa przez La Manche (EUR)", 0.0, 2000.0, 0.0, 10.0,
                                       help="Eurotunel lub prom, za jedną przeprawę. Wpisz własną stawkę - "
                                            "0 oznacza, że opłata nie jest doliczana (trasa i tak jest oznaczona).")
@@ -119,12 +124,29 @@ with st.sidebar:
                                help="O ile km trasa połączonych zleceń może być dłuższa od najdłuższego z nich.")
         date_gap = st.number_input("Maks. różnica dat załadunku (dni)", 0, 14, 3,
                                    help="0 = bez limitu.")
+        max_orders = st.slider("Maks. zleceń w wariancie", 2, 12, 6,
+                               help="Górny limit liczby zleceń na jednej naczepie (poza limitem 13,6 LDM / 24 t).")
         top_n = st.slider("Ile wariantów pokazać", 3, 20, 10)
         n_check = st.slider("Ile kandydatów sprawdzić na drogach", 10, 40, 20,
                             help="Najlepsze warianty wg szacunku są liczone po rzeczywistych trasach, a ranking "
                                  "układany od nowa. Więcej = dokładniej, ale dłużej (publiczny serwer tras).")
-        st.caption("Liczba zleceń w wariancie nie jest ograniczona - program ładuje tyle, ile mieści "
-                   "się na naczepie (13,6 LDM / 24 t) i w limicie odchylenia.")
+
+    with st.expander("💱 Ceny szacunkowe (oferty bez ceny)"):
+        use_est = st.checkbox("Używaj cen szacunkowych", value=True,
+                              help="Oferta bez ceny dostaje cenę = stawka × LDM wg reguły dla kraju załadunku "
+                                   "lub rozładunku. Trafia do wariantów tylko, gdy ta cena osiąga minimum.")
+        st.caption("Stawka EUR/LDM i minimalny przychód dla kraju załadunku („z kraju”) lub rozładunku "
+                   "(„do kraju”). Gdy pasuje kilka reguł, obowiązuje najwyższa stawka.")
+        rules_df = st.data_editor(
+            rules_to_frame(DEFAULT_RULES), key="rules_editor", num_rows="dynamic", hide_index=True, width="stretch",
+            column_config={
+                "Aktywna": st.column_config.CheckboxColumn("Akt.", width="small"),
+                "Kierunek": st.column_config.SelectboxColumn("Kierunek", options=list(DIRECTION_LABELS.values())),
+                "Kraj": st.column_config.TextColumn("Kraj", max_chars=2, width="small"),
+                "EUR/LDM": st.column_config.NumberColumn("EUR/LDM", min_value=0.0, format="%.0f"),
+                "Min. przychód (EUR)": st.column_config.NumberColumn("Min. (EUR)", min_value=0.0, format="%.0f"),
+            })
+        price_rules = frame_to_rules(rules_df)
 
     with st.expander("🛣️ Trasy po drogach"):
         avoid_ch = st.checkbox("Omijaj Szwajcarię", value=True,
@@ -150,10 +172,10 @@ with st.sidebar:
 
 cost = CostParams(day_cost_eur=day_cost, avg_speed_kmh=speed, fuel_l_per_100km=consumption,
                   fuel_price_eur=fuel_price, toll_eur_per_km=toll,
-                  channel_crossing_eur=channel_fee, alpine_tunnel_eur=tunnel_fee)
+                  channel_crossing_eur=channel_fee, alpine_tunnel_eur=tunnel_fee, handling_h_per_stop=handling_h)
 route_opts = RouteOptions(avoid_switzerland=avoid_ch)
 opt = OptimizerParams(max_detour_km=max_detour, top_n=max(n_check, top_n),   # kandydaci do sprawdzenia na drogach
-                      max_load_date_gap_days=int(date_gap) or None)
+                      hard_cap_orders=max_orders, max_load_date_gap_days=int(date_gap) or None)
 
 # ------------------------------------------------------------------ nagłówek
 st.title("🚛 Optymalizator Tras LTL")
@@ -188,6 +210,9 @@ with st.container(border=True):
         online = o1.checkbox("Ustal położenie kodów pocztowych przez internet", value=True, key="opt_online",
                              help="zippopotam.us i Nominatim. Bez tego używane są środki krajów (mało dokładne).")
         drop_no_price = o2.checkbox("Pomiń oferty bez ceny", value=False, key="opt_drop")
+        keep_history = st.checkbox("Zapisz oferty w historii", value=True, key="opt_history",
+                                   help="Każdy import trafia do historii ofert (bez duplikatów); w historii można "
+                                        "szukać po zleceniodawcy i wpisywać ceny zrealizowane.")
         submitted = st.form_submit_button("🔍 Szukaj doładunków", type="primary", width="stretch")
     b1, b2, _ = st.columns([1, 1, 4])
     b1.button("📋 Wczytaj przykład", on_click=_load_example, width="stretch")
@@ -230,12 +255,93 @@ if submitted:
     texts = [raw_text] + [read_uploaded(f.name, f.getvalue()) for f in files]
     if any(t.strip() for t in texts):
         prev = st.session_state.get("analysis", {}).get("id", 0)
-        st.session_state.analysis = {"id": prev + 1, "texts": tuple(texts), "drop": drop_no_price, "online": online}
+        st.session_state.analysis = {"id": prev + 1, "texts": tuple(texts), "drop": drop_no_price, "online": online,
+                                     "record": keep_history}
         st.session_state.pop("ranked", None)
     else:
         st.warning("Wklej oferty albo dodaj plik, a potem kliknij „Szukaj doładunków”.")
 
 analysis = st.session_state.get("analysis")
+parsed = None
+if analysis:
+    parsed = analysis["df"] if "df" in analysis else _parse(analysis["texts"], analysis["drop"])
+    if analysis.get("record") and not analysis.get("recorded") and not parsed.empty:
+        analysis["recorded"] = True       # raz na import
+        rec = _store().record_offers(parsed)
+        st.toast(f"Historia ofert: {rec['new']} nowych, {rec['repeated']} już znanych.", icon="📜")
+
+
+def render_history() -> None:
+    store = _store()
+    n_all = store.history_count()
+    with st.expander(f"📜 Historia ofert ({n_all})"):
+        if n_all == 0:
+            st.caption("Historia jest pusta. Oferty zapisują się automatycznie przy każdym wyszukiwaniu "
+                       "(opcja „Zapisz oferty w historii” w kroku 1).")
+            return
+        all_h = store.query_history(limit=50000)
+        c1, c2, c3 = st.columns(3)
+        h_clients = c1.multiselect("Zleceniodawca", store.history_clients(), key="h_clients")
+        h_text = c2.text_input("Szukaj (zleceniodawca, miasto, kod)", key="h_text")
+        h_outcome = c3.selectbox("Wynik", ["(wszystkie)"] + OUTCOMES[1:], key="h_outcome")
+        d1, d2, d3, d4 = st.columns(4)
+        h_from = d1.multiselect("Kraj załadunku", sorted(all_h.start_country.dropna().unique()), key="h_from")
+        h_to = d2.multiselect("Kraj rozładunku", sorted(all_h.end_country.dropna().unique()), key="h_to")
+        h_d1 = d3.date_input("Od (data zobaczenia)", value=None, key="h_d1")
+        h_d2 = d4.date_input("Do", value=None, key="h_d2")
+        flt = dict(clients=h_clients, text=h_text, from_countries=h_from, to_countries=h_to, date_from=h_d1,
+                   date_to=h_d2, outcome="" if h_outcome == "(wszystkie)" else h_outcome)
+        h = store.query_history(limit=3000, **flt)
+        priced = h[h.price_eur.notna()]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Oferty", len(h))
+        m2.metric("Mediana ceny", eur(priced.price_eur.median()) if len(priced) else "—")
+        per_ldm = (priced.price_eur / priced.ldm.where(priced.ldm > 0)).dropna()
+        per_km = (priced.price_eur / priced.distance_km.where(priced.distance_km > 0)).dropna()
+        m3.metric("Śr. EUR / LDM", f"{per_ldm.mean():.0f}" if len(per_ldm) else "—")
+        m4.metric("Śr. EUR / km", f"{per_km.mean():.2f}" if len(per_km) else "—")
+        st.caption("Kolumny „Cena zrealizowana”, „Wynik” i „Notatka” można edytować - przydadzą się do analizy cen.")
+        fsig = hash(tuple(map(str, flt.values())))
+        edited_h = st.data_editor(
+            h, key=f"hist_editor_{fsig}", hide_index=True, width="stretch", num_rows="fixed",
+            disabled=[c for c in h.columns if c not in ("realized_price_eur", "outcome", "note")],
+            column_order=["first_seen_at", "client", "start_country", "start_postal", "start_city", "end_country",
+                          "end_postal", "end_city", "load_date", "weight_t", "ldm", "distance_km", "price_eur",
+                          "realized_price_eur", "outcome", "note", "seen_count", "last_seen_at"],
+            column_config={
+                "first_seen_at": st.column_config.TextColumn("Zobaczono", width="small"),
+                "last_seen_at": st.column_config.TextColumn("Ostatnio", width="small"),
+                "seen_count": st.column_config.NumberColumn("Razy", width="small"),
+                "client": st.column_config.TextColumn("Zleceniodawca"),
+                "start_country": st.column_config.TextColumn("Kraj zał.", width="small"),
+                "start_postal": st.column_config.TextColumn("Kod zał.", width="small"),
+                "start_city": st.column_config.TextColumn("Miasto zał."),
+                "end_country": st.column_config.TextColumn("Kraj rozł.", width="small"),
+                "end_postal": st.column_config.TextColumn("Kod rozł.", width="small"),
+                "end_city": st.column_config.TextColumn("Miasto rozł."),
+                "load_date": st.column_config.DateColumn("Data zał.", format="DD.MM.YYYY"),
+                "weight_t": st.column_config.NumberColumn("Waga (t)", format="%.2f"),
+                "ldm": st.column_config.NumberColumn("LDM", format="%.2f"),
+                "distance_km": st.column_config.NumberColumn("Dystans (km)", format="%.0f"),
+                "price_eur": st.column_config.NumberColumn("Cena oferty (EUR)", format="%.0f"),
+                "realized_price_eur": st.column_config.NumberColumn("Cena zrealizowana (EUR)", min_value=0.0,
+                                                                     format="%.0f"),
+                "outcome": st.column_config.SelectboxColumn("Wynik", options=OUTCOMES),
+                "note": st.column_config.TextColumn("Notatka"),
+            })
+        s1, s2, _ = st.columns([1, 1, 3])
+        if s1.button("💾 Zapisz zmiany", key="h_save", width="stretch"):
+            keys = ["id", "realized_price_eur", "outcome", "note"]
+            old, new = h[keys].set_index("id"), edited_h[keys].set_index("id")
+            diff = (old.fillna("") != new.fillna("")).any(axis=1)
+            n_changed = _store().update_history(edited_h.loc[diff.reindex(edited_h["id"]).values, keys])
+            st.toast(f"Zapisano zmiany w historii ({n_changed}).", icon="💾")
+        s2.download_button("⬇️ Pobierz CSV", h.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                           file_name="historia_ofert.csv", mime="text/csv", width="stretch")
+
+
+render_history()
+
 if not analysis:
     with st.expander("ℹ️ Jak to działa", expanded=True):
         st.markdown(
@@ -245,7 +351,6 @@ if not analysis:
             "4. **Dopracuj trasę** na mapie: przeciągnij fragment linii, a koszty przeliczą się same.")
     st.stop()
 
-parsed = analysis["df"] if "df" in analysis else _parse(analysis["texts"], analysis["drop"])
 if parsed.empty:
     st.error("Nie rozpoznano żadnych zleceń. W danych muszą być kody w formacie „kraj kod” "
              "(np. FR 77140, GB G1 1) dla miejsca załadunku i rozładunku każdej oferty.")
@@ -257,15 +362,40 @@ with st.container(border=True):
          f"{'Wczytano zapisaną tabelę „' + st.session_state['loaded_name'] + '”: ' if st.session_state.get('loaded_name') else 'Rozpoznano '}"
          f"{len(parsed)} ofert (źródło: {', '.join(sorted(set(parsed['source'])) or ['—'])}). "
          "Kliknij komórkę, aby poprawić wartość; wiersze można dodawać i usuwać. Zmiany od razu wchodzą do wyników.")
+    if st.session_state.get("work_for") != analysis["id"]:       # nowa analiza: nowy zbiór roboczy
+        st.session_state.work = parsed.reset_index(drop=True)
+        st.session_state.work_for = analysis["id"]
+        st.session_state.pop("fsig", None)
+        st.session_state.pop("last_view", None)
+    work = st.session_state.work
+
+    aid = analysis["id"]
+    f1, f2, f3 = st.columns([2, 2, 1])
+    sel_clients = f1.multiselect("Filtr: zleceniodawca", sorted(set(work["client"].dropna()) - {""}),
+                                 key=f"flt_clients_{aid}", help="Pokazuje tylko zlecenia wybranych zleceniodawców.")
+    q = f2.text_input("Szukaj (zleceniodawca, miasto, kod, nr)", key=f"flt_q_{aid}")
+    only_np = f3.checkbox("Tylko bez ceny", key=f"flt_np_{aid}")
+    fsig = (tuple(sel_clients), q, only_np)
+    if st.session_state.get("fsig") != fsig:          # zmiana filtra: zatwierdź poprawki z poprzedniego widoku
+        last = st.session_state.get("last_view")
+        if last is not None:
+            work = merge_edits(work, last["ids"], last["edited"])
+            st.session_state.work = work
+        st.session_state.fsig = fsig
+    view = filter_orders(work, sel_clients, q, only_np)
+    if len(view) < len(work):
+        st.caption(f"Widok: {len(view)} z {len(work)} zleceń. Filtry zmieniają tylko widok tabeli - "
+                   "do szukania doładunków trafiają wszystkie zlecenia.")
     edited = st.data_editor(
-        parsed, key=f"orders_{analysis['id']}", num_rows="dynamic", width="stretch", hide_index=True,
+        view, key=f"orders_{aid}_{abs(hash(fsig))}", num_rows="dynamic", width="stretch", hide_index=True,
         disabled=["id", "source", "status", "defaults_used"],
-        column_order=["id", "source", "start_country", "start_postal", "start_city", "end_country", "end_postal",
-                      "end_city", "load_date", "unload_date", "weight_t", "ldm", "distance_km", "price_eur",
-                      "status", "defaults_used"],
+        column_order=["id", "source", "client", "start_country", "start_postal", "start_city", "end_country",
+                      "end_postal", "end_city", "load_date", "unload_date", "weight_t", "ldm", "distance_km",
+                      "price_eur", "status", "defaults_used"],
         column_config={
             "id": st.column_config.TextColumn("Nr", width="small"),
             "source": st.column_config.TextColumn("Źródło", width="small"),
+            "client": st.column_config.TextColumn("Zleceniodawca", width="medium"),
             "start_country": st.column_config.TextColumn("Kraj zał.", width="small"),
             "start_postal": st.column_config.TextColumn("Kod zał.", width="small"),
             "start_city": st.column_config.TextColumn("Miasto zał."),
@@ -283,7 +413,8 @@ with st.container(border=True):
                 "Uzupełniono", help="Pola, których nie było w ofercie i przyjęto wartości domyślne."),
         },
     )
-    orders = clean_edited(edited)
+    st.session_state.last_view = {"ids": view["id"].tolist(), "edited": edited}
+    orders = clean_edited(merge_edits(work, view["id"].tolist(), edited))
     if orders.empty:
         st.warning("Brak poprawnych wierszy - potrzebne są kraj i kod pocztowy załadunku oraz rozładunku.")
         st.stop()
@@ -303,17 +434,26 @@ with st.container(border=True):
             st.warning(f"Tabela „{save_name.strip()}” już istnieje - zaznacz „Nadpisz” albo wybierz inną nazwę.")
         except InvalidName as e:
             st.warning(str(e))
-    orders = _coords(orders, analysis["online"])
+    orders = apply_price_rules(_coords(orders, analysis["online"]), price_rules, use_est)
 
     est = haversine_km(orders.start_lat, orders.start_lon, orders.end_lat, orders.end_lon) * ROAD_FACTOR
     orders["distance_est_km"] = est.round(0)
     dist_used = orders["distance_km"].fillna(orders["distance_est_km"])
     orders["profit_single_eur"] = [round(profit(p, d, 2, cost)["profit"], 0) if pd.notna(p) else None
-                                   for p, d in zip(orders["price_eur"], dist_used)]
-    n_priced = int(orders["price_eur"].notna().sum())
-    if n_priced < len(orders):
-        st.info(f"{len(orders) - n_priced} ofert bez ceny („Do negocjacji”) nie bierze udziału w wyszukiwaniu - "
-                "wpisz cenę w tabeli, aby je uwzględnić.")
+                                   for p, d in zip(orders["price_used_eur"], dist_used)]
+    no_price = orders[orders["price_eur"].isna()]
+    if len(no_price):
+        n_est = int((no_price["price_kind"] == "szacunek").sum())
+        st.info(f"{len(no_price)} ofert bez ceny: {n_est} dostało cenę szacunkową (wg reguł w panelu bocznym), "
+                f"{len(no_price) - n_est} jest wyłączonych z wyszukiwania. Wpisz cenę w tabeli, aby uwzględnić "
+                "ofertę po cenie z oferty.")
+        with st.expander("Ceny szacunkowe: które oferty weszły do wariantów"):
+            st.dataframe(no_price[["id", "client", "start_country", "end_country", "ldm", "price_used_eur",
+                                   "price_kind", "price_note"]], width="stretch", hide_index=True,
+                         column_config={"id": "Nr", "client": "Zleceniodawca", "start_country": "Z", "end_country": "Do",
+                                        "ldm": "LDM", "price_used_eur": st.column_config.NumberColumn(
+                                            "Cena szac. (EUR)", format="%.0f"),
+                                        "price_kind": "Cena", "price_note": "Uzasadnienie"})
     if not orders["geo_precise"].all():
         st.warning("Części kodów pocztowych nie udało się zlokalizować - użyto środka kraju, więc odległości "
                    "i trasy są mocno przybliżone. Sprawdź połączenie z internetem lub kody pocztowe.")
@@ -327,7 +467,11 @@ with st.container(border=True):
                            "distance_est_km": "Dystans szac. (km)", "profit_single_eur": "Zysk samodzielnie (EUR)",
                            "start_geo": "Pozycja zał.", "end_geo": "Pozycja rozł."})
 
-candidates, stats = _search(orders, cost, opt)
+orders_opt = orders.assign(price_eur=orders["price_used_eur"])      # optymalizacja używa ceny z oferty lub szacunkowej
+client_map = dict(zip(orders["id"], orders["client"].fillna("")))
+est_ids = set(orders.loc[orders["price_kind"] == "szacunek", "id"])
+price_map = dict(zip(orders["id"], orders["price_used_eur"]))
+candidates, stats = _search(orders_opt, cost, opt)
 
 # ------------------------------------------------------- krok 3: warianty
 with st.container(border=True):
@@ -368,10 +512,30 @@ with st.container(border=True):
                 f"{bv.peak_weight_t:.1f}/24 t{'' if estimated else ' (trasa po drogach)'}</div>",
                 unsafe_allow_html=True)
 
-    frame = ranked_to_frame(ranked)
+    vclients = sorted({c for r in ranked for i in r.variant.order_ids if (c := client_map.get(i))})
+    vf1, vf2 = st.columns(2)
+    sel_vc = vf1.multiselect("Filtr: zleceniodawca w wariancie", vclients, key="vf_clients",
+                             help="Pokazuje warianty, w których jest zlecenie wybranego zleceniodawcy.")
+    vq = vf2.text_input("Szukaj w wariantach (zleceniodawca, nr, miasto, kod)", key="vf_q").strip().lower()
+
+    def _variant_text(r) -> str:
+        ids = r.variant.order_ids
+        return " ".join([*ids, *(client_map.get(i, "") for i in ids),
+                         *(f"{s.city} {s.postal} {s.country}" for s in r.variant.stops)]).lower()
+
+    shown = [r for r in ranked
+             if (not sel_vc or any(client_map.get(i) in sel_vc for i in r.variant.order_ids))
+             and (not vq or vq in _variant_text(r))]
+    if not shown:
+        st.info("Żaden wariant nie pasuje do filtra - pokazuję wszystkie.")
+        shown = ranked
+    elif len(shown) < len(ranked):
+        st.caption(f"Widok: {len(shown)} z {len(ranked)} wariantów.")
+
+    frame = ranked_to_frame(shown, client_map, est_ids)
     money = {c: st.column_config.NumberColumn(c, format="%d") for c in frame.columns if "EUR" in c or "km" in c.lower()}
     event = st.dataframe(frame, width="stretch", hide_index=True, on_select="rerun", selection_mode="single-row",
-                         key="variants_table", column_config={
+                         key=f"variants_table_{abs(hash((tuple(sel_vc), vq)))}", column_config={
                              "#": st.column_config.NumberColumn("#", width="small"),
                              "Liczba": st.column_config.NumberColumn("Liczba", width="small",
                                                                      help="Ile zleceń jedzie na naczepie."),
@@ -380,11 +544,14 @@ with st.container(border=True):
                              "Ładunek (t)": st.column_config.NumberColumn("Ładunek (t)", format="%.1f",
                                                                           help="Maks. masa ładunku na naczepie."),
                              "Trasa": st.column_config.TextColumn(width="large"),
+                             "Zleceniodawcy": st.column_config.TextColumn(width="medium"),
+                             "Ceny szac.": st.column_config.TextColumn(
+                                 help="Zlecenia, których cena jest szacunkowa (oferta bez ceny)."),
                              "Przeprawy i tunele": st.column_config.TextColumn(width="large"),
                              **money})
     st.caption(f"Sprawdzono {stats['evaluated']} kombinacji z {stats['candidates']} ofert; na drogach policzono "
-               f"{len(candidates)} najlepszych. ▲ załadunek, ▼ rozładunek. Liczba zleceń nie jest ograniczona - "
-               "limitem jest naczepa (13,6 LDM / 24 t w każdym punkcie trasy).")
+               f"{len(candidates)} najlepszych. ▲ załadunek, ▼ rozładunek. W wariancie maks. {max_orders} zleceń, "
+               "a naczepa nie może przekroczyć 13,6 LDM / 24 t w żadnym punkcie trasy.")
 
     with st.expander("💾 Zapisz ranking pod nazwą / zobacz zapisane rankingi"):
         with st.form("save_ranking_form", border=False):
@@ -413,7 +580,7 @@ with st.container(border=True):
                 st.rerun()
 
 selected = event.selection.rows[0] if event.selection.rows else 0
-v = ranked[min(selected, len(ranked) - 1)].variant
+v = shown[min(selected, len(shown) - 1)].variant
 vkey = _variant_key(v)
 st.session_state.setdefault("vias", {})
 st.session_state.setdefault("seen_nonce", set())
@@ -424,6 +591,9 @@ with st.container(border=True):
     step(4, f"Trasa i koszty: {' + '.join(v.order_ids)}",
          "Przeciągnij fragment niebieskiej linii, aby zmienić przebieg trasy. Punkt pośredni przesuniesz "
          "przeciągnięciem, a usuniesz dwuklikiem.")
+    v_clients = ", ".join(dict.fromkeys(c for i in v.order_ids if (c := client_map.get(i))))
+    if v_clients:
+        st.caption(f"Zleceniodawcy: {v_clients}")
     with st.spinner("Wyznaczanie trasy po drogach…"):
         route = get_route(v, vias)
     ev = evaluate_route(v, route, cost)
@@ -458,6 +628,10 @@ with st.container(border=True):
         st.caption("Na trasie nie wykryto przepraw promowych ani płatnych tuneli alpejskich "
                    "(wykrywanie na podstawie przebiegu trasy, przybliżone).")
 
+    est_in = [i for i in v.order_ids if i in est_ids]
+    if est_in:
+        st.warning(f"Przychód zawiera ceny szacunkowe: {', '.join(est_in)} "
+                   f"({eur(sum(price_map[i] for i in est_in))} z {eur(ev['revenue'])}). Zweryfikuj je przed ofertą.")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Zysk", eur(ev["profit"]), f"{ev['profit'] - v.profit:+,.0f} vs szacunek",
               help="Przychód minus koszty operacyjne.")
@@ -469,7 +643,7 @@ with st.container(border=True):
               help="Dni pracy z limitem 9 h dziennie i odpoczynkiem tygodniowym.")
     st.caption(f"Koszty: paliwo {eur(ev['fuel'])} + myto {eur(ev['tolls'])} + praca {eur(ev['labor'])}"
                f"{' + przeprawy ' + eur(ev['fees']) if ev['fees'] else ''} "
-               f"({ev['days']:.1f} dnia × {day_cost:,.0f} EUR). Naczepa: maks. {v.peak_ldm:.1f} LDM, "
+               f"({ev['days']:.1f} dnia × {day_cost:,.0f} EUR; {handling_h:g} h na każdy załadunek i rozładunek). Naczepa: maks. {v.peak_ldm:.1f} LDM, "
                f"{v.peak_weight_t:.1f} t.")
 
     event_map = route_map(v, route, vias, map_id=vkey, fit_id=vkey, height=620, key=f"map_{vkey}")

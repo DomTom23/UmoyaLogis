@@ -59,3 +59,19 @@ Zapisane tabele trafiają do SQLite (`data/umoyalogis.db`, katalog `data/` jest 
 zmienna `LTL_DB_PATH`). W kroku 2 można zapisać tabelę zleceń (z Twoimi poprawkami) pod własną nazwą - zapis pod
 istniejącą nazwą wymaga zaznaczenia „Nadpisz”. W kroku 3 można zapisać ranking wariantów. Zapisane tabele zleceń
 wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląda i usuwa w kroku 3.
+
+## Historia ofert, zleceniodawca, ceny szacunkowe
+
+* **Zleceniodawca** (kolumna „Firma” z Timocom) jest odczytywany z ofert i można go poprawić w tabeli. Tabelę zleceń
+  i ranking wariantów filtruje się po zleceniodawcy lub frazie (filtry zmieniają tylko widok; do szukania
+  doładunków trafiają wszystkie zlecenia).
+* **Historia ofert** (SQLite, tabela `offer_history`): każdy import zapisuje się automatycznie, bez duplikatów
+  (ta sama oferta wklejona ponownie zwiększa licznik). W panelu „Historia ofert” są filtry (zleceniodawca, kraje,
+  daty, wynik), statystyki (mediana ceny, EUR/LDM, EUR/km), edytowalne pola „cena zrealizowana”, „wynik”, „notatka”
+  oraz eksport CSV.
+* **Czas pracy:** 2 h na każdy załadunek i rozładunek (ustawienie w panelu bocznym).
+* **Ceny szacunkowe** dla ofert bez ceny: stawka × LDM wg kraju załadunku/rozładunku (domyślnie z CH 150 EUR/LDM,
+  do CH 250, do GB 300, z GB 150; min. przychód 500 EUR). Oferta wchodzi do wariantów tylko, gdy cena szacunkowa
+  osiąga minimum; przy kilku pasujących regułach obowiązuje najwyższa stawka. Reguły edytuje się w panelu bocznym.
+* **Szwajcaria:** załadunek i rozładunek w Szwajcarii są dozwolone, omijany jest tylko tranzyt.
+* **Maks. zleceń w wariancie:** domyślnie 6 (suwak w panelu bocznym).

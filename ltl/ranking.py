@@ -61,7 +61,9 @@ def crossing_text(crossings) -> str:
     return "; ".join(c.label for c in crossings) if crossings else "—"
 
 
-def ranked_to_frame(ranked: list[Ranked]) -> pd.DataFrame:
+def ranked_to_frame(ranked: list[Ranked], clients: dict | None = None, estimated: set | None = None) -> pd.DataFrame:
+    """Tabela wariantów. clients: nr zlecenia -> zleceniodawca; estimated: numery zleceń z ceną szacunkową."""
+    clients, estimated = clients or {}, estimated or set()
     rows = []
     for rank, r in enumerate(ranked, start=1):
         v, ev = r.variant, r.ev
@@ -70,6 +72,8 @@ def ranked_to_frame(ranked: list[Ranked]) -> pd.DataFrame:
             "#": rank,
             "Zlecenia": " + ".join(v.order_ids),
             "Liczba": len(v.order_ids),
+            "Zleceniodawcy": ", ".join(dict.fromkeys(c for i in v.order_ids if (c := clients.get(i)))) or "—",
+            "Ceny szac.": ", ".join(i for i in v.order_ids if i in estimated) or "—",
             "Trasa": route,
             "Zapełnienie (LDM)": round(v.peak_ldm, 1),
             "Ładunek (t)": round(v.peak_weight_t, 1),

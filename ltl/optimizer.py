@@ -36,7 +36,7 @@ class OptimizerParams:
     max_weight_t: float = 24.0
     top_n: int = 10
     beam_width: int = 12             # ile najlepszych częściowych wariantów rozwijać na każdym poziomie
-    hard_cap_orders: int = 14        # bezpiecznik techniczny (naczepa 13,6 LDM rzadko pomieści więcej)
+    hard_cap_orders: int = 6         # maks. liczba zleceń w jednym wariancie
     max_load_date_gap_days: Optional[int] = 3
     candidate_limit: int = 150
     max_evaluations: int = 300_000   # bezpiecznik czasu obliczeń
