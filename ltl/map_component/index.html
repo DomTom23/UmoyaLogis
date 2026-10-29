@@ -37,6 +37,7 @@
   function emit(ev) {
     ev.nonce = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
     ev.map_id = args.map_id;
+    console.debug("[ltl-map] emit", JSON.stringify(ev));
     send("streamlit:setComponentValue", {value: ev, dataType: "json"});
   }
 
