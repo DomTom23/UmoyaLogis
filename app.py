@@ -674,6 +674,30 @@ with st.container(border=True):
         route = get_route(v, vias)
     ev = evaluate_route(v, route, cost)
 
+    d_est = ev["profit"] - v.profit
+    kpis([
+        ("Zysk", eur(ev["profit"]), f"{d_est:+,.0f} EUR vs szacunek".replace(",", " "), "pos" if d_est >= 0 else "neg",
+         "Przychód minus koszty operacyjne."),
+        ("Przychód", eur(ev["revenue"]), None, "", "Suma cen wszystkich zleceń w wariancie."),
+        ("Koszty", eur(ev["total"]), None, "", "Paliwo + myto + praca (dni × koszt dnia) + opłaty za przeprawy."),
+        ("Km pełne / puste", f"{ev['loaded_km']:,.0f} / {ev['empty_km']:,.0f}".replace(",", " "), None, "",
+         "Pełne: z ładunkiem. Puste: między rozładunkiem a kolejnym załadunkiem."),
+        ("Czas", f"{ev['days']:.1f} dnia", f"jazda {ev['drive_h']:.1f} h", "",
+         "Dni pracy z limitem 9 h dziennie i odpoczynkiem tygodniowym."),
+    ])
+    st.caption(f"Koszty: paliwo {eur(ev['fuel'])} + myto {eur(ev['tolls'])} + praca {eur(ev['labor'])}"
+               f"{' + przeprawy ' + eur(ev['fees']) if ev['fees'] else ''} "
+               f"({ev['days']:.1f} dnia × {day_cost:,.0f} EUR; {handling_h:g} h na każdy załadunek i rozładunek). Naczepa: maks. {v.peak_ldm:.1f} LDM, "
+               f"{v.peak_weight_t:.1f} t.")
+
+    event_map = route_map(v, route, vias, map_id=vkey, fit_id=vkey, height=620, key=f"map_{vkey}")
+    if event_map and event_map.get("map_id") == vkey and event_map["nonce"] not in st.session_state.seen_nonce:
+        st.session_state.seen_nonce.add(event_map["nonce"])
+        st.session_state.vias[via_key] = apply_edit(vias, event_map, route)
+        st.rerun()
+    if vias:
+        st.caption(f"Punkty pośrednie: {len(vias)}. Koszty zostały przeliczone dla zmienionej trasy.")
+    # komunikaty pod mapą: ich pojawienie się nie może przesuwać mapy w trakcie edycji
     if not route.has_real:
         why = f" ({route.error})" if route.error else ""
         st.warning(f"Brak routingu po drogach{why}. Trasa i koszty są orientacyjne (linia prosta × {ROAD_FACTOR}).")
@@ -708,26 +732,3 @@ with st.container(border=True):
     if est_in:
         st.warning(f"Przychód zawiera ceny szacunkowe: {', '.join(est_in)} "
                    f"({eur(sum(price_map[i] for i in est_in))} z {eur(ev['revenue'])}). Zweryfikuj je przed ofertą.")
-    d_est = ev["profit"] - v.profit
-    kpis([
-        ("Zysk", eur(ev["profit"]), f"{d_est:+,.0f} EUR vs szacunek".replace(",", " "), "pos" if d_est >= 0 else "neg",
-         "Przychód minus koszty operacyjne."),
-        ("Przychód", eur(ev["revenue"]), None, "", "Suma cen wszystkich zleceń w wariancie."),
-        ("Koszty", eur(ev["total"]), None, "", "Paliwo + myto + praca (dni × koszt dnia) + opłaty za przeprawy."),
-        ("Km pełne / puste", f"{ev['loaded_km']:,.0f} / {ev['empty_km']:,.0f}".replace(",", " "), None, "",
-         "Pełne: z ładunkiem. Puste: między rozładunkiem a kolejnym załadunkiem."),
-        ("Czas", f"{ev['days']:.1f} dnia", f"jazda {ev['drive_h']:.1f} h", "",
-         "Dni pracy z limitem 9 h dziennie i odpoczynkiem tygodniowym."),
-    ])
-    st.caption(f"Koszty: paliwo {eur(ev['fuel'])} + myto {eur(ev['tolls'])} + praca {eur(ev['labor'])}"
-               f"{' + przeprawy ' + eur(ev['fees']) if ev['fees'] else ''} "
-               f"({ev['days']:.1f} dnia × {day_cost:,.0f} EUR; {handling_h:g} h na każdy załadunek i rozładunek). Naczepa: maks. {v.peak_ldm:.1f} LDM, "
-               f"{v.peak_weight_t:.1f} t.")
-
-    event_map = route_map(v, route, vias, map_id=vkey, fit_id=vkey, height=620, key=f"map_{vkey}")
-    if event_map and event_map.get("map_id") == vkey and event_map["nonce"] not in st.session_state.seen_nonce:
-        st.session_state.seen_nonce.add(event_map["nonce"])
-        st.session_state.vias[via_key] = apply_edit(vias, event_map, route)
-        st.rerun()
-    if vias:
-        st.caption(f"Punkty pośrednie: {len(vias)}. Koszty zostały przeliczone dla zmienionej trasy.")
