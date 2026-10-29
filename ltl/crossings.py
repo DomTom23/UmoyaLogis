@@ -7,7 +7,7 @@ import numpy as np
 
 from .geo import haversine_km
 from .regions import (ALPINE_TOLL_TUNNELS, CHANNEL_FERRIES, EUROTUNNEL, OTHER_FERRIES, in_switzerland,
-                      shape_in_switzerland)
+                      port_ferry_name, shape_in_switzerland)
 from .routing import RouteResult
 
 FERRY_ENTER, FERRY_EXIT = 28, 29      # typy manewrów Valhalla
@@ -90,7 +90,7 @@ def detect_crossings(route: RouteResult) -> list[Crossing]:
                 if hit:
                     add("ferry", hit[1], i)
                 elif from_maneuver:
-                    add("ferry", f"prom ({a[0]:.2f}, {a[1]:.2f}) → ({b[0]:.2f}, {b[1]:.2f})", i)
+                    add("ferry", port_ferry_name(a, b) or f"prom ({a[0]:.2f}, {a[1]:.2f}) → ({b[0]:.2f}, {b[1]:.2f})", i)
 
         for name, keywords, center, radius in ALPINE_TOLL_TUNNELS:
             if any(k in names for k in keywords) or (center and _near(shape, center, radius)):

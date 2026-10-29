@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .parsers import COLUMNS
+from .parsers import COLUMNS, TEXT_COLUMNS
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "umoyalogis.db"
 KINDS = ("orders", "ranking")
@@ -71,7 +71,7 @@ class Store:
                     end_country TEXT, end_postal TEXT, end_city TEXT,
                     load_date TEXT, unload_date TEXT,
                     weight_t REAL, ldm REAL, distance_km REAL, price_eur REAL,
-                    client TEXT,
+                    client TEXT, load_type TEXT, vehicles TEXT, body TEXT, extras TEXT, description TEXT,
                     status TEXT, defaults_used TEXT,
                     PRIMARY KEY (table_id, row_no)
                 );
@@ -91,6 +91,7 @@ class Store:
                     load_date TEXT, unload_date TEXT,
                     weight_t REAL, ldm REAL, distance_km REAL, price_eur REAL,
                     client TEXT NOT NULL DEFAULT '',
+                    load_type TEXT, vehicles TEXT, body TEXT, extras TEXT, description TEXT,
                     realized_price_eur REAL,
                     outcome TEXT NOT NULL DEFAULT '',
                     note TEXT NOT NULL DEFAULT ''
@@ -98,10 +99,13 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_history_client ON offer_history(client);
                 CREATE INDEX IF NOT EXISTS idx_history_seen ON offer_history(first_seen_at);
             """)
-            # migracja baz utworzonych przed dodaniem zleceniodawcy
-            cols = {r[1] for r in c.execute("PRAGMA table_info(saved_orders)")}
-            if "client" not in cols:
-                c.execute("ALTER TABLE saved_orders ADD COLUMN client TEXT")
+            # migracja baz utworzonych we wcześniejszych wersjach (nowe kolumny dopisujemy na końcu)
+            for table, new_cols in (("saved_orders", ("client", "load_type", "vehicles", "body", "extras", "description")),
+                                    ("offer_history", ("load_type", "vehicles", "body", "extras", "description"))):
+                have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+                for col in new_cols:
+                    if col not in have:
+                        c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
     @contextmanager
     def _conn(self):
@@ -180,7 +184,7 @@ class Store:
             df[col] = df[col].where(df[col].notna(), None)
         for col in NUM_COLS:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        for col in ("source", "start_city", "end_city", "defaults_used", "status", "client"):
+        for col in (*TEXT_COLUMNS, "status"):
             df[col] = df[col].fillna("")
         return df
 
@@ -220,7 +224,7 @@ class Store:
                     continue
                 vals = {}
                 for col in ("source", "start_country", "start_postal", "start_city", "end_country", "end_postal",
-                            "end_city", "client"):
+                            "end_city", "client", "load_type", "vehicles", "body", "extras", "description"):
                     vals[col] = "" if pd.isna(r.get(col)) else str(r.get(col))
                 for col in DATE_COLS:
                     vals[col] = None if pd.isna(r[col]) else pd.Timestamp(r[col]).date().isoformat()
@@ -268,7 +272,8 @@ class Store:
             args.append(outcome)
         sql = "SELECT id, first_seen_at, last_seen_at, seen_count, source, client, start_country, start_postal, " \
               "start_city, end_country, end_postal, end_city, load_date, unload_date, weight_t, ldm, distance_km, " \
-              "price_eur, realized_price_eur, outcome, note FROM offer_history"
+              "price_eur, load_type, vehicles, body, extras, description, realized_price_eur, outcome, note " \
+              "FROM offer_history"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY first_seen_at DESC, id DESC LIMIT ?"

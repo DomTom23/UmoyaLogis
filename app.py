@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import os
 import time
+from collections import Counter
 
 import pandas as pd
 import streamlit as st
 
 from ltl.costs import CostParams, profit
+from ltl.eligibility import ALL_BODIES, DEFAULT_BODIES, FleetProfile, check_eligibility
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.ingest import clean_edited, parse_sources, read_uploaded
 from ltl.mapview import route_map
@@ -29,6 +31,12 @@ st.markdown("""
   .step .n { background: #1f6feb; color: #fff; width: 1.9rem; height: 1.9rem; border-radius: 50%;
              display: inline-flex; align-items: center; justify-content: center; font-size: 1rem; }
   .hint { opacity: .75; font-size: .92rem; margin-bottom: .6rem; }
+  .kpis { display: flex; flex-wrap: wrap; gap: .6rem 1.4rem; margin: .4rem 0 .6rem 0; }
+  .kpi { flex: 1 1 150px; min-width: 130px; }
+  .kpi .l { font-size: .85rem; opacity: .7; }
+  .kpi .v { font-size: 1.7rem; font-weight: 600; line-height: 1.25; white-space: nowrap; }
+  .kpi .d { font-size: .8rem; opacity: .8; }
+  .kpi .d.pos { color: #1a9850; } .kpi .d.neg { color: #d73027; }
   .best { border-left: 5px solid #1a9850; padding: .5rem .9rem; background: rgba(26,152,80,.08);
           border-radius: 6px; margin-bottom: .8rem; }
 </style>
@@ -43,6 +51,18 @@ def step(n: int, title: str, hint: str = "") -> None:
 
 def plural(n: int) -> str:
     return "zlecenie" if n == 1 else "zlecenia" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "zleceń"
+
+
+def kpis(items: list[tuple]) -> None:
+    """Wskaźniki w układzie, który zawija się na wąskich ekranach (st.metric ucina wartości w wąskich kolumnach).
+    items: (etykieta, wartość, podpis | None, 'pos' | 'neg' | '', podpowiedź)."""
+    parts = []
+    for label, value, delta, tone, help_ in items:
+        delta_html = "<div class='d %s'>%s</div>" % (tone, delta) if delta else ""
+        parts.append("<div class='kpi' title='%s'><div class='l'>%s</div><div class='v'>%s</div>%s</div>"
+                     % (help_, label, value, delta_html))
+    html = "".join(parts)
+    st.markdown(f"<div class='kpis'>{html}</div>", unsafe_allow_html=True)
 
 
 def eur(x: float) -> str:
@@ -67,13 +87,8 @@ def _store() -> Store:
 
 
 @st.cache_data(show_spinner="Rozpoznawanie zleceń…")
-def _parse(texts: tuple, drop_no_price: bool) -> pd.DataFrame:
-    return parse_sources(list(texts), drop_without_price=drop_no_price)  # format każdego źródła wykrywany automatycznie
-
-
-@st.cache_data(show_spinner="Geokodowanie kodów pocztowych…")
-def _coords(df: pd.DataFrame, online: bool) -> pd.DataFrame:
-    return add_coordinates(df, _geocoder(online))
+def _parse(texts: tuple, drop_no_price: bool, pln_per_eur: float) -> pd.DataFrame:
+    return parse_sources(list(texts), drop_without_price=drop_no_price, pln_per_eur=pln_per_eur)  # format każdego źródła wykrywany automatycznie
 
 
 @st.cache_data(show_spinner="Szukanie najlepszych doładunków…")
@@ -110,6 +125,9 @@ with st.sidebar:
                                    help="Auto + kierowca za jeden dzień pracy.")
         speed = st.number_input("Średnia prędkość (km/h)", 40.0, 90.0, 65.0, 1.0,
                                 help="Służy do szacowania czasu przejazdu i liczby dni pracy (limit 9 h jazdy dziennie).")
+        pln_per_eur = st.number_input("Kurs PLN za 1 EUR", 3.0, 6.0, 4.25, 0.05,
+                                      help="Do przeliczania cen podanych w PLN. Zmiana wczytuje oferty od nowa "
+                                           "(poprawki ręczne w tabeli zostają tylko do czasu zmiany kursu).")
         handling_h = st.number_input("Czas na załadunek / rozładunek (h)", 0.0, 8.0, 2.0, 0.5,
                                      help="Liczony dla każdego załadunku i każdego rozładunku; wlicza się do czasu "
                                           "pracy i liczby dni (koszt dnia pracy).")
@@ -130,6 +148,20 @@ with st.sidebar:
         n_check = st.slider("Ile kandydatów sprawdzić na drogach", 10, 40, 20,
                             help="Najlepsze warianty wg szacunku są liczone po rzeczywistych trasach, a ranking "
                                  "układany od nowa. Więcej = dokładniej, ale dłużej (publiczny serwer tras).")
+
+    with st.expander("🚚 Dopasowanie ofert do zestawu"):
+        st.caption("Oferty niespełniające warunków nie trafiają do wariantów (powód widać w tabeli).")
+        fleet = FleetProfile(
+            semi_trailer_only=st.checkbox("Tylko oferty dopuszczające naczepę", True,
+                                          help="Oferty tylko dla busa lub „solo” (bez „z naczepą”) odpadają."),
+            accepted_bodies=tuple(st.multiselect("Nadwozia naszego zestawu", list(ALL_BODIES), list(DEFAULT_BODIES),
+                                                 help="Oferta musi dopuszczać któreś z nich (brak informacji = pasuje).")),
+            adr=st.checkbox("Mamy uprawnienia ADR", False),
+            tail_lift=st.checkbox("Mamy windę załadowczą", False),
+            allow_ftl=st.checkbox("Łącz też oferty FTL", True,
+                                  help="FTL zwykle oznacza cały pojazd dla jednego zleceniodawcy. "
+                                       "Odznacz, aby do doładunków brać tylko oferty LTL."),
+        )
 
     with st.expander("💱 Ceny szacunkowe (oferty bez ceny)"):
         use_est = st.checkbox("Używaj cen szacunkowych", value=True,
@@ -264,7 +296,7 @@ if submitted:
 analysis = st.session_state.get("analysis")
 parsed = None
 if analysis:
-    parsed = analysis["df"] if "df" in analysis else _parse(analysis["texts"], analysis["drop"])
+    parsed = analysis["df"] if "df" in analysis else _parse(analysis["texts"], analysis["drop"], pln_per_eur)
     if analysis.get("record") and not analysis.get("recorded") and not parsed.empty:
         analysis["recorded"] = True       # raz na import
         rec = _store().record_offers(parsed)
@@ -370,6 +402,7 @@ with st.container(border=True):
     work = st.session_state.work
 
     aid = analysis["id"]
+    show_details = st.toggle("Pokaż szczegóły ofert (pojazdy, nadwozie, dodatki, opis)", key=f"details_{aid}")
     f1, f2, f3 = st.columns([2, 2, 1])
     sel_clients = f1.multiselect("Filtr: zleceniodawca", sorted(set(work["client"].dropna()) - {""}),
                                  key=f"flt_clients_{aid}", help="Pokazuje tylko zlecenia wybranych zleceniodawców.")
@@ -391,7 +424,8 @@ with st.container(border=True):
         disabled=["id", "source", "status", "defaults_used"],
         column_order=["id", "source", "client", "start_country", "start_postal", "start_city", "end_country",
                       "end_postal", "end_city", "load_date", "unload_date", "weight_t", "ldm", "distance_km",
-                      "price_eur", "status", "defaults_used"],
+                      "price_eur", "load_type", "status", "defaults_used",
+                      *(["vehicles", "body", "extras", "description"] if show_details else [])],
         column_config={
             "id": st.column_config.TextColumn("Nr", width="small"),
             "source": st.column_config.TextColumn("Źródło", width="small"),
@@ -408,9 +442,14 @@ with st.container(border=True):
             "ldm": st.column_config.NumberColumn("LDM", min_value=0.0, max_value=13.6, format="%.2f"),
             "distance_km": st.column_config.NumberColumn("Dystans (km)", min_value=0.0, format="%.0f"),
             "price_eur": st.column_config.NumberColumn("Cena (EUR)", min_value=0.0, format="%.0f"),
+            "load_type": st.column_config.TextColumn("Typ", width="small", help="FTL = cały pojazd, LTL = ładunek częściowy."),
+            "vehicles": st.column_config.TextColumn("Pojazdy"),
+            "body": st.column_config.TextColumn("Nadwozie"),
+            "extras": st.column_config.TextColumn("Dodatki"),
+            "description": st.column_config.TextColumn("Opis oferty"),
             "status": st.column_config.TextColumn("Status", width="small"),
             "defaults_used": st.column_config.TextColumn(
-                "Uzupełniono", help="Pola, których nie było w ofercie i przyjęto wartości domyślne."),
+                "Uwagi", help="Uzupełnione wartości domyślne, przeliczenia walut i ostrzeżenia o danych."),
         },
     )
     st.session_state.last_view = {"ids": view["id"].tolist(), "edited": edited}
@@ -434,40 +473,66 @@ with st.container(border=True):
             st.warning(f"Tabela „{save_name.strip()}” już istnieje - zaznacz „Nadpisz” albo wybierz inną nazwę.")
         except InvalidName as e:
             st.warning(str(e))
-    orders = apply_price_rules(_coords(orders, analysis["online"]), price_rules, use_est)
+    # 1) ceny (z oferty / szacunkowe) i kwalifikacja ofert dla naszego zestawu - jeszcze bez geokodowania
+    orders = apply_price_rules(orders, price_rules, use_est)
+    fleet_why = check_eligibility(orders, fleet)
+    orders["exclusion"] = [w or ("bez ceny: " + note if kind == "brak" else "")
+                           for w, kind, note in zip(fleet_why, orders["price_kind"], orders["price_note"])]
+    use = orders["exclusion"] == ""
+
+    # 2) położenie tylko dla ofert, które wejdą do wyszukiwania (duże wklejki mają setki kodów)
+    geocoder = _geocoder(analysis["online"])
+    subset = orders[use]
+    pairs = [(c, p) for c, p in zip(subset["start_country"], subset["start_postal"])] + \
+            [(c, p) for c, p in zip(subset["end_country"], subset["end_postal"])]
+    if pairs:
+        bar = st.progress(0.0, text="Ustalanie położenia kodów pocztowych…")
+        geo_stats = geocoder.prefetch(
+            pairs, progress=lambda d, t: bar.progress(min(d / max(t, 1), 1.0), text=f"Kody pocztowe: {d}/{t}"))
+        bar.empty()
+        located = add_coordinates(subset, geocoder)
+    else:
+        geo_stats, located = {"missing": 0}, subset.assign(start_lat=0.0, start_lon=0.0, end_lat=0.0, end_lon=0.0,
+                                                         start_geo="", end_geo="", geo_precise=True)
+    for col in ("start_lat", "start_lon", "end_lat", "end_lon", "start_geo", "end_geo", "geo_precise"):
+        orders[col] = located[col].reindex(orders.index)
+    orders["geo_precise"] = orders["geo_precise"].fillna(True).astype(bool)
 
     est = haversine_km(orders.start_lat, orders.start_lon, orders.end_lat, orders.end_lon) * ROAD_FACTOR
     orders["distance_est_km"] = est.round(0)
     dist_used = orders["distance_km"].fillna(orders["distance_est_km"])
-    orders["profit_single_eur"] = [round(profit(p, d, 2, cost)["profit"], 0) if pd.notna(p) else None
+    orders["profit_single_eur"] = [round(profit(p, d, 2, cost)["profit"], 0) if (pd.notna(p) and pd.notna(d)) else None
                                    for p, d in zip(orders["price_used_eur"], dist_used)]
-    no_price = orders[orders["price_eur"].isna()]
-    if len(no_price):
-        n_est = int((no_price["price_kind"] == "szacunek").sum())
-        st.info(f"{len(no_price)} ofert bez ceny: {n_est} dostało cenę szacunkową (wg reguł w panelu bocznym), "
-                f"{len(no_price) - n_est} jest wyłączonych z wyszukiwania. Wpisz cenę w tabeli, aby uwzględnić "
-                "ofertę po cenie z oferty.")
-        with st.expander("Ceny szacunkowe: które oferty weszły do wariantów"):
-            st.dataframe(no_price[["id", "client", "start_country", "end_country", "ldm", "price_used_eur",
-                                   "price_kind", "price_note"]], width="stretch", hide_index=True,
-                         column_config={"id": "Nr", "client": "Zleceniodawca", "start_country": "Z", "end_country": "Do",
-                                        "ldm": "LDM", "price_used_eur": st.column_config.NumberColumn(
-                                            "Cena szac. (EUR)", format="%.0f"),
-                                        "price_kind": "Cena", "price_note": "Uzasadnienie"})
-    if not orders["geo_precise"].all():
-        st.warning("Części kodów pocztowych nie udało się zlokalizować - użyto środka kraju, więc odległości "
-                   "i trasy są mocno przybliżone. Sprawdź połączenie z internetem lub kody pocztowe.")
-    with st.expander("Szczegóły: dystans szacowany i zysk pojedynczych zleceń"):
-        st.dataframe(
-            orders[["id", "start_postal", "end_postal", "price_eur", "distance_km", "distance_est_km",
-                    "profit_single_eur", "start_geo", "end_geo"]],
-            width="stretch", hide_index=True,
-            column_config={"id": "Nr", "start_postal": "Kod zał.", "end_postal": "Kod rozł.",
-                           "price_eur": "Cena (EUR)", "distance_km": "Dystans z oferty (km)",
-                           "distance_est_km": "Dystans szac. (km)", "profit_single_eur": "Zysk samodzielnie (EUR)",
-                           "start_geo": "Pozycja zał.", "end_geo": "Pozycja rozł."})
 
-orders_opt = orders.assign(price_eur=orders["price_used_eur"])      # optymalizacja używa ceny z oferty lub szacunkowej
+    n_use = int(use.sum())
+    st.markdown(f"**Do wyszukiwania weszło {n_use} z {len(orders)} ofert.**")
+    if n_use < len(orders):
+        reasons = Counter(r.split(":")[0] if r.startswith("bez ceny") else r
+                          for why in orders.loc[~use, "exclusion"] for r in why.split(", ") if r)
+        st.caption("Wykluczone (oferta może mieć kilka powodów): " +
+                   "; ".join(f"{r} - {n}" for r, n in reasons.most_common()) +
+                   ". Warunki zmienisz w panelu bocznym („Dopasowanie ofert do zestawu”, „Ceny szacunkowe”).")
+    est_rows = orders[orders["price_kind"] == "szacunek"]
+    if len(est_rows):
+        st.info(f"{len(est_rows)} ofert bez ceny dostało cenę szacunkową wg reguł (panel boczny, „Ceny szacunkowe”).")
+    if n_use and not orders.loc[use, "geo_precise"].all():
+        n_bad = int((~orders.loc[use, "geo_precise"]).sum())
+        st.warning(f"{n_bad} ofert ma kod pocztowy, którego nie udało się zlokalizować - użyto środka kraju, więc "
+                   "odległości i trasy są mocno przybliżone. Sprawdź połączenie z internetem lub kody pocztowe.")
+    with st.expander("Szczegóły: kwalifikacja ofert, ceny szacunkowe, dystans i zysk pojedynczych zleceń"):
+        st.dataframe(
+            orders[["id", "client", "start_postal", "end_postal", "price_eur", "price_used_eur", "price_kind",
+                    "price_note", "exclusion", "distance_km", "distance_est_km", "profit_single_eur"]],
+            width="stretch", hide_index=True,
+            column_config={"id": "Nr", "client": "Zleceniodawca", "start_postal": "Kod zał.", "end_postal": "Kod rozł.",
+                           "price_eur": st.column_config.NumberColumn("Cena oferty (EUR)", format="%.0f"),
+                           "price_used_eur": st.column_config.NumberColumn("Cena użyta (EUR)", format="%.0f"),
+                           "price_kind": "Cena z", "price_note": "Uzasadnienie ceny",
+                           "exclusion": "Powód wykluczenia", "distance_km": "Dystans z oferty (km)",
+                           "distance_est_km": "Dystans szac. (km)",
+                           "profit_single_eur": st.column_config.NumberColumn("Zysk samodzielnie (EUR)", format="%.0f")})
+
+orders_opt = orders[use].assign(price_eur=orders.loc[use, "price_used_eur"])    # cena z oferty lub szacunkowa
 client_map = dict(zip(orders["id"], orders["client"].fillna("")))
 est_ids = set(orders.loc[orders["price_kind"] == "szacunek", "id"])
 price_map = dict(zip(orders["id"], orders["price_used_eur"]))
@@ -500,6 +565,13 @@ with st.container(border=True):
                              evaluate_route(x, r, cost)) for x in candidates[:top_n]]
         cache = st.session_state.ranked = {"sig": sig, "ranked": ranked, "estimated": estimated}
     ranked, estimated = cache["ranked"], cache["estimated"]
+    profitable = [r for r in ranked if r.ev["profit"] > 0]
+    n_hidden = len(ranked) - len(profitable)
+    if profitable:
+        ranked = profitable                  # stratnych wariantów nie pokazujemy
+    else:
+        st.warning("Wszystkie znalezione warianty są stratne (zysk ≤ 0) - pokazuję je, ale warto zmienić "
+                   "limity wyszukiwania albo uzupełnić ceny.")
     if estimated:
         st.warning("Silnik tras jest niedostępny - ranking jest szacunkowy (linia prosta × "
                    f"{ROAD_FACTOR}). Sprawdź ustawienia „Trasy po drogach” w panelu bocznym.")
@@ -549,8 +621,10 @@ with st.container(border=True):
                                  help="Zlecenia, których cena jest szacunkowa (oferta bez ceny)."),
                              "Przeprawy i tunele": st.column_config.TextColumn(width="large"),
                              **money})
-    st.caption(f"Sprawdzono {stats['evaluated']} kombinacji z {stats['candidates']} ofert; na drogach policzono "
-               f"{len(candidates)} najlepszych. ▲ załadunek, ▼ rozładunek. W wariancie maks. {max_orders} zleceń, "
+    st.caption(f"Sprawdzono {stats['evaluated']} kombinacji z {stats['candidates']} ofert"
+               f"{' (z ' + str(stats['eligible']) + ' kwalifikujących się - zbadano ' + str(stats['candidates']) + ' o najlepszej cenie za km)' if stats['eligible'] > stats['candidates'] else ''}; "
+               f"na drogach policzono {len(candidates)} najlepszych"
+               f"{', ukryto ' + str(n_hidden) + ' stratnych' if n_hidden and profitable else ''}. ▲ załadunek, ▼ rozładunek. W wariancie maks. {max_orders} zleceń, "
                "a naczepa nie może przekroczyć 13,6 LDM / 24 t w żadnym punkcie trasy.")
 
     with st.expander("💾 Zapisz ranking pod nazwą / zobacz zapisane rankingi"):
@@ -584,7 +658,9 @@ v = shown[min(selected, len(shown) - 1)].variant
 vkey = _variant_key(v)
 st.session_state.setdefault("vias", {})
 st.session_state.setdefault("seen_nonce", set())
-vias = st.session_state.vias.get(vkey, [])
+# punkty pośrednie należą do konkretnych danych: te same numery zleceń po nowym imporcie to inne trasy
+via_key = (hash(orders_opt[["id", "start_lat", "start_lon", "end_lat", "end_lon"]].to_csv()), vkey)
+vias = st.session_state.vias.get(via_key, [])
 
 # ----------------------------------------------------- krok 4: trasa i koszty
 with st.container(border=True):
@@ -632,15 +708,17 @@ with st.container(border=True):
     if est_in:
         st.warning(f"Przychód zawiera ceny szacunkowe: {', '.join(est_in)} "
                    f"({eur(sum(price_map[i] for i in est_in))} z {eur(ev['revenue'])}). Zweryfikuj je przed ofertą.")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Zysk", eur(ev["profit"]), f"{ev['profit'] - v.profit:+,.0f} vs szacunek",
-              help="Przychód minus koszty operacyjne.")
-    c2.metric("Przychód", eur(ev["revenue"]), help="Suma cen wszystkich zleceń w wariancie.")
-    c3.metric("Koszty", eur(ev["total"]), help="Paliwo + myto + praca (dni × koszt dnia) + opłaty za przeprawy.")
-    c4.metric("Km pełne / puste", f"{ev['loaded_km']:,.0f} / {ev['empty_km']:,.0f}",
-              help="Pełne: z ładunkiem. Puste: między rozładunkiem a kolejnym załadunkiem.")
-    c5.metric("Czas", f"{ev['days']:.1f} dnia", f"jazda {ev['drive_h']:.1f} h", delta_color="off",
-              help="Dni pracy z limitem 9 h dziennie i odpoczynkiem tygodniowym.")
+    d_est = ev["profit"] - v.profit
+    kpis([
+        ("Zysk", eur(ev["profit"]), f"{d_est:+,.0f} EUR vs szacunek".replace(",", " "), "pos" if d_est >= 0 else "neg",
+         "Przychód minus koszty operacyjne."),
+        ("Przychód", eur(ev["revenue"]), None, "", "Suma cen wszystkich zleceń w wariancie."),
+        ("Koszty", eur(ev["total"]), None, "", "Paliwo + myto + praca (dni × koszt dnia) + opłaty za przeprawy."),
+        ("Km pełne / puste", f"{ev['loaded_km']:,.0f} / {ev['empty_km']:,.0f}".replace(",", " "), None, "",
+         "Pełne: z ładunkiem. Puste: między rozładunkiem a kolejnym załadunkiem."),
+        ("Czas", f"{ev['days']:.1f} dnia", f"jazda {ev['drive_h']:.1f} h", "",
+         "Dni pracy z limitem 9 h dziennie i odpoczynkiem tygodniowym."),
+    ])
     st.caption(f"Koszty: paliwo {eur(ev['fuel'])} + myto {eur(ev['tolls'])} + praca {eur(ev['labor'])}"
                f"{' + przeprawy ' + eur(ev['fees']) if ev['fees'] else ''} "
                f"({ev['days']:.1f} dnia × {day_cost:,.0f} EUR; {handling_h:g} h na każdy załadunek i rozładunek). Naczepa: maks. {v.peak_ldm:.1f} LDM, "
@@ -649,7 +727,7 @@ with st.container(border=True):
     event_map = route_map(v, route, vias, map_id=vkey, fit_id=vkey, height=620, key=f"map_{vkey}")
     if event_map and event_map.get("map_id") == vkey and event_map["nonce"] not in st.session_state.seen_nonce:
         st.session_state.seen_nonce.add(event_map["nonce"])
-        st.session_state.vias[vkey] = apply_edit(vias, event_map, route)
+        st.session_state.vias[via_key] = apply_edit(vias, event_map, route)
         st.rerun()
     if vias:
         st.caption(f"Punkty pośrednie: {len(vias)}. Koszty zostały przeliczone dla zmienionej trasy.")

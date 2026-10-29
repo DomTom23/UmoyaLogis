@@ -38,8 +38,9 @@ class OptimizerParams:
     beam_width: int = 12             # ile najlepszych częściowych wariantów rozwijać na każdym poziomie
     hard_cap_orders: int = 6         # maks. liczba zleceń w jednym wariancie
     max_load_date_gap_days: Optional[int] = 3
-    candidate_limit: int = 150
-    max_evaluations: int = 300_000   # bezpiecznik czasu obliczeń
+    candidate_limit: int = 300
+    max_evaluations: int = 300_000   # bezpiecznik czasu obliczeń (dzielony sprawiedliwie między zlecenia główne)
+    compat_limit: int = 40           # ile najlepszych zgodnych zleceń rozważać przy jednym zleceniu głównym
 
 
 @dataclass
@@ -168,12 +169,13 @@ def find_best_combinations(
     odchylenia względem m): na każdym poziomie rozwijamy `beam_width` najzyskowniejszych zestawów, więc
     wypełnienie naczepy rośnie tak długo, jak zysk albo zapełnienie na to pozwalają.
     """
-    stats = {"candidates": 0, "evaluated": 0, "truncated": False}
+    stats = {"candidates": 0, "eligible": 0, "evaluated": 0, "truncated": False}
     df = orders[(orders["price_eur"].notna())].copy()
     df = df[(df["ldm"] <= opt.max_ldm + 1e-9) & (df["weight_t"] <= opt.max_weight_t + 1e-9)]
     if len(df) < 2:
         return [], stats
     df = df.reset_index(drop=True)
+    stats["eligible"] = len(df)
 
     n = len(df)
     lats = np.empty(2 * n)
@@ -200,8 +202,14 @@ def find_best_combinations(
     rank = sorted(range(n), key=lambda i: (-single[i], i))
     pos = {i: r for r, i in enumerate(rank)}
 
+    # ten sam ładunek ofertowany kilka razy (np. z różnymi stawkami) nie może wejść do wariantu dwa razy
+    cargo = [(round(float(a), 3), round(float(b), 3), round(float(c), 3), round(float(d), 3), round(float(w), 2),
+              round(float(m), 2), str(ld))
+             for a, b, c, d, w, m, ld in zip(df["start_lat"], df["start_lon"], df["end_lat"], df["end_lon"],
+                                              df["weight_t"], df["ldm"], df["load_date"])]
+
     def pair_ok(a, b):
-        return _date_ok(ldates[a], ldates[b], opt.max_load_date_gap_days)
+        return cargo[a] != cargo[b] and _date_ok(ldates[a], ldates[b], opt.max_load_date_gap_days)
 
     compat: dict[int, list[int]] = {}
     for m in range(n):
@@ -211,17 +219,26 @@ def find_best_combinations(
                 continue
             r = _best_route([m, j], D, ldm, wt, opt.max_ldm, opt.max_weight_t)
             if r and r[0] - single[m] <= opt.max_detour_km:
-                lst.append(j)
-        compat[m] = lst
+                lst.append((price[j] / (r[0] - single[m] + 50.0), j))   # ile przychodu za dodatkowy kilometr
+        lst.sort(reverse=True)
+        compat[m] = [j for _, j in lst[: opt.compat_limit]]
 
     def score(idx, total):
         return profit(float(sum(price[i] for i in idx)), total, 2 * len(idx), cost)["profit"]
 
     best: dict[frozenset, tuple] = {}     # zestaw -> (zysk, indeksy, kolejność punktów, dystans)
     evals = 0
-    for m in range(n):
-        if stats["truncated"]:
+    # zlecenia główne od najbardziej obiecujących (przychód za km); budżet obliczeń maleje z pozycją na liście,
+    # więc przy dużych zbiorach najlepsze kandydatury dostają najgłębsze przeszukanie
+    mains = sorted((m for m in range(n) if compat[m]), key=lambda m: -price[m] / max(single[m], 50.0))
+    weights = [1.0 / (1.0 + k / 15.0) for k in range(len(mains))]
+    scale = opt.max_evaluations / max(sum(weights), 1e-9)
+    for m, w in zip(mains, weights):
+        if evals >= opt.max_evaluations:
+            stats["truncated"] = True
             break
+        budget_end = evals + max(300, int(scale * w))
+        cut = False
         frontier = {frozenset([m]): ([2 * m, 2 * m + 1], float(single[m]))}
         for _level in range(2, opt.hard_cap_orders + 1):
             new: dict[frozenset, tuple] = {}
@@ -230,8 +247,8 @@ def find_best_combinations(
                     if j in key or not all(pair_ok(j, x) for x in key):
                         continue
                     evals += 1
-                    if evals > opt.max_evaluations:
-                        stats["truncated"] = True
+                    if evals > budget_end:        # budżet tego zlecenia głównego wyczerpany - idziemy do następnego
+                        cut = stats["truncated"] = True
                         break
                     ins = _insert(seq, j, D, ldm, wt, opt.max_ldm, opt.max_weight_t)
                     if ins is None:
@@ -244,7 +261,7 @@ def find_best_combinations(
                     if fk in new and new[fk][1] <= ntotal:
                         continue
                     new[fk] = (nseq, ntotal)
-                if stats["truncated"]:
+                if cut:
                     break
             if not new:
                 break
@@ -261,7 +278,7 @@ def find_best_combinations(
                     best[fk] = (pr, tuple(sorted(fk)), new[fk][0], new[fk][1])
             scored.sort(key=lambda t: -t[0])
             frontier = {fk: new[fk] for _, fk in scored[: opt.beam_width]}
-            if stats["truncated"]:
+            if cut:
                 break
     stats["evaluated"] = evals
 

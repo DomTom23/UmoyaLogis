@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import urllib.error
 import urllib.parse
@@ -56,6 +57,7 @@ class Geocoder:
     def __init__(self, online: bool = True, cache_path: Optional[Path] = DEFAULT_CACHE, timeout: float = 3.0):
         self.online = online
         self.nominatim_ok = online
+        self.nominatim_budget = 10 ** 9      # ile zapytań do Nominatim wolno jeszcze wykonać (patrz prefetch)
         self._last_nominatim = 0.0
         self.timeout = timeout
         self.cache_path = Path(cache_path) if cache_path else None
@@ -115,7 +117,8 @@ class Geocoder:
                 self._cache[key] = list(hit)
                 self._dirty = True
                 return hit[0], hit[1], "online"
-        if self.nominatim_ok:
+        if self.nominatim_ok and self.nominatim_budget > 0:
+            self.nominatim_budget -= 1
             hit = self._fetch_nominatim(country, postal.strip())
             if hit:
                 self._cache[key] = list(hit)
@@ -123,6 +126,64 @@ class Geocoder:
                 return hit[0], hit[1], "online"
         lat, lon = COUNTRY_CENTROIDS.get(country, (50.0, 10.0))
         return lat, lon, "kraj"
+
+    def prefetch(self, pairs, progress=None, workers: int = 12, max_nominatim: int = 150) -> dict:
+        """Szybkie, równoległe ustalanie położenia wielu kodów naraz (dla dużych wklejek).
+
+        1. zippopotam.us w wielu wątkach (kody GB wg pierwszego członu, więc wiele ofert = jedno zapytanie),
+        2. kody, których tam nie ma: Nominatim po kolei (limit 1/s), nie więcej niż `max_nominatim`;
+           reszta dostaje środek kraju (oznaczone jako 'kraj').
+        Zwraca statystyki: {'cache', 'online', 'missing'}."""
+        todo, seen = [], set()
+        for country, postal in pairs:
+            code = self._query_code(country, postal)
+            key = f"{country}|{code}"
+            if key not in self._cache and key not in seen:
+                seen.add(key)
+                todo.append((country, postal, code, key))
+        stats = {"cache": len(seen) == 0, "online": 0, "missing": 0, "total": len(todo)}
+        done = 0
+
+        def tick():
+            nonlocal done
+            done += 1
+            if progress:
+                progress(done, len(todo))
+
+        missing = []
+        if self.online and todo:
+            def one(item):
+                country, postal, code, key = item
+                if not re.fullmatch(r"[A-Z0-9\-]{2,10}", code) or not self.online:
+                    return item, None
+                return item, self._fetch(country, code)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for fut in as_completed([pool.submit(one, it) for it in todo]):
+                    item, hit = fut.result()
+                    if hit:
+                        self._cache[item[3]] = list(hit)
+                        self._dirty = True
+                        stats["online"] += 1
+                        tick()
+                    else:
+                        missing.append(item)
+        else:
+            missing = list(todo)
+        self.nominatim_budget = max_nominatim
+        for item in missing:
+            if self.nominatim_ok and self.nominatim_budget > 0:
+                self.nominatim_budget -= 1
+                hit = self._fetch_nominatim(item[0], item[1].strip())
+                if hit:
+                    self._cache[item[3]] = list(hit)
+                    self._dirty = True
+                    stats["online"] += 1
+                    tick()
+                    continue
+            stats["missing"] += 1
+            tick()
+        self.save()
+        return stats
 
     def save(self) -> None:
         if self.cache_path and self._dirty:

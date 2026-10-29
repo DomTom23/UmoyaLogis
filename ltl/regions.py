@@ -105,3 +105,34 @@ ALPINE_TOLL_TUNNELS = [
     ("Tunel Bosruck (A9, AT)", ["bosrucktunnel"], None, 0.0),
     ("Tunel Pfänder (A14, AT)", ["pfändertunnel", "pfaendertunnel"], None, 0.0),
 ]
+
+
+# --- porty (do nazywania promów, które nie są na liście znanych połączeń): nazwa -> (lat, lon)
+PORTS = {
+    "Calais": (50.967, 1.853), "Dover": (51.127, 1.333), "Folkestone": (51.080, 1.170), "Boulogne": (50.730, 1.600),
+    "Dunkierka": (51.036, 2.366), "Dieppe": (49.933, 1.083), "Newhaven": (50.790, 0.056), "Le Havre": (49.483, 0.108),
+    "Portsmouth": (50.800, -1.100), "Cherbourg": (49.650, -1.620), "Poole": (50.714, -1.987),
+    "Ouistreham": (49.283, -0.250), "Saint-Malo": (48.645, -2.026), "Roscoff": (48.724, -3.985),
+    "Plymouth": (50.365, -4.143), "Zeebrugge": (51.333, 3.200), "Ostenda": (51.230, 2.930),
+    "Rotterdam": (51.950, 4.050), "Hoek van Holland": (51.980, 4.130), "Harwich": (51.945, 1.290),
+    "Hull": (53.740, -0.280), "Immingham": (53.630, -0.190), "Newcastle": (55.010, -1.450),
+    "Cairnryan": (54.970, -5.020), "Belfast": (54.610, -5.930), "Larne": (54.850, -5.800),
+    "Holyhead": (53.310, -4.630), "Dublin": (53.350, -6.200), "Pembroke Dock": (51.690, -4.940),
+    "Rosslare": (52.250, -6.340), "Fishguard": (52.010, -4.980),
+    "Villa San Giovanni": (38.220, 15.640), "Messyna": (38.190, 15.550), "Reggio Calabria": (38.120, 15.640),
+    "Genua": (44.410, 8.920), "Livorno": (43.550, 10.300), "Civitavecchia": (42.090, 11.790),
+    "Olbia": (40.920, 9.500), "Cagliari": (39.210, 9.110), "Porto Torres": (40.840, 8.400),
+    "Palermo": (38.120, 13.370), "Neapol": (40.840, 14.270), "Salerno": (40.680, 14.760),
+    "Katania": (37.500, 15.090), "Bari": (41.140, 16.870), "Brindisi": (40.640, 17.950), "Ankona": (43.620, 13.500),
+    "Wenecja": (45.430, 12.350), "Triest": (45.650, 13.770), "Marsylia": (43.300, 5.370), "Tulon": (43.120, 5.930),
+    "Nicea": (43.700, 7.280), "Bastia": (42.700, 9.450), "Ajaccio": (41.920, 8.740),
+}
+
+
+def port_ferry_name(a, b, max_km: float = 40.0) -> str | None:
+    """'prom Villa San Giovanni–Messyna' dla odcinka morskiego między punktami a i b; None, gdy brak portów."""
+    def nearest(p):
+        name, dist = min(((n, float(haversine_km(p[0], p[1], c[0], c[1]))) for n, c in PORTS.items()), key=lambda t: t[1])
+        return name if dist <= max_km else None
+    na, nb = nearest(a), nearest(b)
+    return f"prom {na}–{nb}" if na and nb and na != nb else None

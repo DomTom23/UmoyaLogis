@@ -75,3 +75,17 @@ wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląd
   osiąga minimum; przy kilku pasujących regułach obowiązuje najwyższa stawka. Reguły edytuje się w panelu bocznym.
 * **Szwajcaria:** załadunek i rozładunek w Szwajcarii są dozwolone, omijany jest tylko tranzyt.
 * **Maks. zleceń w wariancie:** domyślnie 6 (suwak w panelu bocznym).
+
+## Format kart Trans.eu i dopasowanie ofert
+
+* Parser rozpoznaje też kartę oferty (lokalizacja, daty, cel, daty, „waga, nadwozie, LDM”, „km, pojazdy, FTL/LTL,
+  dodatki”, opis, cena, termin płatności, data i godzina publikacji). Koniec karty wyznacza znacznik publikacji, więc
+  opisy typu „zał IT42031” czy „IT-20835 Muggio -- FR-42230 …” nie są mylone z lokalizacjami. Ceny w PLN/GBP/CHF są
+  przeliczane na EUR (kurs PLN w panelu bocznym), ceny nierealne (np. „1 EUR”) i ceny za tonę są pomijane.
+  Powtórzone oferty są scalane, kody GB bez spacji normalizowane (`OX26AA` → `OX2 6AA`), a brakujące LDM liczone
+  z wymiarów palet w opisie (np. `4 pal : 120*80*143`) albo, gdy ich brak, z wagi.
+* „Dopasowanie ofert do zestawu” (panel boczny): tylko oferty dopuszczające naczepę, nadwozia zestawu, ADR, winda,
+  FTL. Powód wykluczenia każdej oferty widać w szczegółach pod tabelą zleceń. Położenie kodów pocztowych jest ustalane
+  tylko dla ofert, które wejdą do wyszukiwania (równolegle, z paskiem postępu).
+* Ten sam ładunek ofertowany kilka razy (np. z różnymi stawkami) nigdy nie trafia do jednego wariantu dwa razy.
+* Stratne warianty (zysk ≤ 0) są ukrywane.

@@ -162,6 +162,17 @@ def _straight_leg(group: list[dict], speed: float = 65.0) -> Leg:
     return Leg(shape=[(q["lat"], q["lon"]) for q in group], km=km, hours=km / speed)
 
 
+def _same_place(group: list[dict], tol_km: float = 0.05) -> bool:
+    """Dwa kolejne przystanki w tym samym miejscu (np. dwa rozładunki w tym samym kodzie): odcinek ma 0 km,
+    a silniki tras nie lubią takich zapytań."""
+    return len(group) == 2 and float(haversine_km(group[0]["lat"], group[0]["lon"],
+                                                   group[1]["lat"], group[1]["lon"])) < tol_km
+
+
+def _zero_leg(group: list[dict]) -> Leg:
+    return Leg(shape=[(g["lat"], g["lon"]) for g in group], km=0.0, hours=0.0)
+
+
 def _merge(a: Leg, b: Leg) -> Leg:
     return Leg(shape=a.shape + b.shape[1:], km=a.km + b.km, hours=a.hours + b.hours,
                maneuvers=a.maneuvers + b.maneuvers, via_switzerland=a.via_switzerland or b.via_switzerland)
@@ -294,6 +305,8 @@ def route_valhalla(points: list[dict], truck: TruckProfile, base_url: str = VALH
     for i, group in enumerate(_groups(points)):
         try:
             def build(group=group):
+                if _same_place(group):
+                    return _zero_leg(group)
                 avoid = opts.avoid_switzerland and not _endpoints_in_ch(group)
                 leg = _valhalla_leg(group, truck, base_url, avoid)
                 if avoid and shape_in_switzerland(leg.shape):
@@ -334,6 +347,8 @@ def route_ors(points: list[dict], truck: TruckProfile, api_key: str, avg_speed_k
     legs, failed, errors = [], [], []
     for i, g in enumerate(_groups(points)):
         def build(g=g):
+            if _same_place(g):
+                return _zero_leg(g)
             leg = _ors_request(g, truck, api_key)
             if opts.avoid_switzerland and not _endpoints_in_ch(g) and shape_in_switzerland(leg.shape):
                 leg = _avoid_switzerland(g, leg, lambda grp: _ors_request(grp, truck, api_key))

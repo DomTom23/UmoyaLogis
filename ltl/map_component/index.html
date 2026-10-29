@@ -6,15 +6,20 @@
 <style>
   html, body { margin: 0; padding: 0; height: 100%; font-family: system-ui, sans-serif; }
   #map { position: absolute; inset: 0; background: #e8eef3; }
-  .pin { width: 26px; height: 26px; border-radius: 50%; color: #fff; font: 700 12px/26px system-ui;
-         text-align: center; border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
-  .pin.L { background: #1a9850; } .pin.U { background: #d73027; }
+  .pin { min-width: 26px; height: 26px; padding: 0 4px; box-sizing: border-box; border-radius: 13px; color: #fff;
+         font: 700 12px/22px system-ui; text-align: center; border: 2px solid #fff; white-space: nowrap;
+         box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+  .pin.L { background: #1a9850; } .pin.U { background: #d73027; } .pin.M { background: #6a3d9a; }
   .via { width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 3px solid #1f4e9c;
          box-shadow: 0 1px 3px rgba(0,0,0,.5); cursor: grab; }
   .ghost { width: 14px; height: 14px; border-radius: 50%; background: #ffd24d; border: 3px solid #1f4e9c; }
-  .panel { background: rgba(255,255,255,.93); padding: 6px 9px; border-radius: 6px; font-size: 12px;
-           box-shadow: 0 1px 5px rgba(0,0,0,.3); line-height: 1.4; }
+  .panel { background: rgba(255,255,255,.95); color: #222; padding: 6px 9px; border-radius: 6px; font-size: 12px;
+           box-shadow: 0 1px 5px rgba(0,0,0,.3); line-height: 1.45; max-width: 250px; }
   .panel button { font: inherit; cursor: pointer; margin-top: 4px; }
+  .panel .row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; border: 1px solid #fff; box-shadow: 0 0 2px #0006; }
+  .bar { width: 18px; height: 0; display: inline-block; border-top: 4px solid #1f77b4; }
+  .bar.dash { border-top: 4px dashed #e08a00; }
   .banner { color: #8a4b00; font-weight: 600; }
   .leaflet-interactive { cursor: crosshair; }
   .leaflet-bar a, .leaflet-bar a:hover { background: #fff; color: #222; text-decoration: none; }
@@ -26,12 +31,8 @@
 <script>
 (function () {
   const send = (type, data) => window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, data), "*");
-  let map, layer, lastFit = null, args = null;
-
-  function busy(text) {
-    const p = document.getElementById("panel");
-    if (p) p.insertAdjacentHTML("afterbegin", "<div class='banner' id='busy'>" + text + "</div>");
-  }
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+  let map, layer, lastFit = null, args = null, helpOpen = false, drag = null;
 
   function emit(ev) {
     ev.nonce = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
@@ -39,13 +40,18 @@
     send("streamlit:setComponentValue", {value: ev, dataType: "json"});
   }
 
+  function busy(text) {                       // natychmiastowa informacja zwrotna, zanim serwer przeliczy trasę
+    const p = document.getElementById("panel");
+    const old = document.getElementById("busy");
+    if (old) old.remove();
+    if (p) p.insertAdjacentHTML("afterbegin", "<div class='banner' id='busy'>" + esc(text) + "</div>");
+  }
+
   function init() {
     map = L.map("map", {zoomControl: true, doubleClickZoom: false}).setView([50, 10], 5);
-    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 18, attribution: "© OpenStreetMap"
-    }).addTo(map);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {maxZoom: 18, attribution: "© OpenStreetMap"}).addTo(map);
     layer = L.layerGroup().addTo(map);
-
+    window.__map = map;                       // wygodne przy debugowaniu w konsoli przeglądarki
     const Panel = L.Control.extend({
       options: {position: "topright"},
       onAdd: function () {
@@ -56,35 +62,72 @@
       }
     });
     new Panel().addTo(map);
+    // przeciąganie przerwane poza mapą (mysz wyszła z ramki / okno straciło fokus) nie może zablokować mapy
+    document.documentElement.addEventListener("mouseleave", cancelDrag);
+    window.addEventListener("blur", cancelDrag);
   }
 
   function updatePanel() {
     const p = document.getElementById("panel");
-    let html = "<b>Edycja trasy</b><br>Przeciągnij fragment linii, aby zmienić przebieg.<br>" +
-               "Punkt pośredni: przeciągnij = przesuń, dwuklik = usuń.";
-    if (args.banner) html += "<div class='banner'>" + args.banner + "</div>";
-    html += "<br><button id='reset'>Wyczyść punkty pośrednie</button>";
+    let html = "<div class='row'><span class='dot' style='background:#1a9850'></span>załadunek " +
+               "<span class='dot' style='background:#d73027'></span>rozładunek " +
+               "<span class='dot' style='background:#fff;border:3px solid #1f4e9c;width:7px;height:7px'></span>via</div>" +
+               "<div class='row'><span class='bar'></span>trasa <span class='bar dash'></span>linia prosta</div>";
+    if (args.banner) html += "<div class='banner'>" + esc(args.banner) + "</div>";
+    if (helpOpen) {
+      html += "<div>Przeciągnij fragment linii, aby zmienić przebieg trasy. Punkt pośredni: przeciągnij = przesuń, " +
+              "dwuklik lub PPM = usuń.</div>";
+    }
+    html += "<button id='help'>" + (helpOpen ? "Ukryj pomoc" : "Jak edytować?") + "</button> " +
+            "<button id='reset'>Wyczyść punkty pośrednie</button>";
     p.innerHTML = html;
-    document.getElementById("reset").onclick = () => emit({action: "reset"});
+    document.getElementById("reset").onclick = () => { busy("Przeliczanie trasy…"); emit({action: "reset"}); };
+    document.getElementById("help").onclick = () => { helpOpen = !helpOpen; updatePanel(); };
   }
 
-  function pin(stop, n) {
-    const icon = L.divIcon({className: "", iconSize: [26, 26], iconAnchor: [13, 13],
-      html: "<div class='pin " + stop.kind + "'>" + n + "</div>"});
-    const m = L.marker([stop.lat, stop.lon], {icon, zIndexOffset: 500});
-    m.bindTooltip(n + ". " + (stop.kind === "L" ? "Załadunek " : "Rozładunek ") + stop.label);
-    return m;
+  // pinezki w tym samym miejscu (np. dwa rozładunki w jednym kodzie) łączymy w jedną: "2,3"
+  function pins() {
+    const groups = new Map();
+    args.stops.forEach((s, i) => {
+      const key = s.lat.toFixed(3) + "|" + s.lon.toFixed(3);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push({n: i + 1, s});
+    });
+    groups.forEach((items) => {
+      const kinds = new Set(items.map((x) => x.s.kind));
+      const cls = kinds.size > 1 ? "M" : items[0].s.kind;
+      const text = items.map((x) => x.n).join(",");
+      const icon = L.divIcon({className: "", iconSize: null, iconAnchor: [13, 13],
+        html: "<div class='pin " + cls + "'>" + esc(text) + "</div>"});
+      const m = L.marker([items[0].s.lat, items[0].s.lon], {icon, zIndexOffset: 500}).addTo(layer);
+      m.bindTooltip(items.map((x) => esc(x.n + ". " + (x.s.kind === "L" ? "Załadunek " : "Rozładunek ") + x.s.label)).join("<br>"));
+    });
+  }
+
+  function cancelDrag() {
+    if (!drag) return;
+    map.off("mousemove", drag.move);
+    document.removeEventListener("mouseup", drag.up);
+    map.removeLayer(drag.ghost);
+    map.dragging.enable();
+    drag = null;
   }
 
   function legLine(shape, i) {
     const straight = (args.straight || []).includes(i);
-    const base = straight ? {color: "#e08a00", weight: 6, opacity: .9, dashArray: "10 8"}
-                          : {color: "#1f77b4", weight: 6, opacity: .85};
+    const base = straight ? {color: "#e08a00", weight: 6, opacity: .9, dashArray: "10 8", smoothFactor: 1.5}
+                          : {color: "#1f77b4", weight: 6, opacity: .85, smoothFactor: 1.5};
     const line = L.polyline(shape, base).addTo(layer);
+    const info = (args.leg_info || [])[i];
+    if (info) {
+      line.bindTooltip("Odcinek " + (i + 1) + ": " + esc(info.label) + "<br>" + info.km + " km · " + info.h + " h" +
+                       (straight ? "<br><i>linia prosta (brak drogi z serwera)</i>" : ""), {sticky: true});
+    }
     line.on("mouseover", () => line.setStyle({weight: 9, opacity: 1}));
     line.on("mouseout", () => line.setStyle({weight: 6, opacity: base.opacity}));
     line.on("mousedown", (e) => {
       L.DomEvent.stop(e);
+      cancelDrag();
       const start = e.containerPoint;
       const ghost = L.marker(e.latlng, {
         icon: L.divIcon({className: "", iconSize: [14, 14], iconAnchor: [7, 7], html: "<div class='ghost'></div>"}),
@@ -93,17 +136,20 @@
       map.dragging.disable();
       const move = (ev) => ghost.setLatLng(ev.latlng);
       const up = (ev) => {
-        map.off("mousemove", move);
-        map.dragging.enable();
-        map.removeLayer(ghost);
         const ll = map.mouseEventToLatLng(ev);
-        if (start.distanceTo(map.mouseEventToContainerPoint(ev)) > 6) {
+        const moved = start.distanceTo(map.mouseEventToContainerPoint(ev)) > 6;
+        const r = map.getContainer().getBoundingClientRect();
+        // Chrome dostarcza mouseup do ramki także po wyjściu kursora poza nią: puszczenie poza mapą = anulowanie
+        const inside = ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom;
+        cancelDrag();
+        if (moved && inside) {
           L.marker(ll, {icon: L.divIcon({className: "", iconSize: [14, 14], iconAnchor: [7, 7],
                         html: "<div class='via'></div>"}), interactive: false}).addTo(layer);
           busy("Przeliczanie trasy…");
           emit({action: "add_via", leg: i, lat: ll.lat, lon: ll.lng});
         }
       };
+      drag = {ghost, move, up};
       map.on("mousemove", move);
       document.addEventListener("mouseup", up, {once: true});
     });
@@ -111,10 +157,11 @@
   }
 
   function render() {
+    cancelDrag();
     layer.clearLayers();
     const all = [];
     args.legs.forEach((shape, i) => {
-      if (shape.length > 1) { legLine(shape, i); shape.forEach(p => all.push(p)); }
+      if (shape.length > 1) { legLine(shape, i); shape.forEach((p) => all.push(p)); }
     });
     args.vias.forEach((v) => {
       const m = L.marker([v.lat, v.lon], {
@@ -126,9 +173,10 @@
       m.on("contextmenu", () => { busy("Przeliczanie trasy…"); emit({action: "remove_via", id: v.id}); });
       m.bindTooltip("Punkt pośredni (dwuklik = usuń)");
     });
-    args.stops.forEach((s, i) => { pin(s, i + 1).addTo(layer); all.push([s.lat, s.lon]); });
+    pins();
+    args.stops.forEach((s) => all.push([s.lat, s.lon]));
     if (args.fit_id !== lastFit && all.length) {
-      map.fitBounds(all, {padding: [30, 30]});
+      map.fitBounds(all, {padding: [30, 30], maxZoom: 11});
       lastFit = args.fit_id;
     }
     updatePanel();

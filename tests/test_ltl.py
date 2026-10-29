@@ -550,3 +550,175 @@ def test_filter_and_merge_edits_keep_hidden_rows():
     assert merged.loc[merged.id == "T1", "client"].iloc[0] == "Optima Logistics Group S.A."   # ukryte wiersze zostają
     new = merged[merged.id.str.startswith("M")].iloc[0]
     assert new.client == "Nowy Klient" and merged.id.is_unique
+
+
+# ------------------------------------------------------------ format kart Trans.eu (prawdziwe oferty), filtry, geokodowanie
+from ltl.eligibility import FleetProfile, check_eligibility
+
+CARDS = (pathlib.Path(__file__).parent / "data" / "trans_cards.txt").read_text()
+
+
+def test_cards_alignment_dates_and_fields():
+    df = parse_orders(CARDS)
+    assert len(df) == 43 and CARDS.count("29.10.2026\n12:") == 45          # 2 oferty to pętle (ten sam kod)
+    first = df.iloc[0]
+    assert (first.start_postal, first.end_postal, str(first.load_date), str(first.unload_date)) == \
+        ("53021", "67100", "2026-10-30", "2026-11-02")
+    assert (first.weight_t, first.ldm, first.distance_km) == (24, 13.6, 921) and first.status == "Do negocjacji"
+    assert first.load_type == "FTL" and first.vehicles == "z naczepą" and first.body == "mega, standard, firanka"
+    # dwa wiersze dat przy lokalizacji = okno; bierzemy początek okna
+    t3 = df[df.start_postal == "38590"].iloc[0]
+    assert (str(t3.load_date), str(t3.unload_date), t3.load_type, t3.ldm) == ("2026-10-29", "2026-11-02", "LTL", 1.3)
+    # opis zawierający "zał IT42031" nie psuje następnych ofert; opis z dwiema lokalizacjami też
+    assert df[df.start_postal == "40121"].end_postal.tolist() == ["13002", "39190"]
+    muggio = df[df.start_postal == "20835"].iloc[0]
+    assert (muggio.end_postal, muggio.distance_km, muggio.ldm) == ("42230", 507, 0.8) and "Muggio" in muggio.description
+    # kod GB bez spacji, kod z "Miasto, Region, Kraj"
+    assert {"OX2 6AA", "MK10 9AB", "NN4 7HS", "W1K 3AB", "WF5 9TG"} <= set(df.start_postal) | set(df.end_postal)
+    assert df[df.start_postal == "67440"].start_city.iloc[0] == "Wielki Wschód"
+    # żaden "zleceniodawca" z terminu płatności ani statusu ceny; kontakt e-mail daje domenę
+    assert set(df.client) == {"", "tirolia.at"}
+    assert list(df[df.start_postal == "20122"].status) == ["Za duże dla naczepy"]       # 15,4 LDM
+
+
+def test_cards_prices_currency_sanity_and_flags():
+    df = parse_orders(CARDS)
+    by = lambda postal: df[df.start_postal == postal].iloc[0]
+    assert by("07100").price_eur == 1100 and "ADR" in by("07100").extras
+    pln = by("18024")                                  # 4000 PLN przeliczone po kursie 4,25
+    assert abs(pln.price_eur - 4000 / 4.25) < 0.01 and "PLN" in pln.defaults_used
+    assert abs(parse_orders(CARDS, pln_per_eur=5.0)[lambda d: d.start_postal == "18024"].price_eur.iloc[0] - 800) < 0.01
+    assert pd.isna(by("52000").price_eur) and "nierealna" in by("52000").defaults_used            # "1 EUR"
+    assert pd.isna(by("52100").price_eur) and "za tonę" in by("52100").defaults_used              # "- PLN/t"
+    assert by("76600").status in ("OK", "Do negocjacji", "Za duże dla naczepy")
+    huge = df[df.weight_t == 1100].iloc[0]                                                       # literówka "1100 t"
+    assert huge.status == "Za duże dla naczepy" and "waga" in huge.defaults_used and "ADR" in huge.extras
+    assert "Winda" in by("69500").extras and "Winda" in df[df.weight_t == 1.1].iloc[0].extras
+
+
+def test_duplicates_dropped_and_counted():
+    df = parse_sources([CARDS])
+    assert len(df) == 42 and df.id.is_unique
+    rocca = df[df.start_postal == "84069"]
+    assert len(rocca) == 1 and "×2" in rocca.iloc[0].defaults_used
+    assert len(df[df.start_postal == "93600"]) == 2                    # różne ceny = osobne oferty (licytacja)
+
+
+def test_fleet_eligibility_reasons():
+    df = parse_sources([CARDS])
+    why = check_eligibility(df, FleetProfile())
+    row = lambda postal: why[df[df.start_postal == postal].index[0]]
+    assert row("69500") == "pojazd bez naczepy, wymaga windy"                                   # bus / solo bez naczepy
+    assert why[df[df.end_postal == "39190"].index[0]] == "" and "pojazd bez naczepy" in row("40121")
+    assert "nadwozie: chłodnia" in row("06018") and row("07100") == "pojazd bez naczepy, ADR"
+    assert "ADR" in row("18024") and "za duże" in row("20122")
+    open_fleet = check_eligibility(df, FleetProfile(semi_trailer_only=False, accepted_bodies=("firanka", "standard", "mega", "chłodnia", "jumbo"),
+                                                    adr=True, tail_lift=True))
+    assert (open_fleet == "").sum() > (why == "").sum()
+    assert "FTL" in check_eligibility(df, FleetProfile(allow_ftl=False)).iloc[0]
+
+
+def test_same_cargo_offered_twice_never_combined():
+    rows = [("A1", 52.5, 13.4, 48.9, 2.35, 2.0, 2.0, 900), ("A2", 52.5, 13.4, 48.9, 2.35, 2.0, 2.0, 950),
+            ("B", 52.4, 13.5, 48.8, 2.30, 2.0, 2.0, 800)]
+    df = _orders(rows)
+    df["load_date"] = [pd.Timestamp("2026-10-30").date()] * 3
+    v, _ = find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=500))
+    assert v and all(not ({"A1", "A2"} <= set(x.order_ids)) for x in v)
+    assert any({"A1", "B"} <= set(x.order_ids) or {"A2", "B"} <= set(x.order_ids) for x in v)
+
+
+def test_domestic_routes_do_not_get_cross_border_estimates():
+    df = pd.DataFrame([("GB", "GB", 13.6, None), ("GB", "FR", 13.6, None)],
+                      columns=["start_country", "end_country", "ldm", "price_eur"])
+    out = apply_price_rules(df, DEFAULT_RULES)
+    assert out.price_kind.tolist() == ["brak", "szacunek"] and out.price_used_eur.iloc[1] == 13.6 * 150
+
+
+def test_geocoder_prefetch_parallel_and_budget(monkeypatch):
+    from ltl.geo import Geocoder
+    g = Geocoder(online=True, cache_path=None)
+    calls = []
+    monkeypatch.setattr(g, "_fetch", lambda c, code: (calls.append(code) or (50.0, 5.0)) if code not in ("99999", "NOM") else None)
+    monkeypatch.setattr(g, "_fetch_nominatim", lambda c, p: (51.0, 6.0) if p == "NOM" else None)
+    pairs = [("FR", "75001"), ("FR", "75001"), ("GB", "OX2 6AA"), ("GB", "OX2 1AA"), ("FR", "99999"), ("DE", "NOM")]
+    ticks = []
+    st = g.prefetch(pairs, progress=lambda d, t: ticks.append((d, t)), max_nominatim=5)
+    assert sorted(calls) == ["75001", "OX2"] and st["total"] == 4 and ticks[-1] == (4, 4)    # GB: jeden człon = jedno zapytanie
+    assert g.locate("GB", "OX2 6AA")[2] == "cache" and g.locate("FR", "99999")[2] == "kraj"
+
+
+# ------------------------------------------------------------ mapa: uproszczenie linii, odcinki zerowe, bezpieczeństwo etykiet
+def test_simplify_shape_keeps_endpoints_and_shape():
+    import numpy as np
+    from ltl.mapview import simplify_shape
+    t = np.linspace(0, 20, 20000)
+    shape = np.column_stack([48 + 0.3 * np.sin(t / 3) + 0.0005 * np.cos(50 * t), 2 + t * 0.05])
+    out = np.asarray(simplify_shape(shape, tol_m=25))
+    assert len(out) < len(shape) / 5 and tuple(out[0]) == tuple(shape[0]) and tuple(out[-1]) == tuple(shape[-1])
+    # każdy oryginalny punkt leży blisko uproszczonej linii (tolerancja ~ 25 m + zapas)
+    from ltl.geo import haversine_km
+    idx = np.searchsorted(out[:, 1], shape[::97, 1]).clip(1, len(out) - 1)
+    a, b = out[idx - 1], out[idx]
+    frac = np.clip((shape[::97, 1] - a[:, 1]) / (b[:, 1] - a[:, 1]), 0, 1)
+    interp = a + (b - a) * frac[:, None]
+    assert haversine_km(shape[::97, 0], shape[::97, 1], interp[:, 0], interp[:, 1]).max() < 0.12   # błąd pionowy bywa większy od prostopadłego (25 m)
+    short = [(50.0, 10.0), (50.1, 10.1)]
+    assert simplify_shape(short) == [[50.0, 10.0], [50.1, 10.1]]
+
+
+def test_consecutive_stops_in_same_place_need_no_routing_request():
+    srv, url = fake_valhalla.start()
+    fake_valhalla.REQUESTS.clear()
+    pts = [{"lat": 48.86, "lon": 2.35}, {"lat": 48.86, "lon": 2.35}, {"lat": 48.9, "lon": 2.4}]
+    r = route_valhalla(pts, TruckProfile(), url)
+    assert r.is_real and len(r.legs) == 2 and r.legs[0].km == 0 and len(fake_valhalla.REQUESTS) == 1
+    srv.shutdown()
+
+
+def test_fake_server_ferry_is_detected_as_channel_crossing():
+    srv, url = fake_valhalla.start()
+    r = route_valhalla([{"lat": 48.86, "lon": 2.35}, {"lat": 51.5, "lon": -0.12}], TruckProfile(), url)
+    kinds = [(c.kind, c.name) for c in detect_crossings(r)]
+    assert kinds == [("channel_ferry", "prom Calais–Dover")]
+    back = route_valhalla([{"lat": 53.4, "lon": -1.5}, {"lat": 49.0, "lon": 2.5}], TruckProfile(), url)
+    assert [c.kind for c in detect_crossings(back)] == ["channel_ferry"]
+    srv.shutdown()
+
+
+def test_parse_orders_old_formats_unchanged_by_card_mode():
+    # kolumna nie-kartowa: dwa lokalizacje w opisie nie mogą rozbić wiersza tabeli
+    row = "FR 77140 Nemours\tGB G1 1 Glasgow\t07.10\t22,00\t13,60\t1176 km\t2 500 EUR\tFirma X (zał. IT42031)\n"
+    r = parse_orders(row).iloc[0]
+    assert (r.start_postal, r.end_postal, r.price_eur) == ("77140", "G1 1", 2500)
+
+
+def test_other_ferries_named_by_ports():
+    from ltl.regions import port_ferry_name
+    assert port_ferry_name((38.22, 15.64), (38.19, 15.55)) == "prom Villa San Giovanni–Messyna"
+    assert port_ferry_name((40.92, 9.50), (43.55, 10.30)) == "prom Olbia–Livorno"
+    assert port_ferry_name((10.0, 10.0), (11.0, 11.0)) is None
+    sicily = _leg([(38.4, 15.8), (38.22, 15.64), (38.19, 15.55), (38.0, 15.4)], [
+        {"type": 28, "names": [], "instruction": "", "begin": (38.22, 15.64), "end": (38.22, 15.64)},
+        {"type": 29, "names": [], "instruction": "", "begin": (38.19, 15.55), "end": (38.19, 15.55)}])
+    c = detect_crossings(RouteResult(legs=[sicily], is_real=True))
+    assert [(x.kind, x.name) for x in c] == [("ferry", "prom Villa San Giovanni–Messyna")]
+
+
+def test_ldm_from_dimensions_in_description():
+    from ltl.parsers import ldm_from_dimensions
+    cases = {"1 x 420x220x220 / 1000kg": 3.85, "2 x 120x80x220 / 348kg": 0.8, "3 x 100x120x200, 2250kg": 1.5,
+             "4 pal : 120*80*143 // 633 KGS TOTAL": 1.6, "7 pal 80*120 + 4 pal 100*120": 4.8,
+             "2 pal 1.28 X 0.75 X 1.30) Załadunek: bokiem": 0.8, "1pal 120x80x40 / no change": 0.4,
+             "5 x 120x80x190 / 600kg 1:1": 2.0}
+    for text, want in cases.items():
+        assert abs(ldm_from_dimensions(text) - want) < 0.02, (text, ldm_from_dimensions(text))
+    assert ldm_from_dimensions("Załadunek: bokiem, górą") is None and ldm_from_dimensions("FTL CONFIRMED") is None
+
+
+def test_missing_ldm_estimated_from_description_dimensions_not_only_from_weight():
+    df = parse_orders(CARDS)
+    row = df[(df.start_postal == "69160")].iloc[0]       # 1 t, "1 x 420x220x220": LDM z wymiarów (3,85), nie z wagi (0,57)
+    assert abs(row.ldm - 3.85) < 0.02 and "wymiar" in row.defaults_used
+    m = df[df.start_postal == "MK10 9AB"].iloc[0] if (df.start_postal == "MK10 9AB").any() else df[df.end_postal == "93290"].iloc[0]
+    assert abs(m.ldm - 1.6) < 0.02                       # "4 pal : 120*80*143"

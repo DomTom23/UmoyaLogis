@@ -2,7 +2,7 @@
 
 Zlecenie bez ceny dostaje cenę sztuczną = stawka (EUR/LDM) × LDM, wg reguły dla kraju załadunku lub rozładunku.
 Do wariantów trafia tylko wtedy, gdy ta cena osiąga minimalny przychód reguły; inaczej (albo gdy żadna reguła
-nie pasuje) zostaje wyłączone, jak „Do negocjacji”. Gdy pasuje kilka reguł, obowiązuje ta o najwyższej stawce.
+nie pasuje) zostaje wyłączone, jak „Do negocjacji”. Dotyczy tylko tras międzynarodowych. Gdy pasuje kilka reguł, obowiązuje ta o najwyższej stawce.
 """
 from __future__ import annotations
 
@@ -54,6 +54,8 @@ def frame_to_rules(df: pd.DataFrame) -> tuple[PriceRule, ...]:
 
 
 def _matching(row, rules) -> list[PriceRule]:
+    if row["start_country"] == row["end_country"]:
+        return []        # krajowe (np. GB -> GB) nie podpadają pod stawki "z/do kraju"
     return [r for r in rules if r.enabled and (
         (r.direction == FROM and row["start_country"] == r.country)
         or (r.direction == TO and row["end_country"] == r.country))]
