@@ -46,7 +46,7 @@ class OptimizerParams:
 @dataclass
 class Stop:
     order_id: str
-    kind: str          # "L" załadunek | "U" rozładunek | "S" start pojazdu (bez zlecenia)
+    kind: str          # "L" załadunek | "U" rozładunek | "S" start pojazdu | "W" punkt dodatkowy (bez zlecenia)
     country: str
     postal: str
     city: str
@@ -162,7 +162,8 @@ def _insert(seq, j, D, ldm, wt, max_ldm, max_wt):
 
 
 def find_best_combinations(
-    orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Optional["Stop"] = None
+    orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Optional["Stop"] = None,
+    waypoints: tuple = ()
 ) -> tuple[list[Variant], dict]:
     """Zwraca (TOP warianty, statystyki). `orders` musi mieć kolumny współrzędnych (ltl.geo.add_coordinates).
 
@@ -170,7 +171,8 @@ def find_best_combinations(
     odchylenia względem m): na każdym poziomie rozwijamy `beam_width` najzyskowniejszych zestawów, więc
     wypełnienie naczepy rośnie tak długo, jak zysk albo zapełnienie na to pozwalają.
     `origin` = miejsce startu pojazdu: dojazd na pierwszy załadunek (puste km) wchodzi do zysku i kolejności punktów,
-    a wariant dostaje na początku przystanek typu "S".
+    a wariant dostaje na początku przystanek typu "S". `waypoints` = obowiązkowe punkty dodatkowe (Stop typu "W"):
+    każdy trafia w najtańsze miejsce trasy (po starcie, przed ostatnim punktem zlecenia), a jego objazd liczy się do kosztów.
     """
     stats = {"candidates": 0, "eligible": 0, "evaluated": 0, "truncated": False}
     df = orders[(orders["price_eur"].notna())].copy()
@@ -197,9 +199,11 @@ def find_best_combinations(
         single = np.array([D[2 * i, 2 * i + 1] for i in range(n)])
     stats["candidates"] = n
 
-    d0 = None if origin is None else haversine_km(origin.lat, origin.lon, lats, lons) * ROAD_FACTOR
     ldm, wt = df["ldm"].to_numpy(float), df["weight_t"].to_numpy(float)
     price = df["price_eur"].to_numpy(float)
+    d0 = None if origin is None else haversine_km(origin.lat, origin.lon, lats, lons) * ROAD_FACTOR
+    plan = _Planner(D, lats, lons, d0, origin, tuple(waypoints))
+    wp_h = cost.waypoint_stop_h * len(waypoints)
     ldates = list(df["load_date"])
 
     # "główne" = najdłuższe; rozstrzyganie remisów indeksem
@@ -228,7 +232,7 @@ def find_best_combinations(
         compat[m] = [j for _, j in lst[: opt.compat_limit]]
 
     def score(idx, total):
-        return profit(float(sum(price[i] for i in idx)), total, 2 * len(idx), cost)["profit"]
+        return profit(float(sum(price[i] for i in idx)), total, 2 * len(idx), cost, wp_h)["profit"]
 
     best: dict[frozenset, tuple] = {}     # zestaw -> (zysk, indeksy, kolejność punktów, dystans)
     evals = 0
@@ -271,13 +275,16 @@ def find_best_combinations(
                 break
             scored = []
             for fk, (nseq, ntotal) in new.items():
-                if len(fk) <= 3:  # małe zestawy: dokładna kolejność
+                full = ntotal if plan.trivial else plan.length(nseq)
+                if len(fk) <= 3:  # małe zestawy: dokładna kolejność (z dojazdem ze startu)
                     r = _best_route(sorted(fk), D, ldm, wt, opt.max_ldm, opt.max_weight_t, d0=d0)
-                    if r and r[0] < ntotal + (0.0 if d0 is None else d0[nseq[0]]):
-                        nseq = r[1]
-                        ntotal = r[0] - (0.0 if d0 is None else d0[nseq[0]])
-                        new[fk] = (nseq, ntotal)
-                scored.append((score(fk, ntotal + (0.0 if d0 is None else d0[nseq[0]])), fk))
+                    if r:
+                        alt = r[0] if plan.trivial else plan.length(r[1])
+                        if alt < full - 1e-9:
+                            nseq, full = r[1], alt
+                            ntotal = plan.seq_length(nseq)
+                            new[fk] = (nseq, ntotal)
+                scored.append((score(fk, full), fk))
             for pr, fk in scored:
                 if fk not in best or best[fk][0] < pr:
                     best[fk] = (pr, tuple(sorted(fk)), new[fk][0], new[fk][1])
@@ -288,31 +295,82 @@ def find_best_combinations(
     stats["evaluated"] = evals
 
     ranked = sorted(best.values(), key=lambda t: -t[0])[: opt.top_n]
-    variants = [_build_variant(df, D, single, (pr, idx, total, seq), cost, ldm, wt, origin, d0)
+    variants = [_build_variant(df, D, single, (pr, idx, total, seq), cost, ldm, wt, plan, wp_h)
                 for pr, idx, seq, total in ranked]
     return variants, stats
 
 
-def _build_variant(df, D, single, res, cost: CostParams, ldm=None, wt=None, origin=None, d0=None) -> Variant:
+class _Planner:
+    """Pełna trasa: [start] + punkty zleceń + obowiązkowe punkty dodatkowe wstawione w najtańsze miejsce.
+
+    Węzły: p >= 0 = punkt zlecenia (2i załadunek, 2i+1 rozładunek), -1 = start, -2-k = k-ty punkt dodatkowy."""
+
+    def __init__(self, D, lats, lons, d0, origin, waypoints):
+        self.D, self.d0, self.origin, self.wps = D, d0, origin, waypoints
+        self.trivial = origin is None and not waypoints
+        self.dw = [haversine_km(w.lat, w.lon, lats, lons) * ROAD_FACTOR for w in waypoints]
+        pts = ([(origin.lat, origin.lon)] if origin else []) + [(w.lat, w.lon) for w in waypoints]
+        ids = ([-1] if origin else []) + [-2 - k for k in range(len(waypoints))]
+        self.sp = {(a, b): float(haversine_km(*pa, *pb)) * ROAD_FACTOR
+                   for a, pa in zip(ids, pts) for b, pb in zip(ids, pts)}
+
+    def dist(self, a, b):
+        if a >= 0 and b >= 0:
+            return float(self.D[a, b])
+        if a >= 0 or b >= 0:
+            p, sp = (a, b) if a >= 0 else (b, a)
+            return float(self.d0[p]) if sp == -1 else float(self.dw[-sp - 2][p])
+        return self.sp[(a, b)]
+
+    def seq_length(self, seq):
+        return sum(float(self.D[a, b]) for a, b in zip(seq, seq[1:]))
+
+    def nodes(self, seq):
+        nodes = ([-1] if self.origin else []) + list(seq)
+        for k in range(len(self.wps)):
+            w = -2 - k
+            best = None
+            for i in range(1, len(nodes)):         # po starcie / pierwszym punkcie, przed ostatnim punktem zlecenia
+                a, b = nodes[i - 1], nodes[i]
+                delta = self.dist(a, w) + self.dist(w, b) - self.dist(a, b)
+                if best is None or delta < best[0]:
+                    best = (delta, i)
+            nodes.insert(best[1], w)
+        return nodes
+
+    def length(self, seq):
+        nodes = self.nodes(seq)
+        return sum(self.dist(a, b) for a, b in zip(nodes, nodes[1:]))
+
+
+def _build_variant(df, D, single, res, cost: CostParams, ldm=None, wt=None, plan=None, wp_h=0.0) -> Variant:
     pr, idx, total, seq = res
+    nodes = plan.nodes(seq) if plan else list(seq)
     stops, loaded, empty = [], 0.0, 0.0
     on_board = set()
-    for step, p in enumerate(seq):
-        i, is_unload = p // 2, bool(p % 2)
-        row = df.iloc[i]
-        side = "end" if is_unload else "start"
-        stops.append(Stop(
-            order_id=row["id"], kind="U" if is_unload else "L",
-            country=row[f"{side}_country"], postal=row[f"{side}_postal"], city=row[f"{side}_city"],
-            lat=float(row[f"{side}_lat"]), lon=float(row[f"{side}_lon"]),
-        ))
+    for step, p in enumerate(nodes):
+        if p == -1:
+            stops.append(plan.origin)
+        elif p <= -2:
+            stops.append(plan.wps[-p - 2])
+        else:
+            i, is_unload = p // 2, bool(p % 2)
+            row = df.iloc[i]
+            side = "end" if is_unload else "start"
+            stops.append(Stop(
+                order_id=row["id"], kind="U" if is_unload else "L",
+                country=row[f"{side}_country"], postal=row[f"{side}_postal"], city=row[f"{side}_city"],
+                lat=float(row[f"{side}_lat"]), lon=float(row[f"{side}_lon"]),
+            ))
         if step > 0:
-            leg = D[seq[step - 1], p]
+            leg = plan.dist(nodes[step - 1], p) if plan else float(D[nodes[step - 1], p])
             if on_board:
                 loaded += leg
             else:
                 empty += leg
-        on_board.add(i) if not is_unload else on_board.discard(i)
+        if p >= 0:
+            on_board.add(p // 2) if not p % 2 else on_board.discard(p // 2)
+    total = loaded + empty
     peak_l = peak_w = cur_l = cur_w = 0.0
     for p in seq:
         sign = 1.0 if p % 2 == 0 else -1.0
@@ -321,16 +379,12 @@ def _build_variant(df, D, single, res, cost: CostParams, ldm=None, wt=None, orig
         peak_l, peak_w = max(peak_l, cur_l), max(peak_w, cur_w)
     revenue = float(sum(df.iloc[i]["price_eur"] for i in idx))
     main = max(single[i] for i in idx)
-    detour = total - main
-    if origin is not None:                      # dojazd z miejsca startu na pierwszy załadunek to puste kilometry
-        dead = float(d0[seq[0]])
-        stops.insert(0, origin)
-        total, empty = total + dead, empty + dead
-    c = profit(revenue, total, len(seq), cost)
+    c = profit(revenue, total, len(seq), cost, wp_h)
     return Variant(
         order_ids=[df.iloc[i]["id"] for i in idx], stops=stops, revenue=revenue, cost=c,
         profit=c["profit"], total_km=total, loaded_km=loaded, empty_km=empty,
-        detour_km=detour, days=c["days"], drive_h=c["drive_h"], peak_ldm=peak_l, peak_weight_t=peak_w,
+        detour_km=float(plan.seq_length(seq) if plan else total) - main, days=c["days"], drive_h=c["drive_h"],
+        peak_ldm=peak_l, peak_weight_t=peak_w,
     )
 
 

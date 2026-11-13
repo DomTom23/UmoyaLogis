@@ -817,3 +817,37 @@ def test_variant_key_depends_on_origin_location():
     k = [variant_key(find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=800), o)[0][0])
          for o in (Stop("START", "S", "PL", "1", "", 52.0, 17.0), Stop("START", "S", "PL", "2", "", 51.0, 19.0), None)]
     assert len(set(k)) == 3
+
+
+def test_mandatory_waypoint_inserted_at_cheapest_place_and_costed():
+    from ltl.optimizer import Stop
+    from ltl.ranking import variant_key
+    from ltl.route_edit import route_for_variant
+    from ltl.routing import TruckProfile
+    # A: Berlin -> Paryż, B: Poznań -> Lyon; punkt dodatkowy: Kolonia (po drodze Berlin -> Paryż)
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500)]
+    df = _orders(rows)
+    p = OptimizerParams(max_detour_km=800)
+    base, _ = find_best_combinations(df, CostParams(), p)
+    on_way = Stop("P1", "W", "DE", "50667", "Kolonia", 50.94, 6.96)
+    v, _ = find_best_combinations(df, CostParams(), p, None, (on_way,))
+    top = [x for x in v if set(x.order_ids) == {"A", "B"}][0]
+    kinds = [s.kind for s in top.stops]
+    assert kinds.count("W") == 1 and kinds[0] != "W" and kinds[-1] != "W"      # po drodze, nie na końcach
+    nob = [x for x in base if set(x.order_ids) == {"A", "B"}][0]
+    assert top.total_km >= nob.total_km and top.total_km - nob.total_km < 150   # Kolonia leży prawie po drodze
+    far = Stop("P1", "W", "ES", "28001", "Madryt", 40.4, -3.7)
+    v2, _ = find_best_combinations(df, CostParams(), p, None, (far,))
+    top2 = [x for x in v2 if set(x.order_ids) == {"A", "B"}][0]
+    assert top2.total_km - nob.total_km > 1500 and top2.profit < top.profit      # daleki punkt mocno obniża zysk
+    assert variant_key(top) != variant_key(top2)
+    # postój w punkcie wlicza się do czasu pracy i nie jest liczony jak załadunek
+    r = route_for_variant(top, [], TruckProfile(), "none", "", "", 65.0)
+    c0, c1 = CostParams(), CostParams(waypoint_stop_h=3.0)
+    e0, e1 = evaluate_route(top, r, c0), evaluate_route(top, r, c1)
+    assert abs((e1["work_h"] - e0["work_h"]) - 3.0) < 1e-9 and e0["work_h"] == e0["drive_h"] + 4 * c0.handling_h_per_stop
+    # start + punkt dodatkowy razem
+    start = Stop("START", "S", "PL", "00-001", "", 52.2, 21.0)
+    v3, _ = find_best_combinations(df, CostParams(), p, start, (on_way,))
+    k3 = [s.kind for s in [x for x in v3 if set(x.order_ids) == {"A", "B"}][0].stops]
+    assert k3[0] == "S" and k3.count("W") == 1 and k3[-1] != "W"

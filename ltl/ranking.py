@@ -16,7 +16,7 @@ from .variant_detail import arrow
 
 def variant_key(v: Variant) -> str:
     # start pojazdu nie ma numeru zlecenia, więc klucz zawiera jego położenie (inny start = inna trasa)
-    return "|".join(f"{s.order_id}@{s.lat:.4f},{s.lon:.4f}S" if s.kind == "S" else f"{s.order_id}{s.kind}"
+    return "|".join(f"{s.order_id}@{s.lat:.4f},{s.lon:.4f}{s.kind}" if s.kind in ("S", "W") else f"{s.order_id}{s.kind}"
                     for s in v.stops)
 
 

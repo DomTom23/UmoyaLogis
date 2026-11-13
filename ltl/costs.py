@@ -18,32 +18,33 @@ class CostParams:
     weekly_rest_days: float = 2.0      # ~45 h odpoczynku po wyczerpaniu 56 h
     channel_crossing_eur: float = 0.0  # opłata za Eurotunel / prom przez La Manche (za jedną przeprawę)
     alpine_tunnel_eur: float = 0.0     # opłata za płatny tunel alpejski (za jeden tunel)
+    waypoint_stop_h: float = 0.0       # postój w każdym obowiązkowym punkcie dodatkowym
 
 
-def trip_time(distance_km: float, n_stops: int, p: CostParams) -> dict:
+def trip_time(distance_km: float, n_stops: int, p: CostParams, extra_h: float = 0.0) -> dict:
     """Czas jazdy i liczba dni pracy z uwzględnieniem pauz.
 
     Dzień pracy = max_drive_h_day godzin (jazda + załadunki). Po każdych 56 h jazdy
     doliczany jest tygodniowy odpoczynek (płatny jak dzień pracy: auto stoi, kierowca jest w kosztach).
     """
     drive_h = distance_km / p.avg_speed_kmh
-    work_h = drive_h + n_stops * p.handling_h_per_stop
+    work_h = drive_h + n_stops * p.handling_h_per_stop + extra_h
     work_days = max(1, math.ceil(work_h / p.max_drive_h_day - 1e-9))
     weekly_rests = max(0, math.ceil(drive_h / p.max_drive_h_week - 1e-9) - 1)
     days = work_days + weekly_rests * p.weekly_rest_days
     return {"drive_h": drive_h, "work_h": work_h, "days": days}
 
 
-def operating_cost(distance_km: float, n_stops: int, p: CostParams) -> dict:
-    t = trip_time(distance_km, n_stops, p)
+def operating_cost(distance_km: float, n_stops: int, p: CostParams, extra_h: float = 0.0) -> dict:
+    t = trip_time(distance_km, n_stops, p, extra_h)
     labor = t["days"] * p.day_cost_eur
     fuel = distance_km * (p.fuel_l_per_100km / 100.0) * p.fuel_price_eur
     tolls = distance_km * p.toll_eur_per_km
     return {**t, "labor": labor, "fuel": fuel, "tolls": tolls, "total": labor + fuel + tolls}
 
 
-def profit(revenue_eur: float, distance_km: float, n_stops: int, p: CostParams) -> dict:
-    c = operating_cost(distance_km, n_stops, p)
+def profit(revenue_eur: float, distance_km: float, n_stops: int, p: CostParams, extra_h: float = 0.0) -> dict:
+    c = operating_cost(distance_km, n_stops, p, extra_h)
     c["revenue"] = revenue_eur
     c["profit"] = revenue_eur - c["total"]
     return c

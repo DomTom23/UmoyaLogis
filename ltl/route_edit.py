@@ -92,7 +92,9 @@ def evaluate_route(variant: Variant, route: RouteResult, cost: CostParams) -> di
         else:
             empty += leg.km
         visit(variant.stops[i + 1])
-    c = profit(variant.revenue, route.km, sum(1 for s in variant.stops if s.kind != "S"), cost)
+    n_cargo = sum(1 for s in variant.stops if s.kind in ("L", "U"))
+    n_wp = sum(1 for s in variant.stops if s.kind == "W")
+    c = profit(variant.revenue, route.km, n_cargo, cost, extra_h=n_wp * cost.waypoint_stop_h)
     crossings = detect_crossings(route)
     fees = sum(cost.channel_crossing_eur for x in crossings if x.kind in ("channel_tunnel", "channel_ferry")) \
         + sum(cost.alpine_tunnel_eur for x in crossings if x.kind == "alpine_tunnel")

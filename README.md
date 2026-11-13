@@ -82,6 +82,10 @@ wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląd
 * **Miejsce startu pojazdu:** pole „Kraj” + „Kod pocztowy startu” (między krokiem 2 a 3). Wszystkie warianty są liczone od
   tego miejsca: dojazd na pierwszy załadunek to puste kilometry w kosztach i zysku, wpływa też na kolejność punktów i
   ranking. Na mapie start to niebieska pinezka „S”, a w tabelach 🏁. Pusty kod = liczenie od pierwszego załadunku.
+* **Punkty dodatkowe (obowiązkowe):** tabela pod miejscem startu (kraj, kod, opis; można dodać kilka). Trasa każdego
+  wariantu musi je zahaczyć: punkt trafia w najtańsze miejsce (po starcie, przed ostatnim punktem zlecenia), objazd
+  wlicza się do kilometrów, kosztów i rankingu, a postój (ustawienie „Postój w punkcie dodatkowym”, domyślnie 0 h) do
+  czasu pracy. Na mapie to pomarańczowa pinezka „P1”, w tabelach 📍.
 * **Opis wariantu:** po wybraniu wariantu widać przebieg krok po kroku (🟢▲ załadunek, 🔴▼ rozładunek, zapełnienie
   naczepy po każdej operacji, km i godziny odcinków), a w rankingu kolumnę Cena/km (przychód / cały dystans).
 * **Szwajcaria:** załadunek i rozładunek w Szwajcarii są dozwolone, omijany jest tylko tranzyt.

@@ -94,8 +94,9 @@ def _parse(texts: tuple, drop_no_price: bool, pln_per_eur: float) -> pd.DataFram
 
 
 @st.cache_data(show_spinner="Szukanie najlepszych doładunków…")
-def _search(orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Stop | None = None):
-    return find_best_combinations(orders, cost, opt, origin)
+def _search(orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Stop | None = None,
+            waypoints: tuple = ()):
+    return find_best_combinations(orders, cost, opt, origin, waypoints)
 
 
 _variant_key = variant_key
@@ -130,6 +131,8 @@ with st.sidebar:
         pln_per_eur = st.number_input("Kurs PLN za 1 EUR", 3.0, 6.0, 4.25, 0.05,
                                       help="Do przeliczania cen podanych w PLN. Zmiana wczytuje oferty od nowa "
                                            "(poprawki ręczne w tabeli zostają tylko do czasu zmiany kursu).")
+        waypoint_h = st.number_input("Postój w punkcie dodatkowym (h)", 0.0, 24.0, 0.0, 0.5,
+                                     help="Czas pracy doliczany za każdy obowiązkowy punkt dodatkowy na trasie.")
         handling_h = st.number_input("Czas na załadunek / rozładunek (h)", 0.0, 8.0, 2.0, 0.5,
                                      help="Liczony dla każdego załadunku i każdego rozładunku; wlicza się do czasu "
                                           "pracy i liczby dni (koszt dnia pracy).")
@@ -210,7 +213,8 @@ with st.sidebar:
 
 cost = CostParams(day_cost_eur=day_cost, avg_speed_kmh=speed, fuel_l_per_100km=consumption,
                   fuel_price_eur=fuel_price, toll_eur_per_km=toll,
-                  channel_crossing_eur=channel_fee, alpine_tunnel_eur=tunnel_fee, handling_h_per_stop=handling_h)
+                  channel_crossing_eur=channel_fee, alpine_tunnel_eur=tunnel_fee, handling_h_per_stop=handling_h,
+                  waypoint_stop_h=waypoint_h)
 route_opts = RouteOptions(avoid_switzerland=avoid_ch)
 opt = OptimizerParams(max_detour_km=max_detour, top_n=max(n_check, top_n),   # kandydaci do sprawdzenia na drogach
                       hard_cap_orders=max_orders, max_load_date_gap_days=int(date_gap) or None)
@@ -579,8 +583,39 @@ with st.container(border=True):
                            "więc dojazd jest bardzo przybliżony. Sprawdź kod lub połączenie z internetem.")
             else:
                 o3.success(f"Start: {o_country} {o_postal} ({o_lat:.2f}, {o_lon:.2f}).")
+    st.markdown("**Punkty dodatkowe (obowiązkowe)** - miejsca, które trasa musi zahaczyć po drodze (np. magazyn, "
+                "warsztat, dodatkowy odbiór bez ładunku). Każdy trafia w najtańsze miejsce trasy: po starcie, przed "
+                "ostatnim rozładunkiem.")
+    wp_df = st.data_editor(
+        pd.DataFrame({"Kraj": pd.Series(dtype=str), "Kod pocztowy": pd.Series(dtype=str), "Opis": pd.Series(dtype=str)}),
+        key="waypoints_editor", num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={"Kraj": st.column_config.TextColumn("Kraj", max_chars=2, width="small", default="PL",
+                                                           help="Dwuliterowy kod kraju, np. PL."),
+                       "Kod pocztowy": st.column_config.TextColumn("Kod pocztowy", width="medium"),
+                       "Opis": st.column_config.TextColumn("Opis (opcjonalnie)", width="large")})
+    waypoints, wp_notes = [], []
+    for n_wp, r in enumerate(wp_df.itertuples(index=False), start=1):
+        wc, wpc = str(r[0] or "PL").strip().upper(), str(r[1] or "").strip()
+        if not wpc:
+            continue
+        if len(wc) != 2:
+            wp_notes.append(f"Punkt {n_wp}: podaj dwuliterowy kod kraju.")
+            continue
+        geocoder.prefetch([(wc, wpc)])
+        w_lat, w_lon, w_src = geocoder.locate(wc, wpc)
+        waypoints.append(Stop(order_id=f"P{len(waypoints) + 1}", kind="W", country=wc, postal=wpc,
+                              city=str(r[2] or "").strip(), lat=float(w_lat), lon=float(w_lon)))
+        if w_src == "kraj":
+            wp_notes.append(f"Punkt {wc} {wpc}: nie udało się zlokalizować kodu - użyto środka kraju.")
+    geocoder.save()
+    for note in wp_notes:
+        st.warning(note)
+    if waypoints:
+        st.caption("Punkty dodatkowe: " + ", ".join(f"📍 {w.order_id} {w.country} {w.postal} {w.city}".strip()
+                                                    for w in waypoints))
+waypoints = tuple(waypoints)
 origin_sig = None if origin is None else (origin.country, origin.postal, round(origin.lat, 4), round(origin.lon, 4))
-candidates, stats = _search(orders_opt, cost, opt, origin)
+candidates, stats = _search(orders_opt, cost, opt, origin, waypoints)
 
 # ------------------------------------------------------- krok 3: warianty
 with st.container(border=True):
@@ -595,7 +630,8 @@ with st.container(border=True):
 
     # ranking po trasach rzeczywistych: liczony od razu, pamiętany do zmiany danych lub ustawień
     sig = (analysis["id"], hash(orders.drop(columns=["start_geo", "end_geo"]).to_csv()), cost, opt, provider,
-           valhalla_url, ors_key, truck, route_opts, top_n, origin_sig)
+           valhalla_url, ors_key, truck, route_opts, top_n, origin_sig,
+           tuple((w.country, w.postal, round(w.lat, 4), round(w.lon, 4)) for w in waypoints))
     cache = st.session_state.get("ranked")
     if not cache or cache["sig"] != sig:
         bar = st.progress(0.0, text="Wyznaczanie tras po drogach dla najlepszych wariantów…")
@@ -646,7 +682,7 @@ with st.container(border=True):
     shown = [r for r in ranked
              if (not sel_vc or any(client_map.get(i) in sel_vc for i in r.variant.order_ids))
              and (not vq or vq in _variant_text(r))
-             and (not vcodes or any(code_match(x.country, x.postal, vcodes) for x in r.variant.stops if x.kind != "S"))]
+             and (not vcodes or any(code_match(x.country, x.postal, vcodes) for x in r.variant.stops if x.kind in ("L", "U")))]
     if not shown:
         st.info("Żaden wariant nie pasuje do filtra - pokazuję wszystkie.")
         shown = ranked
@@ -752,9 +788,9 @@ with st.container(border=True):
         stops_df = stops_df.drop(columns="Zleceniodawca")
     st.dataframe(stops_df, width="stretch", hide_index=True, column_config={
         "Krok": st.column_config.NumberColumn("Krok", width=55),
-        "Operacja": st.column_config.TextColumn("Operacja", width=125),
+        "Operacja": st.column_config.TextColumn("Operacja", width=150),
         "Zlecenie": st.column_config.TextColumn("Zlecenie", width=80),
-        "Miejsce": st.column_config.TextColumn("Miejsce", width=200),
+        "Miejsce": st.column_config.TextColumn("Miejsce", width=180),
         "Data": st.column_config.TextColumn("Data", width=60),
         "Ładunek": st.column_config.TextColumn("Ładunek", width=135,
                                                help="Ile ładunku zlecenia jest brane lub zostawiane w tym punkcie."),

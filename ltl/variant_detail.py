@@ -6,18 +6,18 @@ import pandas as pd
 from .optimizer import Variant
 from .routing import RouteResult
 
-LOAD_ICON, UNLOAD_ICON, START_ICON = "🟢▲", "🔴▼", "🏁"
+LOAD_ICON, UNLOAD_ICON, START_ICON, WAYPOINT_ICON = "🟢▲", "🔴▼", "🏁", "📍"
 LOAD_COLOR, UNLOAD_COLOR = "#1a9850", "#d73027"
 
 
 def arrow(kind: str) -> str:
     """Strzałka do tabel (emoji, bo tabele nie kolorują fragmentów tekstu): zielona = załadunek, czerwona = rozładunek."""
-    return START_ICON if kind == "S" else LOAD_ICON if kind == "L" else UNLOAD_ICON
+    return {"S": START_ICON, "W": WAYPOINT_ICON, "L": LOAD_ICON}.get(kind, UNLOAD_ICON)
 
 
 def arrow_html(kind: str) -> str:
-    if kind == "S":
-        return "<span style='font-weight:700'>🏁</span>"
+    if kind in ("S", "W"):
+        return f"<span style='font-weight:700'>{arrow(kind)}</span>"
     color, sign = (LOAD_COLOR, "▲") if kind == "L" else (UNLOAD_COLOR, "▼")
     return f"<span style='color:{color};font-weight:700'>{sign}</span>"
 
@@ -45,12 +45,13 @@ def stop_table(variant: Variant, route: RouteResult, orders: pd.DataFrame) -> pd
     rows = []
     for i, s in enumerate(variant.stops):
         leg = route.legs[i] if i < len(route.legs) else None
-        if s.kind == "S":
-            rows.append({"Krok": i + 1, "Operacja": f"{arrow('S')} Start pojazdu", "Zlecenie": "—", "Zleceniodawca": "—",
+        if s.kind in ("S", "W"):
+            rows.append({"Krok": i + 1, "Operacja": f"{arrow(s.kind)} {'Start pojazdu' if s.kind == 'S' else 'Punkt dodatkowy'}",
+                         "Zlecenie": "—" if s.kind == "S" else s.order_id, "Zleceniodawca": "—",
                          "Miejsce": place(s.country, s.postal, s.city), "Data": "—", "Ładunek": "—",
-                         "Na naczepie po": "0.0 LDM · 0.0 t",
+                         "Na naczepie po": f"{ldm:.1f} LDM · {wt:.1f} t",
                          "Do następnego": f"{leg.km:,.0f} km · {leg.hours:.1f} h ".replace(",", " ") if leg else "—",
-                         "Od startu (km)": 0})
+                         "Od startu (km)": round(cum_km)})
             if leg:
                 cum_km += leg.km
                 cum_h += leg.hours

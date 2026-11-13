@@ -48,7 +48,9 @@ def route_map(variant: Variant, route: RouteResult, vias: list[Via], *, map_id: 
               height: int = 600, key: str | None = None):
     """Rysuje mapę i zwraca ostatnie zdarzenie edycji (dict) lub None."""
     stops = [{"lat": s.lat, "lon": s.lon, "kind": s.kind,
+              "tag": s.order_id,
               "label": (f"Start pojazdu · {s.country} {s.postal}" if s.kind == "S" else
+                        f"Punkt dodatkowy {s.order_id} · {s.country} {s.postal} {s.city}" if s.kind == "W" else
                         f"{s.order_id} · {s.country} {s.postal} {s.city}").strip()} for s in variant.stops]
     if not route.has_real:
         banner = "Trasa orientacyjna - brak routingu po drogach"
