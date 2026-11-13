@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from .costs import CostParams, profit
-from .geo import road_distance_matrix
+from .geo import ROAD_FACTOR, haversine_km, road_distance_matrix
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,7 @@ class OptimizerParams:
 @dataclass
 class Stop:
     order_id: str
-    kind: str          # "L" załadunek | "U" rozładunek
+    kind: str          # "L" załadunek | "U" rozładunek | "S" start pojazdu (bez zlecenia)
     country: str
     postal: str
     city: str
@@ -75,10 +75,11 @@ class Variant:
         return self.profit / self.days if self.days else 0.0
 
 
-def _best_route(idx, D, ldm, wt, max_ldm, max_wt, bound=float("inf")):
+def _best_route(idx, D, ldm, wt, max_ldm, max_wt, bound=float("inf"), d0=None):
     """Najkrótsza kolejność punktów (DFS z odcinaniem). Punkty zlecenia i: 2i (L), 2i+1 (U).
 
-    Zwraca (dystans, [kolejność punktów]) lub None. `idx` to lista indeksów zleceń.
+    Zwraca (dystans, [kolejność punktów]) lub None. `idx` to lista indeksów zleceń. `d0` (opcjonalnie) to
+    odległości od miejsca startu pojazdu do punktów - wlicza dojazd do pierwszego załadunku.
     """
     k = len(idx)
     best = [bound, None]
@@ -100,7 +101,7 @@ def _best_route(idx, D, ldm, wt, max_ldm, max_wt, bound=float("inf")):
                 if n_ldm > max_ldm + 1e-9 or n_wt > max_wt + 1e-9:
                     continue
                 p = 2 * o
-                step = 0.0 if cur is None else D[cur, p]
+                step = (0.0 if d0 is None else d0[p]) if cur is None else D[cur, p]
                 order.append(p)
                 rec(p, dist + step, done_mask, picked_mask | bit, n_ldm, n_wt)
             else:  # rozładunek
@@ -161,13 +162,15 @@ def _insert(seq, j, D, ldm, wt, max_ldm, max_wt):
 
 
 def find_best_combinations(
-    orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams
+    orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Optional["Stop"] = None
 ) -> tuple[list[Variant], dict]:
     """Zwraca (TOP warianty, statystyki). `orders` musi mieć kolumny współrzędnych (ltl.geo.add_coordinates).
 
     Dla każdego "głównego" (najdłuższego) zlecenia m dokładamy kolejne zlecenia z puli zgodnych (limit
     odchylenia względem m): na każdym poziomie rozwijamy `beam_width` najzyskowniejszych zestawów, więc
     wypełnienie naczepy rośnie tak długo, jak zysk albo zapełnienie na to pozwalają.
+    `origin` = miejsce startu pojazdu: dojazd na pierwszy załadunek (puste km) wchodzi do zysku i kolejności punktów,
+    a wariant dostaje na początku przystanek typu "S".
     """
     stats = {"candidates": 0, "eligible": 0, "evaluated": 0, "truncated": False}
     df = orders[(orders["price_eur"].notna())].copy()
@@ -194,6 +197,7 @@ def find_best_combinations(
         single = np.array([D[2 * i, 2 * i + 1] for i in range(n)])
     stats["candidates"] = n
 
+    d0 = None if origin is None else haversine_km(origin.lat, origin.lon, lats, lons) * ROAD_FACTOR
     ldm, wt = df["ldm"].to_numpy(float), df["weight_t"].to_numpy(float)
     price = df["price_eur"].to_numpy(float)
     ldates = list(df["load_date"])
@@ -268,11 +272,12 @@ def find_best_combinations(
             scored = []
             for fk, (nseq, ntotal) in new.items():
                 if len(fk) <= 3:  # małe zestawy: dokładna kolejność
-                    r = _best_route(sorted(fk), D, ldm, wt, opt.max_ldm, opt.max_weight_t)
-                    if r and r[0] < ntotal:
-                        ntotal, nseq = r[0], r[1]
+                    r = _best_route(sorted(fk), D, ldm, wt, opt.max_ldm, opt.max_weight_t, d0=d0)
+                    if r and r[0] < ntotal + (0.0 if d0 is None else d0[nseq[0]]):
+                        nseq = r[1]
+                        ntotal = r[0] - (0.0 if d0 is None else d0[nseq[0]])
                         new[fk] = (nseq, ntotal)
-                scored.append((score(fk, ntotal), fk))
+                scored.append((score(fk, ntotal + (0.0 if d0 is None else d0[nseq[0]])), fk))
             for pr, fk in scored:
                 if fk not in best or best[fk][0] < pr:
                     best[fk] = (pr, tuple(sorted(fk)), new[fk][0], new[fk][1])
@@ -283,12 +288,12 @@ def find_best_combinations(
     stats["evaluated"] = evals
 
     ranked = sorted(best.values(), key=lambda t: -t[0])[: opt.top_n]
-    variants = [_build_variant(df, D, single, (pr, idx, total, seq), cost, ldm, wt)
+    variants = [_build_variant(df, D, single, (pr, idx, total, seq), cost, ldm, wt, origin, d0)
                 for pr, idx, seq, total in ranked]
     return variants, stats
 
 
-def _build_variant(df, D, single, res, cost: CostParams, ldm=None, wt=None) -> Variant:
+def _build_variant(df, D, single, res, cost: CostParams, ldm=None, wt=None, origin=None, d0=None) -> Variant:
     pr, idx, total, seq = res
     stops, loaded, empty = [], 0.0, 0.0
     on_board = set()
@@ -315,12 +320,17 @@ def _build_variant(df, D, single, res, cost: CostParams, ldm=None, wt=None) -> V
         cur_w += sign * float(df.iloc[p // 2]["weight_t"])
         peak_l, peak_w = max(peak_l, cur_l), max(peak_w, cur_w)
     revenue = float(sum(df.iloc[i]["price_eur"] for i in idx))
-    c = profit(revenue, total, len(seq), cost)
     main = max(single[i] for i in idx)
+    detour = total - main
+    if origin is not None:                      # dojazd z miejsca startu na pierwszy załadunek to puste kilometry
+        dead = float(d0[seq[0]])
+        stops.insert(0, origin)
+        total, empty = total + dead, empty + dead
+    c = profit(revenue, total, len(seq), cost)
     return Variant(
         order_ids=[df.iloc[i]["id"] for i in idx], stops=stops, revenue=revenue, cost=c,
         profit=c["profit"], total_km=total, loaded_km=loaded, empty_km=empty,
-        detour_km=total - main, days=c["days"], drive_h=c["drive_h"], peak_ldm=peak_l, peak_weight_t=peak_w,
+        detour_km=detour, days=c["days"], drive_h=c["drive_h"], peak_ldm=peak_l, peak_weight_t=peak_w,
     )
 
 

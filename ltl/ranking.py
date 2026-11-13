@@ -15,7 +15,9 @@ from .variant_detail import arrow
 
 
 def variant_key(v: Variant) -> str:
-    return "|".join(f"{s.order_id}{s.kind}" for s in v.stops)
+    # start pojazdu nie ma numeru zlecenia, więc klucz zawiera jego położenie (inny start = inna trasa)
+    return "|".join(f"{s.order_id}@{s.lat:.4f},{s.lon:.4f}S" if s.kind == "S" else f"{s.order_id}{s.kind}"
+                    for s in v.stops)
 
 
 @dataclass
@@ -68,7 +70,7 @@ def ranked_to_frame(ranked: list[Ranked], clients: dict | None = None, estimated
     rows = []
     for rank, r in enumerate(ranked, start=1):
         v, ev = r.variant, r.ev
-        route = " → ".join(f"{arrow(s.kind)} {s.order_id} {s.country} {s.postal}" for s in v.stops)
+        route = " → ".join(f"{arrow(s.kind)} {'Start' if s.kind == 'S' else s.order_id} {s.country} {s.postal}" for s in v.stops)
         rows.append({
             "#": rank,
             "Zlecenia": " + ".join(v.order_ids),

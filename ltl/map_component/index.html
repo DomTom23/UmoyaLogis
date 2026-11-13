@@ -9,7 +9,7 @@
   .pin { min-width: 26px; height: 26px; padding: 0 4px; box-sizing: border-box; border-radius: 13px; color: #fff;
          font: 700 12px/22px system-ui; text-align: center; border: 2px solid #fff; white-space: nowrap;
          box-shadow: 0 1px 4px rgba(0,0,0,.5); }
-  .pin.L { background: #1a9850; } .pin.U { background: #d73027; } .pin.M { background: #6a3d9a; }
+  .pin.L { background: #1a9850; } .pin.U { background: #d73027; } .pin.M { background: #6a3d9a; } .pin.S { background: #1f4e9c; }
   .via { width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 3px solid #1f4e9c;
          box-shadow: 0 1px 3px rgba(0,0,0,.5); cursor: grab; }
   .ghost { width: 14px; height: 14px; border-radius: 50%; background: #ffd24d; border: 3px solid #1f4e9c; }
@@ -42,7 +42,7 @@
     send("streamlit:setComponentValue", {value: ev, dataType: "json"});
   }
 
-  const arr = (k) => "<span class='arr-" + k + "'>" + (k === "L" ? "▲" : "▼") + "</span>";
+  const arr = (k) => k === "S" ? "🏁" : "<span class='arr-" + k + "'>" + (k === "L" ? "▲" : "▼") + "</span>";
 
   function busy(text) {                       // natychmiastowa informacja zwrotna, zanim serwer przeliczy trasę
     const p = document.getElementById("panel");
@@ -74,8 +74,9 @@
   function updatePanel() {
     const p = document.getElementById("panel");
     let html = "<div class='row'><span class='dot' style='background:#1a9850'></span>" + arr("L") + " załadunek " +
-               "<span class='dot' style='background:#d73027'></span>" + arr("U") + " rozładunek " +
-               "<span class='dot' style='background:#fff;border:3px solid #1f4e9c;width:7px;height:7px'></span>via</div>" +
+               "<span class='dot' style='background:#d73027'></span>" + arr("U") + " rozładunek</div>" +
+               "<div class='row'><span class='dot' style='background:#fff;border:3px solid #1f4e9c;width:7px;height:7px'></span>via " +
+               "<span class='dot' style='background:#1f4e9c'></span>🏁 start pojazdu</div>" +
                "<div class='row'><span class='bar'></span>trasa <span class='bar dash'></span>linia prosta</div>";
     if (args.banner) html += "<div class='banner'>" + esc(args.banner) + "</div>";
     if (helpOpen) {
@@ -92,19 +93,20 @@
   // pinezki w tym samym miejscu (np. dwa rozładunki w jednym kodzie) łączymy w jedną: "2,3"
   function pins() {
     const groups = new Map();
-    args.stops.forEach((s, i) => {
+    let num = 0;                              // numeracja zleceń; start pojazdu oznaczamy literą S
+    args.stops.forEach((s) => {
       const key = s.lat.toFixed(3) + "|" + s.lon.toFixed(3);
       if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push({n: i + 1, s});
+      groups.get(key).push({n: s.kind === "S" ? "S" : ++num, s});
     });
     groups.forEach((items) => {
       const kinds = new Set(items.map((x) => x.s.kind));
-      const cls = kinds.size > 1 ? "M" : items[0].s.kind;
+      const cls = kinds.has("S") ? "S" : kinds.size > 1 ? "M" : items[0].s.kind;
       const text = items.map((x) => x.n).join(",");
       const icon = L.divIcon({className: "", iconSize: null, iconAnchor: [13, 13],
         html: "<div class='pin " + cls + "'>" + esc(text) + "</div>"});
       const m = L.marker([items[0].s.lat, items[0].s.lon], {icon, zIndexOffset: 500}).addTo(layer);
-      m.bindTooltip(items.map((x) => arr(x.s.kind) + " " + esc(x.n + ". " + (x.s.kind === "L" ? "Załadunek " : "Rozładunek ") + x.s.label)).join("<br>"));
+      m.bindTooltip(items.map((x) => arr(x.s.kind) + " " + esc(x.s.kind === "S" ? x.s.label : x.n + ". " + (x.s.kind === "L" ? "Załadunek " : "Rozładunek ") + x.s.label)).join("<br>"));
     });
   }
 

@@ -13,7 +13,7 @@ from ltl.eligibility import ALL_BODIES, DEFAULT_BODIES, FleetProfile, check_elig
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.ingest import clean_edited, parse_sources, read_uploaded
 from ltl.mapview import route_map
-from ltl.optimizer import OptimizerParams, find_best_combinations
+from ltl.optimizer import OptimizerParams, Stop, find_best_combinations
 from ltl.ordertable import code_match, filter_orders, merge_edits, parse_codes
 from ltl.pricing import DEFAULT_RULES, RULE_COLUMNS, DIRECTION_LABELS, apply_price_rules, frame_to_rules, rules_to_frame
 from ltl.ranking import Ranked, rank_by_real_routes, ranked_to_frame, variant_key
@@ -94,8 +94,8 @@ def _parse(texts: tuple, drop_no_price: bool, pln_per_eur: float) -> pd.DataFram
 
 
 @st.cache_data(show_spinner="Szukanie najlepszych doładunków…")
-def _search(orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams):
-    return find_best_combinations(orders, cost, opt)
+def _search(orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Stop | None = None):
+    return find_best_combinations(orders, cost, opt, origin)
 
 
 _variant_key = variant_key
@@ -553,7 +553,34 @@ orders_opt = orders[use].assign(price_eur=orders.loc[use, "price_used_eur"])    
 client_map = dict(zip(orders["id"], orders["client"].fillna("")))
 est_ids = set(orders.loc[orders["price_kind"] == "szacunek", "id"])
 price_map = dict(zip(orders["id"], orders["price_used_eur"]))
-candidates, stats = _search(orders_opt, cost, opt)
+# ---------------------------------------------------- start pojazdu
+with st.container(border=True):
+    st.markdown("<div class='step'><span class='n'>🏁</span>Miejsce startu pojazdu</div>", unsafe_allow_html=True)
+    st.markdown("<div class='hint'>Wszystkie warianty liczone są od tego miejsca: dojazd na pierwszy załadunek to puste "
+                "kilometry, które wchodzą do kosztów i zysku. Zostaw kod pusty, aby liczyć od pierwszego załadunku.</div>",
+                unsafe_allow_html=True)
+    o1, o2, o3 = st.columns([1, 2, 4])
+    o_country = o1.text_input("Kraj", key="origin_country", value="PL", max_chars=2,
+                              help="Dwuliterowy kod kraju, np. PL, DE, FR.").strip().upper()
+    o_postal = o2.text_input("Kod pocztowy startu", key="origin_postal", placeholder="np. 62-800",
+                             help="Kod pocztowy miejsca, w którym pojazd jest wolny.").strip()
+    origin = None
+    if o_postal:
+        if len(o_country) != 2:
+            o3.warning("Podaj dwuliterowy kod kraju (np. PL).")
+        else:
+            geocoder.prefetch([(o_country, o_postal)])
+            o_lat, o_lon, o_src = geocoder.locate(o_country, o_postal)
+            geocoder.save()
+            origin = Stop(order_id="START", kind="S", country=o_country, postal=o_postal, city="",
+                          lat=float(o_lat), lon=float(o_lon))
+            if o_src == "kraj":
+                o3.warning(f"Nie udało się zlokalizować kodu {o_country} {o_postal} - użyto środka kraju, "
+                           "więc dojazd jest bardzo przybliżony. Sprawdź kod lub połączenie z internetem.")
+            else:
+                o3.success(f"Start: {o_country} {o_postal} ({o_lat:.2f}, {o_lon:.2f}).")
+origin_sig = None if origin is None else (origin.country, origin.postal, round(origin.lat, 4), round(origin.lon, 4))
+candidates, stats = _search(orders_opt, cost, opt, origin)
 
 # ------------------------------------------------------- krok 3: warianty
 with st.container(border=True):
@@ -568,7 +595,7 @@ with st.container(border=True):
 
     # ranking po trasach rzeczywistych: liczony od razu, pamiętany do zmiany danych lub ustawień
     sig = (analysis["id"], hash(orders.drop(columns=["start_geo", "end_geo"]).to_csv()), cost, opt, provider,
-           valhalla_url, ors_key, truck, route_opts, top_n)
+           valhalla_url, ors_key, truck, route_opts, top_n, origin_sig)
     cache = st.session_state.get("ranked")
     if not cache or cache["sig"] != sig:
         bar = st.progress(0.0, text="Wyznaczanie tras po drogach dla najlepszych wariantów…")
@@ -619,7 +646,7 @@ with st.container(border=True):
     shown = [r for r in ranked
              if (not sel_vc or any(client_map.get(i) in sel_vc for i in r.variant.order_ids))
              and (not vq or vq in _variant_text(r))
-             and (not vcodes or any(code_match(x.country, x.postal, vcodes) for x in r.variant.stops))]
+             and (not vcodes or any(code_match(x.country, x.postal, vcodes) for x in r.variant.stops if x.kind != "S"))]
     if not shown:
         st.info("Żaden wariant nie pasuje do filtra - pokazuję wszystkie.")
         shown = ranked
@@ -733,7 +760,7 @@ with st.container(border=True):
                                                help="Ile ładunku zlecenia jest brane lub zostawiane w tym punkcie."),
         "Na naczepie po": st.column_config.TextColumn(
             "Na naczepie po", width=135, help="Zajęte miejsce i masa po tej operacji (limit 13,6 LDM / 24 t)."),
-        "Do następnego": st.column_config.TextColumn("Do następnego", width=120,
+        "Do następnego": st.column_config.TextColumn("Do następnego", width=130,
                                                      help="Odcinek po drogach do kolejnego punktu."),
         "Od startu (km)": st.column_config.NumberColumn("Od startu (km)", format="%d", width=100)})
     st.markdown("**Zlecenia w wariancie** - kolumna „Kody do wyszukania” pozwala znaleźć ofertę na giełdzie "

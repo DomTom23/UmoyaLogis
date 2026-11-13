@@ -6,23 +6,26 @@ import pandas as pd
 from .optimizer import Variant
 from .routing import RouteResult
 
-LOAD_ICON, UNLOAD_ICON = "🟢▲", "🔴▼"
+LOAD_ICON, UNLOAD_ICON, START_ICON = "🟢▲", "🔴▼", "🏁"
 LOAD_COLOR, UNLOAD_COLOR = "#1a9850", "#d73027"
 
 
 def arrow(kind: str) -> str:
     """Strzałka do tabel (emoji, bo tabele nie kolorują fragmentów tekstu): zielona = załadunek, czerwona = rozładunek."""
-    return LOAD_ICON if kind == "L" else UNLOAD_ICON
+    return START_ICON if kind == "S" else LOAD_ICON if kind == "L" else UNLOAD_ICON
 
 
 def arrow_html(kind: str) -> str:
+    if kind == "S":
+        return "<span style='font-weight:700'>🏁</span>"
     color, sign = (LOAD_COLOR, "▲") if kind == "L" else (UNLOAD_COLOR, "▼")
     return f"<span style='color:{color};font-weight:700'>{sign}</span>"
 
 
 def route_chain_html(variant: Variant) -> str:
     """Przebieg wariantu w jednym wierszu: kolorowe strzałki, numer zlecenia, kraj i kod."""
-    parts = [f"{arrow_html(s.kind)}&nbsp;<b>{s.order_id}</b>&nbsp;{s.country}&nbsp;{s.postal}" for s in variant.stops]
+    parts = [f"{arrow_html(s.kind)}&nbsp;<b>{'Start' if s.kind == 'S' else s.order_id}</b>&nbsp;{s.country}&nbsp;{s.postal}"
+             for s in variant.stops]
     return " → ".join(parts)
 
 
@@ -41,11 +44,21 @@ def stop_table(variant: Variant, route: RouteResult, orders: pd.DataFrame) -> pd
     cum_km = cum_h = 0.0
     rows = []
     for i, s in enumerate(variant.stops):
+        leg = route.legs[i] if i < len(route.legs) else None
+        if s.kind == "S":
+            rows.append({"Krok": i + 1, "Operacja": f"{arrow('S')} Start pojazdu", "Zlecenie": "—", "Zleceniodawca": "—",
+                         "Miejsce": place(s.country, s.postal, s.city), "Data": "—", "Ładunek": "—",
+                         "Na naczepie po": "0.0 LDM · 0.0 t",
+                         "Do następnego": f"{leg.km:,.0f} km · {leg.hours:.1f} h ".replace(",", " ") if leg else "—",
+                         "Od startu (km)": 0})
+            if leg:
+                cum_km += leg.km
+                cum_h += leg.hours
+            continue
         o = by_id.loc[s.order_id]
         sign = 1 if s.kind == "L" else -1
         ldm = max(ldm + sign * float(o["ldm"]), 0.0)
         wt = max(wt + sign * float(o["weight_t"]), 0.0)
-        leg = route.legs[i] if i < len(route.legs) else None
         rows.append({
             "Krok": i + 1,
             "Operacja": f"{arrow(s.kind)} {'Załadunek' if s.kind == 'L' else 'Rozładunek'}",

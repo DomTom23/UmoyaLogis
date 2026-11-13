@@ -780,3 +780,40 @@ def test_variant_detail_tables_and_price_per_km():
     assert fr["Cena/km (EUR)"].iloc[0] == round(fr["Przychód (EUR)"].iloc[0] / fr["Dystans (km)"].iloc[0], 2) or \
         abs(fr["Cena/km (EUR)"].iloc[0] - fr["Przychód (EUR)"].iloc[0] / fr["Dystans (km)"].iloc[0]) < 0.01
     assert fr["Trasa"].iloc[0].count("🟢▲") == 2 and fr["Trasa"].iloc[0].count("🔴▼") == 2
+
+
+def test_vehicle_origin_adds_empty_leg_and_changes_ranking():
+    from ltl.optimizer import Stop
+    from ltl.route_edit import route_for_variant
+    from ltl.routing import TruckProfile
+    from ltl.variant_detail import stop_table
+    # A: Berlin -> Paryż, B: Poznań -> Lyon (po drodze), C: Madryt -> Lizbona (daleko od reszty)
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500),
+            ("C", 40.4, -3.7, 38.7, -9.1, 6.0, 10, 1500), ("D", 40.5, -3.6, 38.8, -9.0, 6.0, 10, 1500)]
+    df = _orders(rows)
+    base, _ = find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=800))
+    far = Stop("START", "S", "PL", "00-001", "", 52.2, 21.0)             # Warszawa: blisko A/B, daleko od C/D
+    v, _ = find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=800), far)
+    assert all(x.stops[0].kind == "S" and x.stops[0].order_id == "START" for x in v)
+    top = [x for x in v if set(x.order_ids) == {"A", "B"}][0]
+    nob = [x for x in base if set(x.order_ids) == {"A", "B"}][0]
+    assert top.empty_km > nob.empty_km and top.total_km > nob.total_km and top.profit < nob.profit
+    assert len(top.stops) == len(nob.stops) + 1
+    cd = [x for x in v if set(x.order_ids) == {"C", "D"}][0]
+    assert cd.empty_km > 1000                                         # dojazd z Warszawy do Madrytu
+    # koszt obsługi liczony tylko dla załadunków i rozładunków (start nie dolicza 2 h)
+    r = route_for_variant(top, [], TruckProfile(), "none", "", "", 65.0)
+    ev = evaluate_route(top, r, CostParams())
+    assert ev["empty_km"] > 0 and ev["work_h"] == ev["drive_h"] + 4 * CostParams().handling_h_per_stop
+    tbl = stop_table(top, r, df.assign(client="", unload_date=None))
+    assert tbl["Operacja"].iloc[0].startswith("🏁") and len(tbl) == len(top.stops)
+
+
+def test_variant_key_depends_on_origin_location():
+    from ltl.optimizer import Stop
+    from ltl.ranking import variant_key
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500)]
+    df = _orders(rows)
+    k = [variant_key(find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=800), o)[0][0])
+         for o in (Stop("START", "S", "PL", "1", "", 52.0, 17.0), Stop("START", "S", "PL", "2", "", 51.0, 19.0), None)]
+    assert len(set(k)) == 3
