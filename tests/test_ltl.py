@@ -463,10 +463,10 @@ def test_price_rules_estimates_and_minimums():
             ("FR", "DE", 13.6, None), ("FR", "CH", 1.0, 900.0), ("GB", "CH", 4.0, None)]
     df = pd.DataFrame(rows, columns=["start_country", "end_country", "ldm", "price_eur"])
     out = apply_price_rules(df, DEFAULT_RULES)
-    assert out.price_used_eur.fillna(-1).tolist() == [600, -1, 500, -1, 600, -1, 600, -1, -1, 900, 1000]
+    assert out.price_used_eur.fillna(-1).tolist() == [600, -1, 500, -1, 600, -1, 600, -1, 2720, 900, 1000]
     assert out.price_kind.tolist() == ["szacunek", "brak", "szacunek", "brak", "szacunek", "brak", "szacunek",
-                                       "brak", "brak", "oferta", "szacunek"]   # GB->CH: wyższa stawka (250 > 150)
-    assert "poniżej minimum" in out.price_note.iloc[1] and "pasującej reguły" in out.price_note.iloc[8]
+                                       "brak", "szacunek", "oferta", "szacunek"]   # GB->CH: wyższa stawka (250 > 150); FR->DE: BENELUX/DE 200
+    assert "poniżej minimum" in out.price_note.iloc[1] and "BENELUX" in out.price_note.iloc[8]
     assert (apply_price_rules(df, DEFAULT_RULES, enabled=False).price_kind != "szacunek").all()
     assert frame_to_rules(rules_to_frame(DEFAULT_RULES)) == DEFAULT_RULES
 
@@ -606,16 +606,43 @@ def test_duplicates_dropped_and_counted():
 
 def test_fleet_eligibility_reasons():
     df = parse_sources([CARDS])
-    why = check_eligibility(df, FleetProfile())
+    why = check_eligibility(df, FleetProfile(exclude_cabotage=False))
     row = lambda postal: why[df[df.start_postal == postal].index[0]]
     assert row("69500") == "pojazd bez naczepy, wymaga windy"                                   # bus / solo bez naczepy
     assert why[df[df.end_postal == "39190"].index[0]] == "" and "pojazd bez naczepy" in row("40121")
     assert "nadwozie: chłodnia" in row("06018") and row("07100") == "pojazd bez naczepy, ADR"
     assert "ADR" in row("18024") and "za duże" in row("20122")
-    open_fleet = check_eligibility(df, FleetProfile(semi_trailer_only=False, accepted_bodies=("firanka", "standard", "mega", "chłodnia", "jumbo"),
+    open_fleet = check_eligibility(df, FleetProfile(exclude_cabotage=False, semi_trailer_only=False, accepted_bodies=("firanka", "standard", "mega", "chłodnia", "jumbo"),
                                                     adr=True, tail_lift=True))
     assert (open_fleet == "").sum() > (why == "").sum()
     assert "FTL" in check_eligibility(df, FleetProfile(allow_ftl=False)).iloc[0]
+
+
+def test_cabotage_excluded_and_benelux_de_rule():
+    df = pd.DataFrame([("DE", "DE", 5.0, None), ("DE", "PL", 5.0, None), ("NL", "FR", 2.0, None),
+                       ("PL", "PL", 3.0, 300.0), ("FR", "ES", 5.0, None)],
+                      columns=["start_country", "end_country", "ldm", "price_eur"])
+    why = check_eligibility(df, FleetProfile())
+    assert why.tolist() == ["kabotaż (ten sam kraj)", "", "", "kabotaż (ten sam kraj)", ""]
+    assert (check_eligibility(df, FleetProfile(exclude_cabotage=False)) == "").all()
+    out = apply_price_rules(df, DEFAULT_RULES)
+    # DE->DE krajowe: bez szacunku; DE->PL: 5 x 200 = 1000; NL->FR: 400 < 500 -> brak; FR->ES: brak reguły
+    assert out.price_used_eur.fillna(-1).tolist() == [-1, 1000, -1, 300, -1]
+    rules = frame_to_rules(rules_to_frame(DEFAULT_RULES))
+    assert [r for r in rules if "BENELUX" in r.label][0].countries == ("BE", "NL", "LU", "DE")
+
+
+def test_code_search():
+    from ltl.ordertable import code_match, filter_orders, parse_codes
+    df = parse_sources([CARDS])
+    it = filter_orders(df, from_codes="IT 20")
+    assert 0 < len(it) < len(df)
+    assert all(p.startswith("20") and c == "IT" for c, p in zip(it.start_country, it.start_postal))
+    assert len(filter_orders(df, from_codes="20")) >= len(it)                # bez kraju też działa
+    both = filter_orders(df, from_codes="IT", to_codes="FR")
+    assert len(both) and set(both.start_country) == {"IT"} and set(both.end_country) == {"FR"}
+    assert parse_codes("DE 20, fr-77;\n 00-0") == ["DE20", "FR77", "000"] and code_match("PL", "00-001", ["00"])
+    assert len(filter_orders(df, from_codes=" , ")) == len(df)               # puste kody = brak filtra
 
 
 def test_same_cargo_offered_twice_never_combined():
@@ -722,3 +749,34 @@ def test_missing_ldm_estimated_from_description_dimensions_not_only_from_weight(
     assert abs(row.ldm - 3.85) < 0.02 and "wymiar" in row.defaults_used
     m = df[df.start_postal == "MK10 9AB"].iloc[0] if (df.start_postal == "MK10 9AB").any() else df[df.end_postal == "93290"].iloc[0]
     assert abs(m.ldm - 1.6) < 0.02                       # "4 pal : 120*80*143"
+
+
+def test_variant_detail_tables_and_price_per_km():
+    from ltl.ranking import Ranked
+    from ltl.route_edit import route_for_variant
+    from ltl.routing import TruckProfile
+    from ltl.variant_detail import order_table, route_chain_html, stop_table
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 8, 1500), ("B", 52.4, 13.5, 48.8, 2.30, 4.0, 6, 900)]
+    df = _orders(rows)
+    df["start_country"], df["end_country"] = ["DE", "DE"], ["FR", "FR"]
+    for c, v in (("start_postal", "10115"), ("end_postal", "75001"), ("start_city", "Berlin"), ("end_city", "Paryż")):
+        df[c] = v
+    df["client"] = ["", "ACME"]
+    df["load_date"] = df["unload_date"] = pd.Timestamp("2026-10-30").date()
+    df["distance_km"] = float("nan")
+    df["distance_est_km"] = [1050.0, 1050.0]
+    v, _ = find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=500))
+    route = route_for_variant(v[0], [], TruckProfile(), "none", "", "", 65.0)
+    st_df = stop_table(v[0], route, df)
+    assert len(st_df) == 4 and st_df["Operacja"].str.contains("🟢▲").sum() == 2 and st_df["Operacja"].str.contains("🔴▼").sum() == 2
+    assert st_df["Na naczepie po"].iloc[-1] == "0.0 LDM · 0.0 t"              # po ostatnim rozładunku naczepa pusta
+    assert st_df["Do następnego"].iloc[-1] == "—" and st_df["Od startu (km)"].is_monotonic_increasing
+    od = order_table(v[0], df, {"A"})
+    assert set(od["Zlecenie"]) == {"A", "B"} and od.set_index("Zlecenie").loc["A", "Cena z"] == "szacunek"
+    assert od["Kody do wyszukania"].iloc[0] == "DE 10115 → FR 75001" and od["EUR/km"].notna().all()
+    html = route_chain_html(v[0])
+    assert html.count("#1a9850") == 2 and html.count("#d73027") == 2          # zielone ▲ załadunki, czerwone ▼ rozładunki
+    fr = ranked_to_frame([Ranked(v[0], route, evaluate_route(v[0], route, CostParams()))])
+    assert fr["Cena/km (EUR)"].iloc[0] == round(fr["Przychód (EUR)"].iloc[0] / fr["Dystans (km)"].iloc[0], 2) or \
+        abs(fr["Cena/km (EUR)"].iloc[0] - fr["Przychód (EUR)"].iloc[0] / fr["Dystans (km)"].iloc[0]) < 0.01
+    assert fr["Trasa"].iloc[0].count("🟢▲") == 2 and fr["Trasa"].iloc[0].count("🔴▼") == 2

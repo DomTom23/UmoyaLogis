@@ -11,6 +11,7 @@ from .costs import CostParams
 from .optimizer import Variant
 from .route_edit import evaluate_route
 from .routing import RouteResult
+from .variant_detail import arrow
 
 
 def variant_key(v: Variant) -> str:
@@ -67,23 +68,24 @@ def ranked_to_frame(ranked: list[Ranked], clients: dict | None = None, estimated
     rows = []
     for rank, r in enumerate(ranked, start=1):
         v, ev = r.variant, r.ev
-        route = " → ".join(f"{'▲' if s.kind == 'L' else '▼'} {s.order_id} {s.country} {s.postal}" for s in v.stops)
+        route = " → ".join(f"{arrow(s.kind)} {s.order_id} {s.country} {s.postal}" for s in v.stops)
         rows.append({
             "#": rank,
             "Zlecenia": " + ".join(v.order_ids),
             "Liczba": len(v.order_ids),
             "Zleceniodawcy": ", ".join(dict.fromkeys(c for i in v.order_ids if (c := clients.get(i)))) or "—",
             "Ceny szac.": ", ".join(i for i in v.order_ids if i in estimated) or "—",
-            "Trasa": route,
-            "Zapełnienie (LDM)": round(v.peak_ldm, 1),
-            "Ładunek (t)": round(v.peak_weight_t, 1),
-            "Przychód (EUR)": round(ev["revenue"], 0),
-            "Koszty (EUR)": round(ev["total"], 0),
             "Zysk (EUR)": round(ev["profit"], 0),
             "Zysk/dzień (EUR)": round(ev["profit"] / max(ev["days"], 1), 0),
-            "Czas (dni)": round(ev["days"], 1),
+            "Przychód (EUR)": round(ev["revenue"], 0),
+            "Koszty (EUR)": round(ev["total"], 0),
             "Dystans (km)": round(ev["total_km"], 0),
+            "Cena/km (EUR)": round(ev["revenue"] / ev["total_km"], 2) if ev["total_km"] else 0.0,
+            "Czas (dni)": round(ev["days"], 1),
             "Km puste": round(ev["empty_km"], 0),
+            "Zapełnienie (LDM)": round(v.peak_ldm, 1),
+            "Ładunek (t)": round(v.peak_weight_t, 1),
+            "Trasa": route,
             "Przeprawy i tunele": crossing_text(ev["crossings"]),
         })
     return pd.DataFrame(rows)

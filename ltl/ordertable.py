@@ -4,9 +4,29 @@ from __future__ import annotations
 import pandas as pd
 
 
+def _squash(x) -> str:
+    return "".join(ch for ch in str(x if x is not None and x == x else "").upper() if ch.isalnum())
+
+
+def parse_codes(text: str) -> list[str]:
+    """Kody do wyszukiwania z pola tekstowego: rozdzielone przecinkiem, średnikiem lub nową linią.
+    Każdy kod to początek „kraj+kod pocztowy” (DE 20, FR-77) albo sam początek kodu (20095, 00-0)."""
+    parts = [p for chunk in str(text or "").replace(";", ",").replace("\n", ",").split(",") for p in [_squash(chunk)] if p]
+    return parts
+
+
+def code_match(country, postal, codes: list[str]) -> bool:
+    """Czy miejsce (kraj, kod pocztowy) zaczyna się od któregoś z kodów (z krajem lub bez). Brak kodów = pasuje."""
+    if not codes:
+        return True
+    full, pc = _squash(country) + _squash(postal), _squash(postal)
+    return any(full.startswith(c) or pc.startswith(c) for c in codes)
+
+
 def filter_orders(df: pd.DataFrame, clients: list[str] | None = None, text: str = "",
-                  only_no_price: bool = False) -> pd.DataFrame:
-    """Widok tabeli: wybrani zleceniodawcy (dokładnie) i/lub fraza w zleceniodawcy, mieście, kodzie, numerze."""
+                  only_no_price: bool = False, from_codes: str = "", to_codes: str = "") -> pd.DataFrame:
+    """Widok tabeli: wybrani zleceniodawcy (dokładnie), fraza w zleceniodawcy/mieście/kodzie/numerze oraz kody
+    pocztowe załadunku i rozładunku (np. „DE 20, FR 77”: początek kodu z krajem lub bez)."""
     mask = pd.Series(True, index=df.index)
     if clients:
         mask &= df["client"].isin(clients)
@@ -17,6 +37,11 @@ def filter_orders(df: pd.DataFrame, clients: list[str] | None = None, text: str 
         mask &= hay.str.contains(q, regex=False)
     if only_no_price:
         mask &= df["price_eur"].isna()
+    fc, tc = parse_codes(from_codes), parse_codes(to_codes)
+    if fc:
+        mask &= pd.Series([code_match(c, p, fc) for c, p in zip(df["start_country"], df["start_postal"])], index=df.index)
+    if tc:
+        mask &= pd.Series([code_match(c, p, tc) for c, p in zip(df["end_country"], df["end_postal"])], index=df.index)
     return df[mask]
 
 

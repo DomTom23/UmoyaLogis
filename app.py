@@ -14,12 +14,13 @@ from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.ingest import clean_edited, parse_sources, read_uploaded
 from ltl.mapview import route_map
 from ltl.optimizer import OptimizerParams, find_best_combinations
-from ltl.ordertable import filter_orders, merge_edits
+from ltl.ordertable import code_match, filter_orders, merge_edits, parse_codes
 from ltl.pricing import DEFAULT_RULES, RULE_COLUMNS, DIRECTION_LABELS, apply_price_rules, frame_to_rules, rules_to_frame
 from ltl.ranking import Ranked, rank_by_real_routes, ranked_to_frame, variant_key
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
 from ltl.routing import VALHALLA_URL, RouteOptions, RouteResult, TruckProfile
 from ltl.sample import SAMPLE_TEXT
+from ltl.variant_detail import order_table, route_chain_html, stop_table
 from ltl.storage import OUTCOMES, InvalidName, NameExists, Store
 
 st.set_page_config(page_title="Optymalizator Tras LTL", page_icon="🚛", layout="wide")
@@ -37,6 +38,7 @@ st.markdown("""
   .kpi .v { font-size: 1.7rem; font-weight: 600; line-height: 1.25; white-space: nowrap; }
   .kpi .d { font-size: .8rem; opacity: .8; }
   .kpi .d.pos { color: #1a9850; } .kpi .d.neg { color: #d73027; }
+  .chain { margin: .2rem 0 .6rem 0; line-height: 1.9; }
   .best { border-left: 5px solid #1a9850; padding: .5rem .9rem; background: rgba(26,152,80,.08);
           border-radius: 6px; margin-bottom: .8rem; }
 </style>
@@ -158,6 +160,9 @@ with st.sidebar:
                                                  help="Oferta musi dopuszczać któreś z nich (brak informacji = pasuje).")),
             adr=st.checkbox("Mamy uprawnienia ADR", False),
             tail_lift=st.checkbox("Mamy windę załadowczą", False),
+            exclude_cabotage=st.checkbox("Wyklucz kabotaż (odbiór i dowóz w tym samym kraju)", True,
+                                         help="Oferty, w których załadunek i rozładunek są w jednym kraju "
+                                              "(np. DE → DE), nie trafiają do wariantów."),
             allow_ftl=st.checkbox("Łącz też oferty FTL", True,
                                   help="FTL zwykle oznacza cały pojazd dla jednego zleceniodawcy. "
                                        "Odznacz, aby do doładunków brać tylko oferty LTL."),
@@ -168,13 +173,14 @@ with st.sidebar:
                               help="Oferta bez ceny dostaje cenę = stawka × LDM wg reguły dla kraju załadunku "
                                    "lub rozładunku. Trafia do wariantów tylko, gdy ta cena osiąga minimum.")
         st.caption("Stawka EUR/LDM i minimalny przychód dla kraju załadunku („z kraju”) lub rozładunku "
-                   "(„do kraju”). Gdy pasuje kilka reguł, obowiązuje najwyższa stawka.")
+                   "(„do kraju”) albo któregokolwiek z nich („z lub do kraju”); w polu Kraj można podać kilka kodów po przecinku. "
+                   "Gdy pasuje kilka reguł, obowiązuje najwyższa stawka. Oferty krajowe (kabotaż) są pomijane.")
         rules_df = st.data_editor(
             rules_to_frame(DEFAULT_RULES), key="rules_editor", num_rows="dynamic", hide_index=True, width="stretch",
             column_config={
                 "Aktywna": st.column_config.CheckboxColumn("Akt.", width="small"),
                 "Kierunek": st.column_config.SelectboxColumn("Kierunek", options=list(DIRECTION_LABELS.values())),
-                "Kraj": st.column_config.TextColumn("Kraj", max_chars=2, width="small"),
+                "Kraj": st.column_config.TextColumn("Kraj", max_chars=40, width="small", help="Kod kraju (np. CH) albo kilka kodów po przecinku (BE,NL,LU,DE)."),
                 "EUR/LDM": st.column_config.NumberColumn("EUR/LDM", min_value=0.0, format="%.0f"),
                 "Min. przychód (EUR)": st.column_config.NumberColumn("Min. (EUR)", min_value=0.0, format="%.0f"),
             })
@@ -321,9 +327,13 @@ def render_history() -> None:
         h_to = d2.multiselect("Kraj rozładunku", sorted(all_h.end_country.dropna().unique()), key="h_to")
         h_d1 = d3.date_input("Od (data zobaczenia)", value=None, key="h_d1")
         h_d2 = d4.date_input("Do", value=None, key="h_d2")
+        e1, e2 = st.columns(2)
+        h_fc = e1.text_input("Kod załadunku (początek)", key="h_fc", placeholder="np. DE 20, FR 77",
+                             help="Wyszukiwanie po kodzie pocztowym (z krajem lub bez); kilka kodów rozdziel przecinkiem.")
+        h_tc = e2.text_input("Kod rozładunku (początek)", key="h_tc", placeholder="np. PL 00, GB M")
         flt = dict(clients=h_clients, text=h_text, from_countries=h_from, to_countries=h_to, date_from=h_d1,
                    date_to=h_d2, outcome="" if h_outcome == "(wszystkie)" else h_outcome)
-        h = store.query_history(limit=3000, **flt)
+        h = filter_orders(store.query_history(limit=3000, **flt), from_codes=h_fc, to_codes=h_tc)
         priced = h[h.price_eur.notna()]
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Oferty", len(h))
@@ -333,7 +343,7 @@ def render_history() -> None:
         m3.metric("Śr. EUR / LDM", f"{per_ldm.mean():.0f}" if len(per_ldm) else "—")
         m4.metric("Śr. EUR / km", f"{per_km.mean():.2f}" if len(per_km) else "—")
         st.caption("Kolumny „Cena zrealizowana”, „Wynik” i „Notatka” można edytować - przydadzą się do analizy cen.")
-        fsig = hash(tuple(map(str, flt.values())))
+        fsig = hash(tuple(map(str, [*flt.values(), h_fc, h_tc])))
         edited_h = st.data_editor(
             h, key=f"hist_editor_{fsig}", hide_index=True, width="stretch", num_rows="fixed",
             disabled=[c for c in h.columns if c not in ("realized_price_eur", "outcome", "note")],
@@ -404,18 +414,25 @@ with st.container(border=True):
     aid = analysis["id"]
     show_details = st.toggle("Pokaż szczegóły ofert (pojazdy, nadwozie, dodatki, opis)", key=f"details_{aid}")
     f1, f2, f3 = st.columns([2, 2, 1])
+    c1, c2 = st.columns(2)
+    flt_from = c1.text_input("Kod załadunku (początek)", key=f"flt_from_{aid}", placeholder="np. DE 20, FR 77, PL",
+                             help="Szukanie po kodzie pocztowym - wygodne, gdy z giełdy nie kopiuje się nazwa "
+                                  "zleceniodawcy. Kilka kodów rozdziel przecinkiem; wystarczy początek kodu, "
+                                  "z krajem (DE 20) lub bez (20095).")
+    flt_to = c2.text_input("Kod rozładunku (początek)", key=f"flt_to_{aid}", placeholder="np. PL 00, GB M",
+                           help="Jak obok, ale dla miejsca rozładunku.")
     sel_clients = f1.multiselect("Filtr: zleceniodawca", sorted(set(work["client"].dropna()) - {""}),
                                  key=f"flt_clients_{aid}", help="Pokazuje tylko zlecenia wybranych zleceniodawców.")
     q = f2.text_input("Szukaj (zleceniodawca, miasto, kod, nr)", key=f"flt_q_{aid}")
     only_np = f3.checkbox("Tylko bez ceny", key=f"flt_np_{aid}")
-    fsig = (tuple(sel_clients), q, only_np)
+    fsig = (tuple(sel_clients), q, only_np, flt_from, flt_to)
     if st.session_state.get("fsig") != fsig:          # zmiana filtra: zatwierdź poprawki z poprzedniego widoku
         last = st.session_state.get("last_view")
         if last is not None:
             work = merge_edits(work, last["ids"], last["edited"])
             st.session_state.work = work
         st.session_state.fsig = fsig
-    view = filter_orders(work, sel_clients, q, only_np)
+    view = filter_orders(work, sel_clients, q, only_np, flt_from, flt_to)
     if len(view) < len(work):
         st.caption(f"Widok: {len(view)} z {len(work)} zleceń. Filtry zmieniają tylko widok tabeli - "
                    "do szukania doładunków trafiają wszystkie zlecenia.")
@@ -541,7 +558,7 @@ candidates, stats = _search(orders_opt, cost, opt)
 # ------------------------------------------------------- krok 3: warianty
 with st.container(border=True):
     step(3, "Najlepsze doładunki", "Kombinacje zleceń na jednej naczepie, od najbardziej zyskownej - liczone po "
-                                   "rzeczywistych trasach. Kliknij wiersz, aby zobaczyć trasę.")
+                                   "rzeczywistych trasach. Kliknij wiersz, aby zobaczyć szczegóły i trasę.")
     if stats["truncated"]:
         st.warning("Przerwano wyszukiwanie po limicie obliczeń - zmniejsz odchylenie albo liczbę ofert.")
     if not candidates:
@@ -580,15 +597,19 @@ with st.container(border=True):
     bv, bev = best.variant, best.ev
     st.markdown(f"<div class='best'>🏆 <b>Najlepszy wariant: {len(bv.order_ids)} {plural(len(bv.order_ids))} "
                 f"({' + '.join(bv.order_ids)})</b> · zysk <b>{eur(bev['profit'])}</b> · {bev['days']:.1f} dnia · "
-                f"{bev['profit'] / max(bev['days'], 1):,.0f} EUR/dzień · naczepa {bv.peak_ldm:.1f}/13,6 LDM, "
+                f"{eur(bev['profit'] / max(bev['days'], 1))}/dzień · naczepa {bv.peak_ldm:.1f}/13,6 LDM, "
                 f"{bv.peak_weight_t:.1f}/24 t{'' if estimated else ' (trasa po drogach)'}</div>",
                 unsafe_allow_html=True)
 
     vclients = sorted({c for r in ranked for i in r.variant.order_ids if (c := client_map.get(i))})
-    vf1, vf2 = st.columns(2)
+    vf1, vf2, vf3 = st.columns([2, 2, 2])
     sel_vc = vf1.multiselect("Filtr: zleceniodawca w wariancie", vclients, key="vf_clients",
                              help="Pokazuje warianty, w których jest zlecenie wybranego zleceniodawcy.")
-    vq = vf2.text_input("Szukaj w wariantach (zleceniodawca, nr, miasto, kod)", key="vf_q").strip().lower()
+    vq = vf2.text_input("Szukaj w wariantach (zleceniodawca, nr, miasto)", key="vf_q").strip().lower()
+    vcodes_txt = vf3.text_input("Kod pocztowy w wariancie", key="vf_codes", placeholder="np. DE 20, FR 77",
+                                help="Warianty, w których któryś załadunek lub rozładunek zaczyna się od podanego "
+                                     "kodu (z krajem lub bez). Kilka kodów rozdziel przecinkiem.")
+    vcodes = parse_codes(vcodes_txt)
 
     def _variant_text(r) -> str:
         ids = r.variant.order_ids
@@ -597,7 +618,8 @@ with st.container(border=True):
 
     shown = [r for r in ranked
              if (not sel_vc or any(client_map.get(i) in sel_vc for i in r.variant.order_ids))
-             and (not vq or vq in _variant_text(r))]
+             and (not vq or vq in _variant_text(r))
+             and (not vcodes or any(code_match(x.country, x.postal, vcodes) for x in r.variant.stops))]
     if not shown:
         st.info("Żaden wariant nie pasuje do filtra - pokazuję wszystkie.")
         shown = ranked
@@ -606,8 +628,10 @@ with st.container(border=True):
 
     frame = ranked_to_frame(shown, client_map, est_ids)
     money = {c: st.column_config.NumberColumn(c, format="%d") for c in frame.columns if "EUR" in c or "km" in c.lower()}
-    event = st.dataframe(frame, width="stretch", hide_index=True, on_select="rerun", selection_mode="single-row",
-                         key=f"variants_table_{abs(hash((tuple(sel_vc), vq)))}", column_config={
+    # kolumny bez informacji (np. Trans.eu nie podaje zleceniodawcy) nie zajmują miejsca w tabeli
+    blank = [c for c in ("Zleceniodawcy", "Ceny szac.") if (frame[c] == "—").all()]
+    event = st.dataframe(frame.drop(columns=blank), width="stretch", hide_index=True, on_select="rerun", selection_mode="single-row",
+                         key=f"variants_table_{abs(hash((tuple(sel_vc), vq, vcodes_txt)))}", column_config={
                              "#": st.column_config.NumberColumn("#", width="small"),
                              "Liczba": st.column_config.NumberColumn("Liczba", width="small",
                                                                      help="Ile zleceń jedzie na naczepie."),
@@ -620,11 +644,15 @@ with st.container(border=True):
                              "Ceny szac.": st.column_config.TextColumn(
                                  help="Zlecenia, których cena jest szacunkowa (oferta bez ceny)."),
                              "Przeprawy i tunele": st.column_config.TextColumn(width="large"),
-                             **money})
+                             **money,
+                             "Cena/km (EUR)": st.column_config.NumberColumn(
+                                 "Cena/km (EUR)", format="%.2f",
+                                 help="Przychód ze wszystkich zleceń podzielony przez cały przejechany dystans "
+                                      "(z pustymi kilometrami).")})
     st.caption(f"Sprawdzono {stats['evaluated']} kombinacji z {stats['candidates']} ofert"
                f"{' (z ' + str(stats['eligible']) + ' kwalifikujących się - zbadano ' + str(stats['candidates']) + ' o najlepszej cenie za km)' if stats['eligible'] > stats['candidates'] else ''}; "
                f"na drogach policzono {len(candidates)} najlepszych"
-               f"{', ukryto ' + str(n_hidden) + ' stratnych' if n_hidden and profitable else ''}. ▲ załadunek, ▼ rozładunek. W wariancie maks. {max_orders} zleceń, "
+               f"{', ukryto ' + str(n_hidden) + ' stratnych' if n_hidden and profitable else ''}. 🟢▲ załadunek, 🔴▼ rozładunek. W wariancie maks. {max_orders} zleceń, "
                "a naczepa nie może przekroczyć 13,6 LDM / 24 t w żadnym punkcie trasy.")
 
     with st.expander("💾 Zapisz ranking pod nazwą / zobacz zapisane rankingi"):
@@ -690,6 +718,41 @@ with st.container(border=True):
                f"({ev['days']:.1f} dnia × {day_cost:,.0f} EUR; {handling_h:g} h na każdy załadunek i rozładunek). Naczepa: maks. {v.peak_ldm:.1f} LDM, "
                f"{v.peak_weight_t:.1f} t.")
 
+    st.markdown("<div class='chain'>" + route_chain_html(v) + "</div>", unsafe_allow_html=True)
+    st.markdown("**Przebieg krok po kroku**")
+    stops_df = stop_table(v, route, orders_opt)
+    if (stops_df["Zleceniodawca"] == "—").all():
+        stops_df = stops_df.drop(columns="Zleceniodawca")
+    st.dataframe(stops_df, width="stretch", hide_index=True, column_config={
+        "Krok": st.column_config.NumberColumn("Krok", width=55),
+        "Operacja": st.column_config.TextColumn("Operacja", width=125),
+        "Zlecenie": st.column_config.TextColumn("Zlecenie", width=80),
+        "Miejsce": st.column_config.TextColumn("Miejsce", width=200),
+        "Data": st.column_config.TextColumn("Data", width=60),
+        "Ładunek": st.column_config.TextColumn("Ładunek", width=135,
+                                               help="Ile ładunku zlecenia jest brane lub zostawiane w tym punkcie."),
+        "Na naczepie po": st.column_config.TextColumn(
+            "Na naczepie po", width=135, help="Zajęte miejsce i masa po tej operacji (limit 13,6 LDM / 24 t)."),
+        "Do następnego": st.column_config.TextColumn("Do następnego", width=120,
+                                                     help="Odcinek po drogach do kolejnego punktu."),
+        "Od startu (km)": st.column_config.NumberColumn("Od startu (km)", format="%d", width=100)})
+    st.markdown("**Zlecenia w wariancie** - kolumna „Kody do wyszukania” pozwala znaleźć ofertę na giełdzie "
+                "bez nazwy zleceniodawcy (pomagają też LDM, waga i cena).")
+    ord_df = order_table(v, orders_opt, est_ids)
+    if (ord_df["Zleceniodawca"] == "—").all():
+        ord_df = ord_df.drop(columns="Zleceniodawca")
+    st.dataframe(ord_df, width="stretch", hide_index=True, column_config={
+        "Zlecenie": st.column_config.TextColumn("Zlecenie", width=75),
+        "Zleceniodawca": st.column_config.TextColumn("Zleceniodawca", width=130),
+        "Kody do wyszukania": st.column_config.TextColumn("Kody do wyszukania", width=170),
+        "🟢▲ Załadunek": st.column_config.TextColumn("🟢▲ Załadunek", width=200),
+        "🔴▼ Rozładunek": st.column_config.TextColumn("🔴▼ Rozładunek", width=200),
+        "LDM": st.column_config.NumberColumn("LDM", format="%.1f", width=50),
+        "Waga (t)": st.column_config.NumberColumn("Waga (t)", format="%.1f", width=65),
+        "Cena (EUR)": st.column_config.NumberColumn("Cena (EUR)", format="%d", width=85),
+        "EUR/km": st.column_config.NumberColumn("EUR/km", format="%.2f", width=65,
+                                                 help="Cena zlecenia / jego własny dystans (z oferty lub szacowany)."),
+        "Cena z": st.column_config.TextColumn("Cena z", width=70)})
     event_map = route_map(v, route, vias, map_id=vkey, fit_id=vkey, height=620, key=f"map_{vkey}")
     if event_map and event_map.get("map_id") == vkey and event_map["nonce"] not in st.session_state.seen_nonce:
         st.session_state.seen_nonce.add(event_map["nonce"])

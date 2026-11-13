@@ -56,8 +56,8 @@ def route_map(variant: Variant, route: RouteResult, vias: list[Via], *, map_id: 
     else:
         banner = ""
     straight = list(route.straight_legs)
-    leg_info = [{"label": f"{a['kind'] == 'L' and '▲' or '▼'} {a['label'].split(' · ')[0]} → "
-                          f"{b['kind'] == 'L' and '▲' or '▼'} {b['label'].split(' · ')[0]}",
+    leg_info = [{"from": a["label"].split(" · ")[0], "from_kind": a["kind"],
+                 "to": b["label"].split(" · ")[0], "to_kind": b["kind"],
                  "km": round(leg.km), "h": round(leg.hours, 1)}
                 for a, b, leg in zip(stops, stops[1:], route.legs)]
     return _component(

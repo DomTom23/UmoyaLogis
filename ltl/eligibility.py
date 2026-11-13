@@ -17,6 +17,7 @@ class FleetProfile:
     adr: bool = False                            # mamy uprawnienia ADR
     tail_lift: bool = False                      # mamy windę załadowczą
     allow_ftl: bool = True                       # FTL = cały pojazd dla jednego zleceniodawcy
+    exclude_cabotage: bool = True                # kabotaż: załadunek i rozładunek w tym samym kraju
 
 
 def _body_ok(body: str, accepted: tuple) -> bool:
@@ -42,6 +43,9 @@ def check_eligibility(df: pd.DataFrame, fleet: FleetProfile) -> pd.Series:
             why.append("ADR")
         if "Winda" in extras and not fleet.tail_lift:
             why.append("wymaga windy")
+        if fleet.exclude_cabotage and getattr(r, "start_country", "") and \
+                getattr(r, "start_country", "") == getattr(r, "end_country", None):
+            why.append("kabotaż (ten sam kraj)")
         if not fleet.allow_ftl and (getattr(r, "load_type", "") or "") == "FTL":
             why.append("FTL")
         reasons.append(", ".join(why))

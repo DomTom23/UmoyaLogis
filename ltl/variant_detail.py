@@ -1,0 +1,91 @@
+"""Opis wariantu po wyborze: kolejność przystanków z zapełnieniem naczepy oraz lista zleceń do odnalezienia na giełdzie."""
+from __future__ import annotations
+
+import pandas as pd
+
+from .optimizer import Variant
+from .routing import RouteResult
+
+LOAD_ICON, UNLOAD_ICON = "🟢▲", "🔴▼"
+LOAD_COLOR, UNLOAD_COLOR = "#1a9850", "#d73027"
+
+
+def arrow(kind: str) -> str:
+    """Strzałka do tabel (emoji, bo tabele nie kolorują fragmentów tekstu): zielona = załadunek, czerwona = rozładunek."""
+    return LOAD_ICON if kind == "L" else UNLOAD_ICON
+
+
+def arrow_html(kind: str) -> str:
+    color, sign = (LOAD_COLOR, "▲") if kind == "L" else (UNLOAD_COLOR, "▼")
+    return f"<span style='color:{color};font-weight:700'>{sign}</span>"
+
+
+def route_chain_html(variant: Variant) -> str:
+    """Przebieg wariantu w jednym wierszu: kolorowe strzałki, numer zlecenia, kraj i kod."""
+    parts = [f"{arrow_html(s.kind)}&nbsp;<b>{s.order_id}</b>&nbsp;{s.country}&nbsp;{s.postal}" for s in variant.stops]
+    return " → ".join(parts)
+
+
+def _fmt_date(x) -> str:
+    return "" if x is None or pd.isna(x) else pd.Timestamp(x).strftime("%d.%m")
+
+
+def place(country, postal, city) -> str:
+    return f"{country}-{postal} {city}".strip()
+
+
+def stop_table(variant: Variant, route: RouteResult, orders: pd.DataFrame) -> pd.DataFrame:
+    """Krok po kroku: co robimy, gdzie, ile jest na naczepie po operacji i ile km/h do następnego przystanku."""
+    by_id = orders.set_index("id")
+    ldm = wt = 0.0
+    cum_km = cum_h = 0.0
+    rows = []
+    for i, s in enumerate(variant.stops):
+        o = by_id.loc[s.order_id]
+        sign = 1 if s.kind == "L" else -1
+        ldm = max(ldm + sign * float(o["ldm"]), 0.0)
+        wt = max(wt + sign * float(o["weight_t"]), 0.0)
+        leg = route.legs[i] if i < len(route.legs) else None
+        rows.append({
+            "Krok": i + 1,
+            "Operacja": f"{arrow(s.kind)} {'Załadunek' if s.kind == 'L' else 'Rozładunek'}",
+            "Zlecenie": s.order_id,
+            "Zleceniodawca": o.get("client") or "—",
+            "Miejsce": place(s.country, s.postal, s.city),
+            "Data": _fmt_date(o["load_date"] if s.kind == "L" else o["unload_date"]) or "—",
+            "Ładunek": f"{float(o['ldm']):.1f} LDM · {float(o['weight_t']):.1f} t",
+            "Na naczepie po": f"{ldm:.1f} LDM · {wt:.1f} t",
+            "Do następnego": f"{leg.km:,.0f} km · {leg.hours:.1f} h".replace(",", " ") if leg else "—",
+            "Od startu (km)": round(cum_km),
+        })
+        if leg:
+            cum_km += leg.km
+            cum_h += leg.hours
+    return pd.DataFrame(rows)
+
+
+def order_table(variant: Variant, orders: pd.DataFrame, estimated: set | None = None) -> pd.DataFrame:
+    """Zlecenia wariantu z kolumną „Kody do wyszukania” (kraj + kod załadunku i rozładunku, bo nazwa zleceniodawcy
+    często nie jest widoczna w kopiowanych ofertach Trans.eu); LDM, waga i cena pomagają wybrać właściwą ofertę."""
+    estimated = estimated or set()
+    by_id = orders.set_index("id")
+    rows = []
+    for oid in variant.order_ids:
+        o = by_id.loc[oid]
+        a, b = place(o["start_country"], o["start_postal"], o["start_city"]), \
+            place(o["end_country"], o["end_postal"], o["end_city"])
+        dist = o["distance_km"] if pd.notna(o.get("distance_km")) else o.get("distance_est_km")
+        price = o["price_eur"]
+        rows.append({
+            "Zlecenie": oid,
+            "Zleceniodawca": o.get("client") or "—",
+            "Kody do wyszukania": f"{o['start_country']} {o['start_postal']} → {o['end_country']} {o['end_postal']}",
+            "🟢▲ Załadunek": f"{a} · {_fmt_date(o['load_date']) or '—'}",
+            "🔴▼ Rozładunek": f"{b} · {_fmt_date(o['unload_date']) or '—'}",
+            "LDM": float(o["ldm"]),
+            "Waga (t)": float(o["weight_t"]),
+            "Cena (EUR)": float(price),
+            "EUR/km": round(float(price) / float(dist), 2) if pd.notna(dist) and dist else None,
+            "Cena z": "szacunek" if oid in estimated else "oferty",
+        })
+    return pd.DataFrame(rows)

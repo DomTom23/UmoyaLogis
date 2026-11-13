@@ -20,6 +20,7 @@
   .dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; border: 1px solid #fff; box-shadow: 0 0 2px #0006; }
   .bar { width: 18px; height: 0; display: inline-block; border-top: 4px solid #1f77b4; }
   .bar.dash { border-top: 4px dashed #e08a00; }
+  .arr-L { color: #1a9850; font-weight: 700; } .arr-U { color: #d73027; font-weight: 700; }
   .banner { color: #8a4b00; font-weight: 600; }
   .leaflet-interactive { cursor: crosshair; }
   .leaflet-bar a, .leaflet-bar a:hover { background: #fff; color: #222; text-decoration: none; }
@@ -40,6 +41,8 @@
     console.debug("[ltl-map] emit", JSON.stringify(ev));
     send("streamlit:setComponentValue", {value: ev, dataType: "json"});
   }
+
+  const arr = (k) => "<span class='arr-" + k + "'>" + (k === "L" ? "▲" : "▼") + "</span>";
 
   function busy(text) {                       // natychmiastowa informacja zwrotna, zanim serwer przeliczy trasę
     const p = document.getElementById("panel");
@@ -70,8 +73,8 @@
 
   function updatePanel() {
     const p = document.getElementById("panel");
-    let html = "<div class='row'><span class='dot' style='background:#1a9850'></span>załadunek " +
-               "<span class='dot' style='background:#d73027'></span>rozładunek " +
+    let html = "<div class='row'><span class='dot' style='background:#1a9850'></span>" + arr("L") + " załadunek " +
+               "<span class='dot' style='background:#d73027'></span>" + arr("U") + " rozładunek " +
                "<span class='dot' style='background:#fff;border:3px solid #1f4e9c;width:7px;height:7px'></span>via</div>" +
                "<div class='row'><span class='bar'></span>trasa <span class='bar dash'></span>linia prosta</div>";
     if (args.banner) html += "<div class='banner'>" + esc(args.banner) + "</div>";
@@ -101,7 +104,7 @@
       const icon = L.divIcon({className: "", iconSize: null, iconAnchor: [13, 13],
         html: "<div class='pin " + cls + "'>" + esc(text) + "</div>"});
       const m = L.marker([items[0].s.lat, items[0].s.lon], {icon, zIndexOffset: 500}).addTo(layer);
-      m.bindTooltip(items.map((x) => esc(x.n + ". " + (x.s.kind === "L" ? "Załadunek " : "Rozładunek ") + x.s.label)).join("<br>"));
+      m.bindTooltip(items.map((x) => arr(x.s.kind) + " " + esc(x.n + ". " + (x.s.kind === "L" ? "Załadunek " : "Rozładunek ") + x.s.label)).join("<br>"));
     });
   }
 
@@ -121,7 +124,8 @@
     const line = L.polyline(shape, base).addTo(layer);
     const info = (args.leg_info || [])[i];
     if (info) {
-      line.bindTooltip("Odcinek " + (i + 1) + ": " + esc(info.label) + "<br>" + info.km + " km · " + info.h + " h" +
+      line.bindTooltip("Odcinek " + (i + 1) + ": " + arr(info.from_kind) + " " + esc(info.from) + " → " +
+                       arr(info.to_kind) + " " + esc(info.to) + "<br>" + info.km + " km · " + info.h + " h" +
                        (straight ? "<br><i>linia prosta (brak drogi z serwera)</i>" : ""), {sticky: true});
     }
     line.on("mouseover", () => line.setStyle({weight: 9, opacity: 1}));

@@ -10,17 +10,21 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-FROM, TO = "from", "to"
+FROM, TO, BOTH = "from", "to", "both"
 
 
 @dataclass(frozen=True)
 class PriceRule:
     label: str
-    direction: str            # "from" = załadunek w kraju, "to" = rozładunek w kraju
-    country: str              # kod ISO, np. "CH"
+    direction: str            # "from" = załadunek w kraju, "to" = rozładunek w kraju, "both" = jedno z dwóch
+    country: str              # kod ISO, np. "CH"; kilka krajów po przecinku: "BE,NL,LU,DE"
     eur_per_ldm: float
     min_revenue_eur: float
     enabled: bool = True
+
+    @property
+    def countries(self) -> tuple[str, ...]:
+        return tuple(c.strip().upper() for c in self.country.split(",") if c.strip())
 
 
 DEFAULT_RULES = (
@@ -28,10 +32,11 @@ DEFAULT_RULES = (
     PriceRule("do Szwajcarii", TO, "CH", 250.0, 500.0),
     PriceRule("do Anglii", TO, "GB", 300.0, 500.0),
     PriceRule("z Anglii", FROM, "GB", 150.0, 500.0),
+    PriceRule("z/do BENELUX i DE", BOTH, "BE,NL,LU,DE", 200.0, 500.0),
 )
 
 RULE_COLUMNS = ["Aktywna", "Reguła", "Kierunek", "Kraj", "EUR/LDM", "Min. przychód (EUR)"]
-DIRECTION_LABELS = {FROM: "z kraju (załadunek)", TO: "do kraju (rozładunek)"}
+DIRECTION_LABELS = {FROM: "z kraju (załadunek)", TO: "do kraju (rozładunek)", BOTH: "z lub do kraju"}
 
 
 def rules_to_frame(rules) -> pd.DataFrame:
@@ -44,9 +49,10 @@ def frame_to_rules(df: pd.DataFrame) -> tuple[PriceRule, ...]:
     rev = {v: k for k, v in DIRECTION_LABELS.items()}
     out = []
     for r in df.itertuples(index=False):
-        country = str(r[3] or "").strip().upper()
+        codes = [c.strip().upper() for c in str(r[3] or "").replace(";", ",").replace(" ", ",").split(",") if c.strip()]
+        country = ",".join(codes)
         direction = rev.get(r[2])
-        if len(country) != 2 or direction is None or pd.isna(r[4]) or float(r[4]) <= 0:
+        if not codes or any(len(c) != 2 for c in codes) or direction is None or pd.isna(r[4]) or float(r[4]) <= 0:
             continue
         out.append(PriceRule(str(r[1] or f"{r[2]} {country}"), direction, country, float(r[4]),
                              0.0 if pd.isna(r[5]) else float(r[5]), bool(r[0])))
@@ -57,8 +63,8 @@ def _matching(row, rules) -> list[PriceRule]:
     if row["start_country"] == row["end_country"]:
         return []        # krajowe (np. GB -> GB) nie podpadają pod stawki "z/do kraju"
     return [r for r in rules if r.enabled and (
-        (r.direction == FROM and row["start_country"] == r.country)
-        or (r.direction == TO and row["end_country"] == r.country))]
+        (r.direction in (FROM, BOTH) and row["start_country"] in r.countries)
+        or (r.direction in (TO, BOTH) and row["end_country"] in r.countries))]
 
 
 def apply_price_rules(orders: pd.DataFrame, rules, enabled: bool = True) -> pd.DataFrame:

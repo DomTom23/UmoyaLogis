@@ -71,8 +71,16 @@ wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląd
   oraz eksport CSV.
 * **Czas pracy:** 2 h na każdy załadunek i rozładunek (ustawienie w panelu bocznym).
 * **Ceny szacunkowe** dla ofert bez ceny: stawka × LDM wg kraju załadunku/rozładunku (domyślnie z CH 150 EUR/LDM,
-  do CH 250, do GB 300, z GB 150; min. przychód 500 EUR). Oferta wchodzi do wariantów tylko, gdy cena szacunkowa
+  do CH 250, do GB 300, z GB 150, z/do BENELUX i DE 200 EUR/LDM; min. przychód 500 EUR; w polu „Kraj” można podać
+  kilka kodów po przecinku, a kierunek „z lub do kraju” obejmuje oba końce trasy). Oferta wchodzi do wariantów tylko, gdy cena szacunkowa
   osiąga minimum; przy kilku pasujących regułach obowiązuje najwyższa stawka. Reguły edytuje się w panelu bocznym.
+* **Kabotaż:** oferty z załadunkiem i rozładunkiem w tym samym kraju są wykluczane (można wyłączyć w „Dopasowanie
+  ofert do zestawu”).
+* **Szukanie po kodach pocztowych** (Trans.eu nie kopiuje nazwy zleceniodawcy): pola „Kod załadunku / rozładunku”
+  w tabeli zleceń i w historii oraz „Kod pocztowy w wariancie” przyjmują początek kodu z krajem lub bez
+  (`DE 20, FR 77, 00-0`). Po wyborze wariantu tabela „Zlecenia w wariancie” podaje kody do wyszukania na giełdzie.
+* **Opis wariantu:** po wybraniu wariantu widać przebieg krok po kroku (🟢▲ załadunek, 🔴▼ rozładunek, zapełnienie
+  naczepy po każdej operacji, km i godziny odcinków), a w rankingu kolumnę Cena/km (przychód / cały dystans).
 * **Szwajcaria:** załadunek i rozładunek w Szwajcarii są dozwolone, omijany jest tylko tranzyt.
 * **Maks. zleceń w wariancie:** domyślnie 6 (suwak w panelu bocznym).
 
