@@ -1,0 +1,90 @@
+SCIAGAWKA - MODUL SVM (SLAJDY 8-11)
+Czas calosci: ok. 4-5 minut
+
+==================================================
+WEJSCIE (przed slajdem 8) - ok. 15 s
+==================================================
+Sieci neuronowe ucza sie granicy decyzyjnej za pomoca gradientu. SVM podchodzi do tego inaczej: szuka granicy, ktora jest najbardziej bezpieczna, czyli lezy jak najdalej od obu klas.
+
+==================================================
+SLAJD 8 - Skad sie bierze maksymalny margines? (ok. 1 min 15 s)
+==================================================
+1. Granica decyzyjna to hiperplaszczyzna opisana rownaniem w * x + b = 0.
+2. Dla danych rozdzielnych istnieje wiele takich granic. Ktora wybrac? SVM wybiera ta, ktora ma najwiekszy margines, czyli najwiekszy odstep od najblizszych punktow obu klas.
+3. Szerokosc marginesu wynosi 2 / ||w||. Z tego wynika, ze maksymalizacja marginesu to to samo, co minimalizacja ||w||^2. To jest laczenie geometrii z optymalizacja.
+4. Wektory nosne to punkty lezace na brzegu marginesu albo go naruszajace. Tylko one wyznaczaja polozenie granicy. Gdybysmy usuneli reszte punktow, granica by sie nie zmienila.
+5. Zdanie koncowe: To margines odroznia SVM od dowolnego liniowego separatora. Perceptron znajdzie jakas granice, SVM znajdzie te najlepiej odsunieta od danych.
+
+Wskazowka: slajd nie ma rysunku. Narysuj lub opisz slowami dwie chmury punktow, granice posrodku i dwie rownolegle linie po bokach.
+
+==================================================
+SLAJD 9 - Hard margin, soft margin i parametr C (ok. 1 min 15 s)
+==================================================
+1. Hard margin zaklada, ze klasy da sie idealnie rozdzielic i zaden punkt nie moze naruszyc marginesu. W realnych danych, przy szumie albo blednych etykietach, jest to zalozenie nierealistyczne. Jeden odstajacy punkt psuje model albo rozwiazanie w ogole nie istnieje.
+2. Soft margin dopuszcza naruszenia marginesu, ale doliczamy za nie kare do funkcji celu.
+3. Parametr C to kompromis miedzy szerokoscia marginesu a dopasowaniem do danych treningowych:
+   - duze C: mocno karzemy bledy, margines jest waski, model dopasowuje sie do treningu, ryzyko przeuczenia;
+   - male C: tolerujemy wiecej bledow, margines jest szerszy, model prostszy, ryzyko niedouczenia.
+4. Funkcja straty to hinge: max(0, 1 - y * f(x)). Jest rowna zero, gdy punkt jest po wlasciwej stronie z zapasem, a rosnie liniowo, gdy punkt jest blisko granicy albo po zlej stronie.
+5. C dobieramy na zbiorze walidacyjnym, najlepiej walidacja krzyzowa.
+
+Nawiazanie do slajdu 7: C pelni role regularyzacji, ale w odwrotnej skali - duze C oznacza slabsza regularyzacje.
+
+==================================================
+SLAJD 10 - Kernel trick (ok. 1 min 30 s)
+==================================================
+Ide za rysunkiem.
+1. Lewy panel: niebieskie punkty sa w srodku, rozowe tworza pierscien dookola. Zadna prosta nie rozdzieli tych klas.
+2. Prawy panel: dodajemy ceche r^2 = x1^2 + x2^2, czyli kwadrat odleglosci od srodka. Teraz niebieskie maja male r^2, rozowe duze, i wystarczy jeden prog, zeby je rozdzielic.
+3. Sedno triku: nie musimy jawnie liczyc transformacji phi(x), ktora moze byc ogromnowymiarowa, a nawet nieskonczenie wymiarowa. SVM w postaci dualnej uzywa danych tylko w iloczynach skalarnych. Zamiast nich podstawiamy funkcje jadra K(x, z) = <phi(x), phi(z)>, ktora liczymy bezposrednio z oryginalnych punktow.
+4. Przyklad: jadro RBF, K(x, z) = exp(-gamma * ||x - z||^2). Mozna je rozumiec jako miare podobienstwa: punkty bliskie maja wartosc bliska 1, odlegle bliska 0.
+
+Uwaga: przyklad z r^2 to ilustracja idei transformacji cech. RBF robi cos analogicznego, ale w nieskonczenie wymiarowej przestrzeni. Powiedz to wprost.
+
+==================================================
+SLAJD 11 - Trzy najczesciej spotykane funkcje jadrowe (ok. 1 min)
+==================================================
+Wybor jadra to wybor zalozenia o ksztalcie granicy.
+1. Liniowe, K = x * z: brak transformacji, szybkie, dobre przy duzej liczbie cech (np. teksty), czesto pierwszy punkt odniesienia.
+2. Wielomianowe, K = (gamma * x*z + r)^d: uwzglednia interakcje cech do stopnia d; im wieksze d, tym bardziej zlozona granica.
+3. RBF (gaussowskie), K = exp(-gamma * ||x - z||^2): najbardziej uniwersalne, dobry domyslny wybor, gdy nic nie wiemy o danych.
+
+Kluczowy komunikat z dolnego paska: w RBF mamy dwa pokretla. C karze bledy, a gamma okresla zasieg wplywu pojedynczego punktu. Duze gamma: waski wplyw, poszarpana granica, przeuczenie. Male gamma: gladka granica. Oba parametry stroimy razem (grid search + walidacja krzyzowa).
+
+ZAMKNIECIE MODULU (1 zdanie):
+SVM laczy trzy rzeczy: maksymalny margines dla stabilnosci, soft margin dla odpornosci na szum i kernele dla nieliniowosci.
+
+PRZEJSCIE DO K-MEANS:
+Do tej pory mielismy etykiety. Teraz je zabierzemy i zobaczymy, co mozna zrobic bez nich.
+
+==================================================
+TRZY WZORY DO ZAPAMIETANIA
+==================================================
+- Szerokosc marginesu: 2 / ||w||
+- Strata hinge: max(0, 1 - y * f(x))
+- Jadro: K(x, z) = <phi(x), phi(z)>
+
+==================================================
+MOZLIWE PYTANIA I KROTKIE ODPOWIEDZI
+==================================================
+P: Czym SVM roznie sie od regresji logistycznej albo perceptronu?
+O: Maksymalizuje margines, a o granicy decyduja tylko wektory nosne. Uzywa straty hinge zamiast log-loss.
+
+P: Dlaczego tylko wektory nosne maja znaczenie?
+O: Punkty daleko od granicy maja zerowa strate i zerowy wspolczynnik w rozwiazaniu dualnym.
+
+P: Jak dobrac C i gamma?
+O: Grid search albo random search z walidacja krzyzowa, na skali logarytmicznej.
+
+P: Kiedy SVM nie jest dobrym wyborem?
+O: Przy bardzo duzych zbiorach (trening rzedu O(n^2)-O(n^3)), gdy potrzebne sa prawdopodobienstwa (wymaga kalibracji) oraz gdy cechy nie sa przeskalowane (SVM, zwlaszcza RBF, wymaga standaryzacji).
+
+P: Czy SVM dziala na wiele klas?
+O: Tak, przez schematy one-vs-rest lub one-vs-one.
+
+==================================================
+PRAKTYCZNE WSKAZOWKI
+==================================================
+- Nie czytaj slajdow, mow wlasnymi slowami.
+- Na slajdach 8 i 9 ogranicz sie do 2-3 najwazniejszych zdan.
+- Gdy zabraknie czasu, na slajdzie 11 omow tylko RBF oraz role C i gamma.
