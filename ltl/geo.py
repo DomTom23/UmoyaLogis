@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
@@ -36,7 +37,8 @@ COUNTRY_CENTROIDS = {
     "SK": (48.67, 19.70), "TR": (38.96, 35.24), "UA": (48.38, 31.17), "XK": (42.60, 20.90),
 }
 
-DEFAULT_CACHE = Path.home() / ".cache" / "umoyalogis" / "geocache.json"
+DEFAULT_CACHE = Path(os.environ.get("LTL_GEOCACHE_PATH")
+                     or Path.home() / ".cache" / "umoyalogis" / "geocache.json")
 
 
 def haversine_km(lat1, lon1, lat2, lon2):

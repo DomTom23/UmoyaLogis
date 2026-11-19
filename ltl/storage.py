@@ -52,6 +52,7 @@ class Store:
         self.path = Path(path) if path else db_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
+            c.execute("PRAGMA journal_mode = WAL")       # kilku użytkowników naraz: odczyty nie blokują zapisu
             c.executescript("""
                 CREATE TABLE IF NOT EXISTS saved_tables (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

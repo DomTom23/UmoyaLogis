@@ -851,3 +851,19 @@ def test_mandatory_waypoint_inserted_at_cheapest_place_and_costed():
     v3, _ = find_best_combinations(df, CostParams(), p, start, (on_way,))
     k3 = [s.kind for s in [x for x in v3 if set(x.order_ids) == {"A", "B"}][0].stops]
     assert k3[0] == "S" and k3.count("W") == 1 and k3[-1] != "W"
+
+
+def test_password_check_and_db_backup(tmp_path):
+    import sqlite3, sys
+    from ltl.auth import password_ok
+    assert password_ok("tajne", "tajne") and not password_ok("inne", "tajne") and not password_ok("", "")
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "scripts"))
+    from backup_db import backup
+    st = Store(tmp_path / "x.db")
+    df = parse_orders((pathlib.Path(__file__).parent / "data" / "timocom_vertical.txt").read_text())
+    st.record_offers(df, "2026-10-01T10:00:00")
+    for _ in range(3):
+        out = backup(tmp_path / "x.db", tmp_path / "bk", keep=2)
+    assert len(list((tmp_path / "bk").glob("*.db"))) <= 3 and Store(out).history_count() == 9
+    mode = sqlite3.connect(tmp_path / "x.db").execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode == "wal"

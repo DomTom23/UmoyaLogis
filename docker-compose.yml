@@ -1,0 +1,16 @@
+# Uruchomienie: docker compose up -d --build   (szczegóły: DEPLOY.md)
+services:
+  app:
+    build: .
+    image: umoyalogis:latest
+    container_name: umoyalogis
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8501}:8501"
+    env_file: .env
+    volumes:
+      - ./data:/data            # baza SQLite (historia, zapisane tabele) i cache kodów pocztowych
+    # logi nie rosną w nieskończoność
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}

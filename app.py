@@ -8,6 +8,7 @@ from collections import Counter
 import pandas as pd
 import streamlit as st
 
+from ltl.auth import password_ok
 from ltl.costs import CostParams, profit
 from ltl.eligibility import ALL_BODIES, DEFAULT_BODIES, FleetProfile, check_eligibility
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
@@ -24,6 +25,19 @@ from ltl.variant_detail import order_table, route_chain_html, stop_table
 from ltl.storage import OUTCOMES, InvalidName, NameExists, Store
 
 st.set_page_config(page_title="Optymalizator Tras LTL", page_icon="🚛", layout="wide")
+
+# opcjonalne wspólne hasło (serwer biurowy): ustaw APP_PASSWORD w pliku .env
+_APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+if _APP_PASSWORD and not st.session_state.get("authed"):
+    st.title("🚛 Optymalizator Tras LTL")
+    with st.form("login_form"):
+        entered = st.text_input("Hasło", type="password")
+        if st.form_submit_button("Zaloguj", type="primary"):
+            if password_ok(entered, _APP_PASSWORD):
+                st.session_state.authed = True
+                st.rerun()
+            st.error("Nieprawidłowe hasło.")
+    st.stop()
 
 st.markdown("""
 <style>

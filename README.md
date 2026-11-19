@@ -1,13 +1,15 @@
 # Optymalizator Tras LTL
 
-Streamlit + Pandas + Folium. Wklejasz dane z Timocom / Trans.eu, aplikacja liczy koszty
+Streamlit + Pandas + Leaflet (własny komponent mapy). Wklejasz dane z Timocom / Trans.eu, aplikacja liczy koszty
 i podpowiada najbardziej zyskowne doładunki (TOP 10).
 
 ```
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 streamlit run app.py
 pytest
 ```
+
+Uruchomienie na serwerze biurowym (Docker, hasło, kopie zapasowe): [DEPLOY.md](DEPLOY.md).
 
 | Moduł | Zawartość |
 |---|---|
