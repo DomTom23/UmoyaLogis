@@ -237,6 +237,8 @@ def find_best_combinations(
     # trasa bazowa: zlecenie główne + zlecenia obowiązkowe (własne ładunki); bez obowiązkowych = samo zlecenie główne
     seed: dict[int, tuple] = {}
     for m in market:
+        if not all(pair_ok(m, f) for f in forced):      # data odbioru własnego ładunku vs załadunek zlecenia głównego
+            continue
         seq, ok = [2 * m, 2 * m + 1], True
         for f in sorted(forced, key=lambda f: D[2 * m, 2 * f]):
             ins = _insert(seq, f, D, ldm, wt, opt.max_ldm, opt.max_weight_t)

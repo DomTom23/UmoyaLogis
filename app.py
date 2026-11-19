@@ -645,7 +645,7 @@ with st.container(border=True):
         pd.DataFrame({"Kraj": pd.Series(dtype=str), "Kod pocztowy": pd.Series(dtype=str),
                       "Opis": pd.Series(dtype=str), "Ładunek LDM": pd.Series(dtype=float),
                       "Ładunek (t)": pd.Series(dtype=float), "Cena (EUR)": pd.Series(dtype=float),
-                      "Zrzut: kraj": pd.Series(dtype=str), "Zrzut: kod": pd.Series(dtype=str),
+                      "Data odbioru": pd.Series(dtype="datetime64[ns]"), "Zrzut: kraj": pd.Series(dtype=str), "Zrzut: kod": pd.Series(dtype=str),
                       "Zrzut: opis": pd.Series(dtype=str)}),
         key="waypoints_editor", num_rows="dynamic", hide_index=True, width="stretch",
         column_config={
@@ -659,14 +659,20 @@ with st.container(border=True):
                                                          width=95, help="Pusty = wyliczone z LDM."),
             "Cena (EUR)": st.column_config.NumberColumn("Cena EUR", min_value=0.0, format="%.0f", width=90,
                                                         help="Przychód za ten ładunek; puste = 0 (własny towar)."),
+            "Data odbioru": st.column_config.DateColumn("Data odbioru", format="DD.MM.YYYY", width=115,
+                                                        help="Opcjonalnie. Zlecenia z giełdy w wariancie muszą mieć "
+                                                             "załadunek w limicie dni od tej daty (ustawienie "
+                                                             "„Maks. różnica dat załadunku”)."),
             "Zrzut: kraj": st.column_config.TextColumn("Zrzut kraj", max_chars=2, width=95,
                                                        help="Puste = ten sam kraj co punkt."),
             "Zrzut: kod": st.column_config.TextColumn("Zrzut kod", width=95,
                                                       help="Wymagany, gdy punkt ma ładunek."),
             "Zrzut: opis": st.column_config.TextColumn("Zrzut opis", width=160)})
     waypoints, own_orders, wp_notes = build_extra_points(
-        ({"country": r[0], "postal": r[1], "desc": r[2], "ldm": r[3], "weight": r[4], "price": r[5],
-          "drop_country": r[6], "drop_postal": r[7], "drop_desc": r[8]} for r in wp_df.itertuples(index=False)),
+        ({"country": r["Kraj"], "postal": r["Kod pocztowy"], "desc": r["Opis"], "ldm": r["Ładunek LDM"],
+          "weight": r["Ładunek (t)"], "price": r["Cena (EUR)"], "date": r["Data odbioru"],
+          "drop_country": r["Zrzut: kraj"], "drop_postal": r["Zrzut: kod"], "drop_desc": r["Zrzut: opis"]}
+         for r in wp_df.to_dict("records")),
         lambda c, p: (geocoder.prefetch([(c, p)]), geocoder.locate(c, p))[1])
     geocoder.save()
     for note in wp_notes:
@@ -674,7 +680,8 @@ with st.container(border=True):
     if len(waypoints) or len(own_orders):
         st.caption("Punkty dodatkowe: " + ", ".join(
             [f"📍 {w.order_id} {w.country} {w.postal} {w.city}".strip() for w in waypoints]
-            + [f"📍 {o.id} {o.start_country} {o.start_postal} ({o.ldm:g} LDM) → zrzut {o.end_country} {o.end_postal}"
+            + [f"📍 {o.id} {o.start_country} {o.start_postal} ({o.ldm:g} LDM"
+               f"{', odbiór ' + o.load_date.strftime('%d.%m.%Y') if o.load_date else ''}) → zrzut {o.end_country} {o.end_postal}"
                for o in own_orders.itertuples()]))
 waypoints = tuple(waypoints)
 if len(own_orders):                      # własne ładunki: obowiązkowe zlecenia w każdym wariancie
@@ -692,7 +699,10 @@ with st.container(border=True):
         st.warning("Przerwano wyszukiwanie po limicie obliczeń - zmniejsz odchylenie albo liczbę ofert.")
     if not candidates:
         st.info("Nie znaleziono doładunków spełniających warunki. Potrzeba co najmniej 2 ofert z ceną, "
-                "a ich trasy muszą mieścić się w limicie odchylenia - spróbuj go zwiększyć w ustawieniach.")
+                "a ich trasy muszą mieścić się w limicie odchylenia - spróbuj go zwiększyć w ustawieniach."
+                + (" Masz własny ładunek w punkcie dodatkowym: jest w każdym wariancie, więc sprawdź jego datę "
+                   "odbioru (zlecenia z giełdy muszą mieć załadunek w limicie dni od niej), miejsce zrzutu i LDM."
+                   if forced_ids else ""))
         st.stop()
 
     # ranking po trasach rzeczywistych: liczony od razu, pamiętany do zmiany danych lub ustawień

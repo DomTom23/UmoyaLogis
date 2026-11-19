@@ -939,3 +939,30 @@ def test_file_formats_tabular_utf16_and_source_report():
     # wklejka z giełdy zapisana jako .txt z tabulacjami (bez nagłówków) zostaje bez zmian
     tab_txt = "DE 20095 Hamburg\tPL 00-001 Warszawa\t30.10.2026\t5,2 t\t900 EUR"
     assert read_uploaded("w.txt", tab_txt.encode()) == tab_txt
+
+
+def test_own_cargo_pickup_date_limits_matching_orders():
+    import datetime
+    from ltl.ownpoints import build_extra_points
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500)]
+    df = _orders(rows)
+    df["load_date"] = [datetime.date(2026, 11, 2), datetime.date(2026, 11, 20)]
+    _, own, _ = build_extra_points([{"country": "DE", "postal": "50667", "ldm": 2, "date": "2026-11-03",
+                                     "drop_country": "FR", "drop_postal": "75001"}], lambda c, p: (50.9, 7.0, "cache"))
+    assert own.loc[0, "load_date"] == datetime.date(2026, 11, 3)
+    full = pd.concat([df, own.reindex(columns=df.columns.union(own.columns))], ignore_index=True)
+    v, _ = find_best_combinations(full, CostParams(), OptimizerParams(max_detour_km=2000), None, (), ("P1",))
+    # B ma załadunek 17 dni po odbiorze własnego ładunku (limit 3 dni): nigdy razem z P1
+    assert v and all("B" not in x.order_ids for x in v) and any("A" in x.order_ids for x in v)
+    _, own2, _ = build_extra_points([{"postal": "50667", "country": "DE", "ldm": 2, "drop_postal": "75001", "drop_country": "FR"}],
+                                    lambda c, p: (50.9, 7.0, "cache"))
+    assert own2.loc[0, "load_date"] is None          # bez daty: bez ograniczenia
+
+
+def test_own_cargo_date_two_digit_year_and_invalid_values():
+    import datetime
+    from ltl.ownpoints import _date
+    assert _date(datetime.date(26, 11, 2)) == datetime.date(2026, 11, 2)
+    assert _date(pd.Timestamp("2026-11-02")) == datetime.date(2026, 11, 2)
+    assert _date("2026-11-02") == datetime.date(2026, 11, 2)
+    assert _date(None) is None and _date(float("nan")) is None and _date(pd.NaT) is None and _date("to nie data") is None

@@ -2,7 +2,8 @@
 
 Wiersz bez ładunku to zwykły przystanek (Stop typu "W"). Wiersz z ładunkiem (LDM i/lub waga) i miejscem zrzutu
 staje się własnym zleceniem „P<n>” (odbiór w punkcie, zrzut w podanym miejscu), które musi być w każdym wariancie.
-Cena jest opcjonalna (domyślnie 0 - własny towar, który tylko generuje koszt).
+Cena jest opcjonalna (domyślnie 0 - własny towar, który tylko generuje koszt), data odbioru też: gdy jest, zlecenia
+z giełdy muszą mieć załadunek w limicie dni od niej (jak między zleceniami).
 """
 from __future__ import annotations
 
@@ -24,13 +25,27 @@ def _f(x) -> Optional[float]:
     return None if v != v or v <= 0 else v
 
 
+def _date(x):
+    """Data odbioru z edytora; dwucyfrowy rok (wpisane „02.11.26” bywa odczytane jako rok 26) -> 20xx."""
+    if x is None or (isinstance(x, float) and x != x):
+        return None
+    try:
+        d = x if hasattr(x, "year") and hasattr(x, "month") else pd.Timestamp(x)
+        if pd.isna(d):
+            return None
+        d = d.date() if hasattr(d, "hour") else d
+        return d.replace(year=d.year + 2000) if d.year < 100 else d
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _s(x) -> str:
     return "" if x is None or (isinstance(x, float) and x != x) else str(x).strip()
 
 
 def build_extra_points(rows: Iterable[dict], geocode: Callable[[str, str], tuple]
                        ) -> tuple[list[Stop], pd.DataFrame, list[str]]:
-    """rows: country, postal, desc, ldm, weight, price, drop_country, drop_postal, drop_desc.
+    """rows: country, postal, desc, ldm, weight, price, date, drop_country, drop_postal, drop_desc.
     geocode(country, postal) -> (lat, lon, źródło). Zwraca (przystanki bez ładunku, własne zlecenia, uwagi)."""
     stops, own, notes, n = [], [], [], 0
     for r in rows:
@@ -79,7 +94,7 @@ def build_extra_points(rows: Iterable[dict], geocode: Callable[[str, str], tuple
         own.append({
             "id": tag, "source": "Własny", "start_country": country, "start_postal": postal, "start_city": desc,
             "end_country": dc, "end_postal": drop_postal, "end_city": _s(r.get("drop_desc")),
-            "load_date": None, "unload_date": None, "weight_t": round(wt, 2), "ldm": round(ldm, 2),
+            "load_date": _date(r.get("date")), "unload_date": None, "weight_t": round(wt, 2), "ldm": round(ldm, 2),
             "distance_km": None, "price_eur": price if price is not None else 0.0,
             "client": f"własny ładunek {tag}", "load_type": "LTL", "vehicles": "", "body": "",
             "extras": "", "description": desc, "status": "Własny ładunek",
