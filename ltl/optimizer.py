@@ -114,6 +114,10 @@ def _best_route(idx, D, ldm, wt, max_ldm, max_wt, bound=float("inf"), d0=None):
     return (best[0], best[1]) if best[1] is not None else None
 
 
+def plan_len(D, seq) -> float:
+    return float(sum(D[a, b] for a, b in zip(seq, seq[1:])))
+
+
 def _date_ok(a, b, gap) -> bool:
     if gap is None or a is None or b is None or pd.isna(a) or pd.isna(b):
         return True
@@ -163,7 +167,8 @@ def _insert(seq, j, D, ldm, wt, max_ldm, max_wt):
 
 def find_best_combinations(
     orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Optional["Stop"] = None,
-    waypoints: tuple = ()
+    waypoints: tuple = (),
+    forced_ids: tuple = ()
 ) -> tuple[list[Variant], dict]:
     """Zwraca (TOP warianty, statystyki). `orders` musi mieć kolumny współrzędnych (ltl.geo.add_coordinates).
 
@@ -173,12 +178,19 @@ def find_best_combinations(
     `origin` = miejsce startu pojazdu: dojazd na pierwszy załadunek (puste km) wchodzi do zysku i kolejności punktów,
     a wariant dostaje na początku przystanek typu "S". `waypoints` = obowiązkowe punkty dodatkowe (Stop typu "W"):
     każdy trafia w najtańsze miejsce trasy (po starcie, przed ostatnim punktem zlecenia), a jego objazd liczy się do kosztów.
+    `forced_ids` = numery zleceń, które muszą być w każdym wariancie (np. własny ładunek zbierany w punkcie dodatkowym);
+    nie liczą się do limitu zleceń w wariancie, a limit odchylenia mierzony jest od trasy bazowej z nimi.
     """
     stats = {"candidates": 0, "eligible": 0, "evaluated": 0, "truncated": False}
-    df = orders[(orders["price_eur"].notna())].copy()
+    forced_ids = set(forced_ids)
+    max_evals = opt.max_evaluations * (2 if forced_ids else 1)       # własne ładunki zwiększają liczbę kombinacji
+    is_forced = orders["id"].isin(forced_ids)
+    df = orders[orders["price_eur"].notna() | is_forced].copy()
+    df["price_eur"] = df["price_eur"].fillna(0.0)
     df = df[(df["ldm"] <= opt.max_ldm + 1e-9) & (df["weight_t"] <= opt.max_weight_t + 1e-9)]
-    if len(df) < 2:
-        return [], stats
+    n_forced = int(df["id"].isin(forced_ids).sum())
+    if n_forced < len(forced_ids) or len(df) - n_forced < 1 or (len(df) < 2 and not forced_ids):
+        return [], stats                  # własny ładunek nie mieści się na naczepie albo brak zleceń z giełdy
     df = df.reset_index(drop=True)
     stats["eligible"] = len(df)
 
@@ -191,6 +203,7 @@ def find_best_combinations(
     single = np.array([D[2 * i, 2 * i + 1] for i in range(n)])
     if n > opt.candidate_limit:  # zostaw zlecenia o najwyższej cenie za km
         score = df["price_eur"].to_numpy(float) / np.maximum(single, 50.0)
+        score[df["id"].isin(forced_ids).to_numpy()] = np.inf       # własnych ładunków nie wolno odrzucić
         keep = np.sort(np.argsort(-score)[: opt.candidate_limit])
         df = df.iloc[keep].reset_index(drop=True)
         n = len(df)
@@ -201,13 +214,15 @@ def find_best_combinations(
 
     ldm, wt = df["ldm"].to_numpy(float), df["weight_t"].to_numpy(float)
     price = df["price_eur"].to_numpy(float)
+    forced = [i for i in range(n) if df["id"].iloc[i] in forced_ids]
+    market = [i for i in range(n) if i not in set(forced)]
     d0 = None if origin is None else haversine_km(origin.lat, origin.lon, lats, lons) * ROAD_FACTOR
     plan = _Planner(D, lats, lons, d0, origin, tuple(waypoints))
     wp_h = cost.waypoint_stop_h * len(waypoints)
     ldates = list(df["load_date"])
 
     # "główne" = najdłuższe; rozstrzyganie remisów indeksem
-    rank = sorted(range(n), key=lambda i: (-single[i], i))
+    rank = sorted(market, key=lambda i: (-single[i], i))
     pos = {i: r for r, i in enumerate(rank)}
 
     # ten sam ładunek ofertowany kilka razy (np. z różnymi stawkami) nie może wejść do wariantu dwa razy
@@ -219,15 +234,35 @@ def find_best_combinations(
     def pair_ok(a, b):
         return cargo[a] != cargo[b] and _date_ok(ldates[a], ldates[b], opt.max_load_date_gap_days)
 
+    # trasa bazowa: zlecenie główne + zlecenia obowiązkowe (własne ładunki); bez obowiązkowych = samo zlecenie główne
+    seed: dict[int, tuple] = {}
+    for m in market:
+        seq, ok = [2 * m, 2 * m + 1], True
+        for f in sorted(forced, key=lambda f: D[2 * m, 2 * f]):
+            ins = _insert(seq, f, D, ldm, wt, opt.max_ldm, opt.max_weight_t)
+            if ins is None:
+                ok = False
+                break
+            seq = ins[0]
+        if not ok:
+            continue
+        if forced and len(forced) + 1 <= 3:
+            r = _best_route(sorted([m, *forced]), D, ldm, wt, opt.max_ldm, opt.max_weight_t)
+            if r and r[0] < plan_len(D, seq):
+                seq = r[1]
+        seed[m] = (seq, plan_len(D, seq))
+    market = [m for m in market if m in seed]
+
     compat: dict[int, list[int]] = {}
-    for m in range(n):
+    for m in market:
         lst = []
-        for j in range(n):
+        slack = seed[m][1] - single[m]             # o tyle trasa bazowa jest dłuższa przez własne ładunki
+        for j in market:
             if j == m or pos[j] < pos[m] or not pair_ok(m, j):
                 continue
             r = _best_route([m, j], D, ldm, wt, opt.max_ldm, opt.max_weight_t)
-            if r and r[0] - single[m] <= opt.max_detour_km:
-                lst.append((price[j] / (r[0] - single[m] + 50.0), j))   # ile przychodu za dodatkowy kilometr
+            if r and r[0] - single[m] <= opt.max_detour_km + slack:       # wstępne odsiewanie; limit sprawdza wiązka
+                lst.append((price[j] / (max(r[0] - single[m] - slack, 0.0) + 50.0), j))   # przychód za dodatkowy km
         lst.sort(reverse=True)
         compat[m] = [j for _, j in lst[: opt.compat_limit]]
 
@@ -238,16 +273,22 @@ def find_best_combinations(
     evals = 0
     # zlecenia główne od najbardziej obiecujących (przychód za km); budżet obliczeń maleje z pozycją na liście,
     # więc przy dużych zbiorach najlepsze kandydatury dostają najgłębsze przeszukanie
-    mains = sorted((m for m in range(n) if compat[m]), key=lambda m: -price[m] / max(single[m], 50.0))
+    mains = sorted((m for m in market if compat[m] or forced), key=lambda m: -price[m] / max(single[m], 50.0))
     weights = [1.0 / (1.0 + k / 15.0) for k in range(len(mains))]
-    scale = opt.max_evaluations / max(sum(weights), 1e-9)
+    scale = max_evals / max(sum(weights), 1e-9)
     for m, w in zip(mains, weights):
-        if evals >= opt.max_evaluations:
+        if evals >= max_evals:
             stats["truncated"] = True
             break
         budget_end = evals + max(300, int(scale * w))
         cut = False
-        frontier = {frozenset([m]): ([2 * m, 2 * m + 1], float(single[m]))}
+        key0 = frozenset([m, *forced])
+        frontier = {key0: (list(seed[m][0]), float(seed[m][1]))}
+        if forced:                                  # sam własny ładunek + zlecenie główne też jest wariantem
+            f0 = plan.length(seed[m][0])
+            pr0 = score(key0, f0)
+            if key0 not in best or best[key0][0] < pr0:
+                best[key0] = (pr0, tuple(sorted(key0)), list(seed[m][0]), float(seed[m][1]))
         for _level in range(2, opt.hard_cap_orders + 1):
             new: dict[frozenset, tuple] = {}
             for key, (seq, total) in frontier.items():
@@ -263,7 +304,7 @@ def find_best_combinations(
                         continue
                     nseq, delta = ins
                     ntotal = total + delta
-                    if ntotal - single[m] > opt.max_detour_km:
+                    if ntotal - seed[m][1] > opt.max_detour_km:
                         continue
                     fk = key | {j}
                     if fk in new and new[fk][1] <= ntotal:

@@ -867,3 +867,75 @@ def test_password_check_and_db_backup(tmp_path):
     assert len(list((tmp_path / "bk").glob("*.db"))) <= 3 and Store(out).history_count() == 9
     mode = sqlite3.connect(tmp_path / "x.db").execute("PRAGMA journal_mode").fetchone()[0]
     assert mode == "wal"
+
+
+def test_waypoint_with_own_cargo_is_forced_into_every_variant():
+    from ltl.optimizer import Stop
+    from ltl.ownpoints import build_extra_points
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500),
+            ("C", 40.4, -3.7, 38.7, -9.1, 6.0, 10, 1500), ("D", 52.5, 13.5, 48.8, 2.4, 11.0, 18, 1800)]
+    df = _orders(rows)
+    stops, own, notes = build_extra_points(
+        [{"country": "DE", "postal": "50667", "desc": "Kolonia", "ldm": 3, "price": 400,
+          "drop_country": "FR", "drop_postal": "75001"}],
+        lambda c, p: (50.94, 6.96, "cache") if c == "DE" else (48.86, 2.34, "cache"))
+    assert not stops and not notes and list(own["id"]) == ["P1"] and own.loc[0, "ldm"] == 3
+    own = own.reindex(columns=df.columns.union(own.columns))
+    full = pd.concat([df, own], ignore_index=True)
+    v, _ = find_best_combinations(full, CostParams(), OptimizerParams(max_detour_km=800), None, (), ("P1",))
+    assert v and all("P1" in x.order_ids for x in v)                       # własny ładunek jest w każdym wariancie
+    assert all(x.peak_ldm <= 13.6 + 1e-9 for x in v)
+    assert not any({"D", "P1"} <= set(x.order_ids) and x.peak_ldm > 13.6 for x in v)   # D (11 LDM) + 3 LDM mieści się tylko po rozładunku
+    assert all(x.revenue >= 400 for x in v)
+    # odbiór własnego ładunku jest w punkcie dodatkowym, a zrzut po nim
+    t = [x for x in v if set(x.order_ids) >= {"A", "P1"}][0]
+    keys = [(s.order_id, s.kind) for s in t.stops]
+    assert keys.index(("P1", "L")) < keys.index(("P1", "U"))
+    # bez ceny = 0 EUR, ładunek za duży / bez zrzutu = zwykły przystanek z uwagą
+    s2, own2, n2 = build_extra_points(
+        [{"country": "PL", "postal": "00-001", "ldm": 5}, {"country": "PL", "postal": "00-002", "ldm": 20,
+                                                           "drop_postal": "10-001"}, {"postal": "00-003"}],
+        lambda c, p: (52.0, 21.0, "cache"))
+    assert len(s2) == 3 and own2.empty and len(n2) == 2
+    # tylko własny ładunek + jedno zlecenie z giełdy też daje wariant
+    v1, _ = find_best_combinations(pd.concat([df.iloc[[0]], own], ignore_index=True), CostParams(),
+                                   OptimizerParams(max_detour_km=800), None, (), ("P1",))
+    assert v1 and set(v1[0].order_ids) == {"A", "P1"}
+
+
+def test_file_formats_tabular_utf16_and_source_report():
+    import datetime, io
+    from ltl.ingest import UnreadableFile, parse_sources_report, read_uploaded
+    vert = (pathlib.Path(__file__).parent / "data" / "timocom_vertical.txt").read_text()
+    # UTF-16 (Excel „Tekst Unicode”, Notatnik) - kiedyś dawało 0 ofert
+    assert len(parse_sources([read_uploaded("a.txt", vert.encode("utf-16"))])) == 9
+    assert len(parse_sources([read_uploaded("a.txt", vert.encode("utf-16-le"))])) == 9
+    # arkusz: kraj, kod i miasto w osobnych kolumnach, data Excela, waga/LDM/cena, klient - rozpoznane po nagłówkach
+    df = pd.DataFrame([["DE", "20095", "Hamburg", "Polska", "00-001", "Warszawa", datetime.date(2026, 10, 30), 5.2, 3.5, 900.0, "ACME"],
+                       ["FR", "67100", "Strasburg", "IT", "20122", "Mediolan", datetime.date(2026, 10, 31), 8.0, 6.0, None, "Beta"]],
+                      columns=["Kraj zał", "Kod zał", "Miasto zał", "Kraj rozł", "Kod rozł", "Miasto rozł", "Data załadunku",
+                               "Waga (t)", "LDM", "Cena (EUR)", "Zleceniodawca"])
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False)
+    out = parse_sources([read_uploaded("o.xlsx", buf.getvalue())])
+    assert len(out) == 2 and out.start_country.tolist() == ["DE", "FR"] and out.end_country.tolist() == ["PL", "IT"]
+    assert out.end_postal.tolist() == ["00-001", "20122"] and out.ldm.tolist() == [3.5, 6.0]
+    assert out.price_eur.tolist()[0] == 900.0 and pd.isna(out.price_eur.iloc[1]) and out.client.tolist() == ["ACME", "Beta"]
+    assert str(out.load_date.iloc[0]) == "2026-10-30"
+    # csv ze średnikami w cp1250, ceny w PLN z nagłówka
+    csv_bytes = "Załadunek;Rozładunek;Waga (kg);LDM;Cena PLN\nDE 20095 Hamburg;PL 00-001 Warszawa;5200;3,5;4250\n".encode("cp1250")
+    one = parse_sources([read_uploaded("o.csv", csv_bytes)])
+    assert len(one) == 1 and one.weight_t.iloc[0] == 5.2 and abs(one.price_eur.iloc[0] - 1000.0) < 1
+    # raport źródeł: powtórzenia z innego źródła pomijane, puste źródło nie psuje wyniku
+    both, rep = parse_sources_report([("Wklejony tekst", vert), ("plik.txt", vert), ("pusty.txt", "")])
+    assert len(both) == 9 and rep[0]["kept"] == 9 and rep[1]["found"] == 9 and rep[1]["kept"] == 0 and rep[2]["empty"]
+    _, rep2 = parse_sources_report([("śmieci.txt", "to nie są oferty\nnic tu nie ma")])
+    assert rep2[0]["found"] == 0 and not rep2[0]["empty"]
+    try:
+        read_uploaded("zly.xlsx", b"to nie jest arkusz")
+        raise AssertionError("powinien być błąd")
+    except UnreadableFile as e:
+        assert "arkusz" in str(e)
+    # wklejka z giełdy zapisana jako .txt z tabulacjami (bez nagłówków) zostaje bez zmian
+    tab_txt = "DE 20095 Hamburg\tPL 00-001 Warszawa\t30.10.2026\t5,2 t\t900 EUR"
+    assert read_uploaded("w.txt", tab_txt.encode()) == tab_txt

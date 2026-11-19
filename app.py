@@ -12,9 +12,10 @@ from ltl.auth import password_ok
 from ltl.costs import CostParams, profit
 from ltl.eligibility import ALL_BODIES, DEFAULT_BODIES, FleetProfile, check_eligibility
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
-from ltl.ingest import clean_edited, parse_sources, read_uploaded
+from ltl.ingest import UnreadableFile, clean_edited, parse_sources_report, read_uploaded
 from ltl.mapview import route_map
 from ltl.optimizer import OptimizerParams, Stop, find_best_combinations
+from ltl.ownpoints import build_extra_points
 from ltl.ordertable import code_match, filter_orders, merge_edits, parse_codes
 from ltl.pricing import DEFAULT_RULES, RULE_COLUMNS, DIRECTION_LABELS, apply_price_rules, frame_to_rules, rules_to_frame
 from ltl.ranking import Ranked, rank_by_real_routes, ranked_to_frame, variant_key
@@ -103,14 +104,15 @@ def _store() -> Store:
 
 
 @st.cache_data(show_spinner="Rozpoznawanie zleceń…")
-def _parse(texts: tuple, drop_no_price: bool, pln_per_eur: float) -> pd.DataFrame:
-    return parse_sources(list(texts), drop_without_price=drop_no_price, pln_per_eur=pln_per_eur)  # format każdego źródła wykrywany automatycznie
+def _parse(named: tuple, drop_no_price: bool, pln_per_eur: float):
+    # format każdego źródła wykrywany automatycznie; zwraca (tabela, raport źródeł)
+    return parse_sources_report(list(named), drop_without_price=drop_no_price, pln_per_eur=pln_per_eur)
 
 
 @st.cache_data(show_spinner="Szukanie najlepszych doładunków…")
 def _search(orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Stop | None = None,
-            waypoints: tuple = ()):
-    return find_best_combinations(orders, cost, opt, origin, waypoints)
+            waypoints: tuple = (), forced_ids: tuple = ()):
+    return find_best_combinations(orders, cost, opt, origin, waypoints, forced_ids)
 
 
 _variant_key = variant_key
@@ -308,23 +310,53 @@ with st.expander(f"📂 Zapisane tabele zleceń ({len(_store().list_tables('orde
 
 if submitted:
     st.session_state.pop("loaded_name", None)
-    texts = [raw_text] + [read_uploaded(f.name, f.getvalue()) for f in files]
-    if any(t.strip() for t in texts):
+    named, read_errors = [("Wklejony tekst", raw_text)], []
+    for f in files:
+        try:
+            named.append((f.name, read_uploaded(f.name, f.getvalue())))
+        except UnreadableFile as e:
+            read_errors.append(f"Plik „{f.name}”: {e}.")
+    if any(t.strip() for _, t in named):
         prev = st.session_state.get("analysis", {}).get("id", 0)
-        st.session_state.analysis = {"id": prev + 1, "texts": tuple(texts), "drop": drop_no_price, "online": online,
-                                     "record": keep_history}
+        st.session_state.analysis = {"id": prev + 1, "texts": tuple(named), "drop": drop_no_price, "online": online,
+                                     "record": keep_history, "errors": read_errors}
         st.session_state.pop("ranked", None)
     else:
-        st.warning("Wklej oferty albo dodaj plik, a potem kliknij „Szukaj doładunków”.")
+        for msg in read_errors:
+            st.error(msg)
+        st.warning("Wklej oferty albo dodaj plik, a potem kliknij „Szukaj doładunków”." if not files else
+                   "Z dodanych plików nie udało się odczytać żadnych danych.")
 
 analysis = st.session_state.get("analysis")
 parsed = None
 if analysis:
-    parsed = analysis["df"] if "df" in analysis else _parse(analysis["texts"], analysis["drop"], pln_per_eur)
+    if "df" in analysis:
+        parsed, src_report = analysis["df"], []
+    else:
+        parsed, src_report = _parse(analysis["texts"], analysis["drop"], pln_per_eur)
     if analysis.get("record") and not analysis.get("recorded") and not parsed.empty:
         analysis["recorded"] = True       # raz na import
         rec = _store().record_offers(parsed)
         st.toast(f"Historia ofert: {rec['new']} nowych, {rec['repeated']} już znanych.", icon="📜")
+
+
+def source_notes(report: list, errors: list) -> None:
+    """Co wczytano z którego źródła (wklejony tekst, każdy plik): błędy, puste pliki, powtórzenia."""
+    for msg in errors:
+        st.error(msg)
+    used = [r for r in report if not r["empty"]]
+    for r in used:
+        if r["found"] == 0:
+            st.warning(f"„{r['name']}”: nie rozpoznano żadnych ofert. Potrzebne są kraj i kod pocztowy załadunku "
+                       "oraz rozładunku każdej oferty (np. „DE 20095 Hamburg”); w arkuszu pomagają nagłówki kolumn "
+                       "(Kraj zał., Kod zał., Kraj rozł., Kod rozł., Data, Waga, LDM, Cena).")
+    ok = [r for r in used if r["found"]]
+    if len(report) > 1 and ok and (len(ok) > 1 or any(r["name"] != "Wklejony tekst" for r in ok)):
+        parts = []
+        for r in ok:
+            dup = r["found"] - r["kept"]
+            parts.append(f"**{r['name']}**: {r['found']}" + (f" (w tym {dup} powtórzeń z innych źródeł pominięto)" if dup else ""))
+        st.caption("Wczytano ofert - " + " · ".join(parts))
 
 
 def render_history() -> None:
@@ -412,6 +444,7 @@ if not analysis:
     st.stop()
 
 if parsed.empty:
+    source_notes(src_report, analysis.get("errors", []))
     st.error("Nie rozpoznano żadnych zleceń. W danych muszą być kody w formacie „kraj kod” "
              "(np. FR 77140, GB G1 1) dla miejsca załadunku i rozładunku każdej oferty.")
     st.stop()
@@ -422,6 +455,7 @@ with st.container(border=True):
          f"{'Wczytano zapisaną tabelę „' + st.session_state['loaded_name'] + '”: ' if st.session_state.get('loaded_name') else 'Rozpoznano '}"
          f"{len(parsed)} ofert (źródło: {', '.join(sorted(set(parsed['source'])) or ['—'])}). "
          "Kliknij komórkę, aby poprawić wartość; wiersze można dodawać i usuwać. Zmiany od razu wchodzą do wyników.")
+    source_notes(src_report, analysis.get("errors", []))
     if st.session_state.get("work_for") != analysis["id"]:       # nowa analiza: nowy zbiór roboczy
         st.session_state.work = parsed.reset_index(drop=True)
         st.session_state.work_for = analysis["id"]
@@ -499,11 +533,16 @@ with st.container(border=True):
                                   help="Zapisuje tabelę z Twoimi poprawkami; można ją później wczytać w kroku 1.")
         overwrite = f2.checkbox("Nadpisz, jeśli nazwa już istnieje", key="save_overwrite")
         save_clicked = f3.form_submit_button("💾 Zapisz tabelę", width="stretch")
+    if st.session_state.get("save_flash"):
+        st.success(st.session_state.pop("save_flash"))
     if save_clicked:
         try:
             saved_as = _store().save_orders(save_name, orders, overwrite=overwrite)
             st.session_state.loaded_name = saved_as
-            st.success(f"Zapisano tabelę „{saved_as}” ({len(orders)} zleceń).")
+            # lista „Zapisane tabele” leży wyżej na stronie i była już narysowana: odświeżamy, żeby nowa tabela
+            # była od razu widoczna (inaczej wyglądało to tak, jakby zapis się nie udał)
+            st.session_state.save_flash = f"Zapisano tabelę „{saved_as}” ({len(orders)} zleceń)."
+            st.rerun()
         except NameExists:
             st.warning(f"Tabela „{save_name.strip()}” już istnieje - zaznacz „Nadpisz” albo wybierz inną nazwę.")
         except InvalidName as e:
@@ -598,38 +637,52 @@ with st.container(border=True):
             else:
                 o3.success(f"Start: {o_country} {o_postal} ({o_lat:.2f}, {o_lon:.2f}).")
     st.markdown("**Punkty dodatkowe (obowiązkowe)** - miejsca, które trasa musi zahaczyć po drodze (np. magazyn, "
-                "warsztat, dodatkowy odbiór bez ładunku). Każdy trafia w najtańsze miejsce trasy: po starcie, przed "
-                "ostatnim rozładunkiem.")
+                "warsztat). Każdy trafia w najtańsze miejsce trasy: po starcie, przed ostatnim rozładunkiem. "
+                "Opcjonalnie możesz podać **własny ładunek** zbierany w tym punkcie (LDM i/lub waga) oraz **miejsce "
+                "zrzutu** - taki ładunek jedzie w każdym wariancie razem ze zleceniami z giełdy (mieści się w limicie "
+                "13,6 LDM / 24 t), a cena jest opcjonalna (puste = 0 EUR).")
     wp_df = st.data_editor(
-        pd.DataFrame({"Kraj": pd.Series(dtype=str), "Kod pocztowy": pd.Series(dtype=str), "Opis": pd.Series(dtype=str)}),
+        pd.DataFrame({"Kraj": pd.Series(dtype=str), "Kod pocztowy": pd.Series(dtype=str),
+                      "Opis": pd.Series(dtype=str), "Ładunek LDM": pd.Series(dtype=float),
+                      "Ładunek (t)": pd.Series(dtype=float), "Cena (EUR)": pd.Series(dtype=float),
+                      "Zrzut: kraj": pd.Series(dtype=str), "Zrzut: kod": pd.Series(dtype=str),
+                      "Zrzut: opis": pd.Series(dtype=str)}),
         key="waypoints_editor", num_rows="dynamic", hide_index=True, width="stretch",
-        column_config={"Kraj": st.column_config.TextColumn("Kraj", max_chars=2, width="small", default="PL",
-                                                           help="Dwuliterowy kod kraju, np. PL."),
-                       "Kod pocztowy": st.column_config.TextColumn("Kod pocztowy", width="medium"),
-                       "Opis": st.column_config.TextColumn("Opis (opcjonalnie)", width="large")})
-    waypoints, wp_notes = [], []
-    for n_wp, r in enumerate(wp_df.itertuples(index=False), start=1):
-        wc, wpc = str(r[0] or "PL").strip().upper(), str(r[1] or "").strip()
-        if not wpc:
-            continue
-        if len(wc) != 2:
-            wp_notes.append(f"Punkt {n_wp}: podaj dwuliterowy kod kraju.")
-            continue
-        geocoder.prefetch([(wc, wpc)])
-        w_lat, w_lon, w_src = geocoder.locate(wc, wpc)
-        waypoints.append(Stop(order_id=f"P{len(waypoints) + 1}", kind="W", country=wc, postal=wpc,
-                              city=str(r[2] or "").strip(), lat=float(w_lat), lon=float(w_lon)))
-        if w_src == "kraj":
-            wp_notes.append(f"Punkt {wc} {wpc}: nie udało się zlokalizować kodu - użyto środka kraju.")
+        column_config={
+            "Kraj": st.column_config.TextColumn("Kraj", max_chars=2, width=55, default="PL",
+                                                help="Dwuliterowy kod kraju, np. PL."),
+            "Kod pocztowy": st.column_config.TextColumn("Kod", width=110),
+            "Opis": st.column_config.TextColumn("Opis (opcjonalnie)", width=160),
+            "Ładunek LDM": st.column_config.NumberColumn("LDM", min_value=0.0, max_value=13.6, format="%.1f",
+                                                         width=105, help="Pusty = punkt bez ładunku."),
+            "Ładunek (t)": st.column_config.NumberColumn("Tony", min_value=0.0, max_value=24.0, format="%.1f",
+                                                         width=95, help="Pusty = wyliczone z LDM."),
+            "Cena (EUR)": st.column_config.NumberColumn("Cena EUR", min_value=0.0, format="%.0f", width=90,
+                                                        help="Przychód za ten ładunek; puste = 0 (własny towar)."),
+            "Zrzut: kraj": st.column_config.TextColumn("Zrzut kraj", max_chars=2, width=95,
+                                                       help="Puste = ten sam kraj co punkt."),
+            "Zrzut: kod": st.column_config.TextColumn("Zrzut kod", width=95,
+                                                      help="Wymagany, gdy punkt ma ładunek."),
+            "Zrzut: opis": st.column_config.TextColumn("Zrzut opis", width=160)})
+    waypoints, own_orders, wp_notes = build_extra_points(
+        ({"country": r[0], "postal": r[1], "desc": r[2], "ldm": r[3], "weight": r[4], "price": r[5],
+          "drop_country": r[6], "drop_postal": r[7], "drop_desc": r[8]} for r in wp_df.itertuples(index=False)),
+        lambda c, p: (geocoder.prefetch([(c, p)]), geocoder.locate(c, p))[1])
     geocoder.save()
     for note in wp_notes:
         st.warning(note)
-    if waypoints:
-        st.caption("Punkty dodatkowe: " + ", ".join(f"📍 {w.order_id} {w.country} {w.postal} {w.city}".strip()
-                                                    for w in waypoints))
+    if len(waypoints) or len(own_orders):
+        st.caption("Punkty dodatkowe: " + ", ".join(
+            [f"📍 {w.order_id} {w.country} {w.postal} {w.city}".strip() for w in waypoints]
+            + [f"📍 {o.id} {o.start_country} {o.start_postal} ({o.ldm:g} LDM) → zrzut {o.end_country} {o.end_postal}"
+               for o in own_orders.itertuples()]))
 waypoints = tuple(waypoints)
+if len(own_orders):                      # własne ładunki: obowiązkowe zlecenia w każdym wariancie
+    orders_opt = pd.concat([orders_opt, own_orders.reindex(columns=orders_opt.columns)], ignore_index=True)
+    client_map = {**client_map, **dict(zip(own_orders["id"], own_orders["client"]))}
+forced_ids = tuple(own_orders["id"]) if len(own_orders) else ()
 origin_sig = None if origin is None else (origin.country, origin.postal, round(origin.lat, 4), round(origin.lon, 4))
-candidates, stats = _search(orders_opt, cost, opt, origin, waypoints)
+candidates, stats = _search(orders_opt, cost, opt, origin, waypoints, forced_ids)
 
 # ------------------------------------------------------- krok 3: warianty
 with st.container(border=True):
@@ -645,7 +698,8 @@ with st.container(border=True):
     # ranking po trasach rzeczywistych: liczony od razu, pamiętany do zmiany danych lub ustawień
     sig = (analysis["id"], hash(orders.drop(columns=["start_geo", "end_geo"]).to_csv()), cost, opt, provider,
            valhalla_url, ors_key, truck, route_opts, top_n, origin_sig,
-           tuple((w.country, w.postal, round(w.lat, 4), round(w.lon, 4)) for w in waypoints))
+           tuple((w.country, w.postal, round(w.lat, 4), round(w.lon, 4)) for w in waypoints),
+           hash(own_orders.to_csv()) if len(own_orders) else 0)
     cache = st.session_state.get("ranked")
     if not cache or cache["sig"] != sig:
         bar = st.progress(0.0, text="Wyznaczanie tras po drogach dla najlepszych wariantów…")

@@ -7,11 +7,23 @@ import io
 import pandas as pd
 
 from .parsers import COLUMNS, TEXT_COLUMNS, parse_orders
+from .tabular import has_header, rows_to_text
 
 TEXT_ENCODINGS = ("utf-8-sig", "cp1250", "latin-1")
 
 
+class UnreadableFile(Exception):
+    """Plik nie dał się odczytać (uszkodzony, nieobsługiwany format, brak biblioteki)."""
+
+
 def _decode(data: bytes) -> str:
+    # Excel „Tekst Unicode” i Notatnik „Unicode” zapisują UTF-16: bez tego tekst wychodzi jako śmieci
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace")
+    head = data[:400]
+    if head.count(b"\x00") > len(head) // 4:
+        enc = "utf-16-le" if head[1:2] == b"\x00" else "utf-16-be"
+        return data.decode(enc, errors="replace")
     for enc in TEXT_ENCODINGS:
         try:
             return data.decode(enc)
@@ -21,23 +33,29 @@ def _decode(data: bytes) -> str:
 
 
 def read_uploaded(name: str, data: bytes) -> str:
-    """Zamienia plik na tekst zrozumiały dla parsera (wiersze tabeli rozdzielone tabulacjami)."""
+    """Zamienia plik na tekst zrozumiały dla parsera (wiersze rozdzielone tabulacjami).
+
+    Arkusze i pliki z nagłówkami (kraj, kod, miasto, data, waga, LDM, cena…) są składane po nagłówkach
+    (patrz ltl.tabular). Zgłasza UnreadableFile z opisem problemu."""
     ext = name.lower().rsplit(".", 1)[-1] if "." in name else "txt"
     if ext in ("xlsx", "xlsm", "xls"):
-        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=str)
-        lines = []
-        for df in sheets.values():
-            for row in df.fillna("").itertuples(index=False):
-                lines.append("\t".join(str(c).strip() for c in row))
-        return "\n".join(lines)
+        try:
+            sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=str)
+        except ImportError as e:
+            raise UnreadableFile("brak biblioteki do plików .xls (zainstaluj xlrd) - zapisz plik jako .xlsx lub .csv") from e
+        except Exception as e:                      # uszkodzony plik, zły format, plik chroniony hasłem
+            raise UnreadableFile(f"nie udało się otworzyć arkusza ({type(e).__name__}) - zapisz go jako .xlsx lub .csv") from e
+        return "\n".join(t for t in (rows_to_text(df.fillna("").values.tolist()) for df in sheets.values()) if t)
     text = _decode(data)
-    if ext in ("csv", "tsv"):
+    if ext in ("csv", "tsv", "txt"):
         try:
             dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|")
-            rows = csv.reader(io.StringIO(text), dialect)
-            return "\n".join("\t".join(c.strip() for c in r) for r in rows)
+            rows = list(csv.reader(io.StringIO(text), dialect))
         except csv.Error:
-            pass
+            return text
+        if ext == "txt" and not has_header(rows):       # wklejka z giełdy zapisana do .txt zostaje bez zmian
+            return text
+        return rows_to_text(rows)
     return text
 
 
@@ -58,15 +76,31 @@ def drop_duplicate_offers(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def parse_sources(texts: list[str], **kwargs) -> pd.DataFrame:
-    """Parsuje każde źródło osobno (własny format), łączy wyniki, usuwa powtórzenia i nadaje unikalne numery."""
-    frames = [parse_orders(t, "Auto", **kwargs) for t in texts if t and t.strip()]
-    frames = [f for f in frames if not f.empty]
+def parse_sources_report(named: list[tuple[str, str]], **kwargs) -> tuple[pd.DataFrame, list[dict]]:
+    """Parsuje każde źródło (nazwa, tekst) osobno - każde może mieć inny format - łączy wyniki, usuwa powtórzenia
+    i nadaje unikalne numery. Raport: dla każdego źródła ile ofert rozpoznano i ile z nich weszło po usunięciu
+    powtórzeń (np. ten sam plik wklejony drugi raz)."""
+    frames, report = [], []
+    for k, (name, text) in enumerate(named):
+        if not text or not text.strip():
+            report.append({"name": name, "found": 0, "kept": 0, "empty": True})
+            continue
+        f = parse_orders(text, "Auto", **kwargs)
+        report.append({"name": name, "found": len(f), "kept": 0, "empty": False})
+        if not f.empty:
+            frames.append(f.assign(_src=k))
     if not frames:
-        return pd.DataFrame(columns=COLUMNS)
+        return pd.DataFrame(columns=COLUMNS), report
     df = drop_duplicate_offers(pd.concat(frames, ignore_index=True))
+    for k, n in df["_src"].value_counts().items():
+        report[int(k)]["kept"] = int(n)
+    df = df.drop(columns="_src")
     df["id"] = [f"{s[0]}{i}" for i, s in enumerate(df["source"], start=1)]
-    return df
+    return df, report
+
+
+def parse_sources(texts: list[str], **kwargs) -> pd.DataFrame:
+    return parse_sources_report([(f"źródło {i}", t) for i, t in enumerate(texts, start=1)], **kwargs)[0]
 
 
 def clean_edited(df: pd.DataFrame) -> pd.DataFrame:
