@@ -21,21 +21,33 @@ function Fail($m) { Write-Host "BŁĄD: $m" -ForegroundColor Red; exit 1 }
 Step "Sprawdzanie wymagań"
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) { Fail "Uruchom PowerShell jako administrator." }
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Fail "Brak Git. Zainstaluj: https://git-scm.com/download/win" }
+$hasGit = [bool](Get-Command git -ErrorAction SilentlyContinue)
+$inRepo = (Test-Path "docker-compose.yml") -and (Test-Path "deploy\install.ps1")
+if (-not $hasGit -and -not $inRepo) { Fail "Brak Git. Zainstaluj: https://git-scm.com/download/win (albo uruchom skrypt z katalogu projektu pobranego przez GitHub Desktop)." }
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { Fail "Brak Dockera. Zainstaluj Docker Desktop: https://www.docker.com/products/docker-desktop/" }
 docker info *> $null
 if ($LASTEXITCODE -ne 0) { Fail "Docker nie odpowiada. Uruchom Docker Desktop, poczekaj aż pokaże 'Running', i spróbuj ponownie." }
 
-Step "Pobieranie programu do $InstallDir"
-if (Test-Path (Join-Path $InstallDir ".git")) {
-    git -C $InstallDir fetch origin $Branch
-    git -C $InstallDir checkout $Branch
-    git -C $InstallDir pull origin $Branch
-} elseif ((Test-Path "docker-compose.yml") -and (Test-Path ".git")) {
+if ($inRepo) {
+    # skrypt uruchomiony w katalogu projektu (np. sklonowanym przez GitHub Desktop): używamy go bez klonowania
     $InstallDir = (Get-Location).Path
-    Write-Host "Używam bieżącego katalogu: $InstallDir"
+    Step "Używam bieżącego katalogu: $InstallDir"
+    if ($hasGit -and (Test-Path ".git")) {
+        git fetch origin $Branch 2>$null
+        git checkout $Branch 2>$null
+        git pull origin $Branch 2>$null
+    } else {
+        Write-Host "Brak Gita w PowerShellu - pomijam pobieranie zmian (zaktualizuj projekt w GitHub Desktop: Fetch/Pull na gałęzi $Branch)."
+    }
 } else {
-    git clone --branch $Branch $Repo $InstallDir
+    Step "Pobieranie programu do $InstallDir"
+    if (Test-Path (Join-Path $InstallDir ".git")) {
+        git -C $InstallDir fetch origin $Branch
+        git -C $InstallDir checkout $Branch
+        git -C $InstallDir pull origin $Branch
+    } else {
+        git clone --branch $Branch $Repo $InstallDir
+    }
 }
 Set-Location $InstallDir
 
