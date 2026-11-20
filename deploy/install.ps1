@@ -4,13 +4,13 @@
      Set-ExecutionPolicy -Scope Process Bypass -Force
      .\deploy\install.ps1                      # pierwsza instalacja z klonowaniem repozytorium
  lub, jeśli repozytorium już masz:   cd C:\umoyalogis ; .\deploy\install.ps1
- Parametry: -InstallDir C:\umoyalogis  -Port 8501  -Branch claude/ltl-route-optimizer-8v6qec  -Valhalla
+ Parametry: -InstallDir C:\umoyalogis  -Port 8501  -Branch Optymalizator_tras_LTL_serwer4  -Valhalla
 #>
 param(
     [string]$InstallDir = "C:\umoyalogis",
     [int]$Port = 8501,
     [string]$Repo = "https://github.com/DomTom23/UmoyaLogis.git",
-    [string]$Branch = "claude/ltl-route-optimizer-8v6qec",
+    [string]$Branch = "Optymalizator_tras_LTL_serwer4",
     [switch]$Valhalla
 )
 $ErrorActionPreference = "Stop"

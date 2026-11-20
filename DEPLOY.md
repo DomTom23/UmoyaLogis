@@ -15,7 +15,7 @@ wszystkich i leżą w katalogu `data/` na serwerze.
 **Najprościej (skrypt):** w PowerShellu jako administrator
 
 ```powershell
-git clone --branch claude/ltl-route-optimizer-8v6qec https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
+git clone --branch Optymalizator_tras_LTL_serwer4 https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
 cd C:\umoyalogis
 Set-ExecutionPolicy -Scope Process Bypass -Force
 .\deploy\install.ps1
@@ -32,7 +32,7 @@ W PowerShellu:
 ```powershell
 git clone https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
 cd C:\umoyalogis
-git checkout claude/ltl-route-optimizer-8v6qec
+git checkout Optymalizator_tras_LTL_serwer4
 copy .env.example .env
 notepad .env                 # ustaw APP_PASSWORD (wspólne hasło) i ewentualnie VALHALLA_URL
 docker compose up -d --build
