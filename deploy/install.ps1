@@ -94,7 +94,7 @@ schtasks /Create /TN $task /SC DAILY /ST 02:00 /TR $cmd /F | Out-Null
 Write-Host "Zadanie '$task' ustawione (kopie w $InstallDir\data\backups)."
 
 Step "Gotowe"
-$ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike "169.*" -and $_.IPAddress -ne "127.0.0.1" -and $_.PrefixOrigin -ne "WellKnown" } | Select-Object -First 1).IPAddress
+$ip = (Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -eq "Up" } | Select-Object -First 1).IPv4Address.IPAddress
 Write-Host "Aplikacja dziala. Na tym komputerze:  http://localhost:$Port" -ForegroundColor Green
 if ($ip) { Write-Host "Z innych komputerow w biurze:        http://${ip}:$Port   (nadaj serwerowi staly adres IP w routerze)" -ForegroundColor Green }
 Write-Host "Logi: docker compose logs -f app   |   Aktualizacja: ponownie uruchom ten skrypt"
