@@ -4,13 +4,14 @@
      Set-ExecutionPolicy -Scope Process Bypass -Force
      .\deploy\install.ps1                      # pierwsza instalacja z klonowaniem repozytorium
  lub, jesli repozytorium juz masz:   cd C:\umoyalogis ; .\deploy\install.ps1
- Parametry: -InstallDir C:\umoyalogis  -Port 8501  -Branch Optymalizator_tras_LTL_serwer4  -Valhalla
+ Parametry: -InstallDir C:\umoyalogis  -Port 8501  -BackupTime 15:30  -Branch Optymalizator_tras_LTL_serwer4  -Valhalla
 #>
 param(
     [string]$InstallDir = "C:\umoyalogis",
     [int]$Port = 8501,
     [string]$Repo = "https://github.com/DomTom23/UmoyaLogis.git",
     [string]$Branch = "Optymalizator_tras_LTL_serwer4",
+    [string]$BackupTime = "15:30",
     [switch]$Valhalla
 )
 $ErrorActionPreference = "Continue"   # Docker pisze postep na stderr - nie traktujemy tego jako blad; kody wyjscia sprawdzamy sami
@@ -87,10 +88,10 @@ if (-not (Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue))
     Write-Host "Dodano regule zapory dla portu $Port (profil: Prywatna)."
 } else { Write-Host "Regula zapory juz istnieje." }
 
-Step "Codzienna kopia zapasowa bazy (2:00)"
+Step "Codzienna kopia zapasowa bazy ($BackupTime czasu lokalnego komputera)"
 $task = "Umoyalogis backup"
 $cmd = "cmd /c cd /d `"$InstallDir`" && docker compose exec -T app python scripts/backup_db.py /data/backups 30"
-schtasks /Create /TN $task /SC DAILY /ST 02:00 /TR $cmd /F | Out-Null
+schtasks /Create /TN $task /SC DAILY /ST $BackupTime /TR $cmd /F | Out-Null
 Write-Host "Zadanie '$task' ustawione (kopie w $InstallDir\data\backups)."
 
 Step "Gotowe"

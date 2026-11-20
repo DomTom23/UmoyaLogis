@@ -74,10 +74,10 @@ Kopia bazy (spójna także przy pracującej aplikacji), 30 ostatnich zostaje:
 docker compose exec -T app python scripts/backup_db.py /data/backups 30
 ```
 
-Codzienne wykonanie o 2:00 (Harmonogram zadań):
+Codzienne wykonanie o 15:30 (godzina lokalna komputera; skrypt instalacyjny ustawia to sam, parametr -BackupTime) (Harmonogram zadań):
 
 ```powershell
-schtasks /Create /TN "Umoyalogis backup" /SC DAILY /ST 02:00 /TR "cmd /c cd /d C:\umoyalogis && docker compose exec -T app python scripts/backup_db.py /data/backups 30"
+schtasks /Create /TN "Umoyalogis backup" /SC DAILY /ST 15:30 /TR "cmd /c cd /d C:\umoyalogis && docker compose exec -T app python scripts/backup_db.py /data/backups 30"
 ```
 
 Kopie trafiają do `C:\umoyalogis\data\backups`. Skopiuj je okresowo na drugi dysk lub dysk sieciowy: lustro dysków
