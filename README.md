@@ -81,7 +81,7 @@ wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląd
 * **Szukanie po kodach pocztowych** (Trans.eu nie kopiuje nazwy zleceniodawcy): pola „Kod załadunku / rozładunku”
   w tabeli zleceń i w historii oraz „Kod pocztowy w wariancie” przyjmują początek kodu z krajem lub bez
   (`DE 20, FR 77, 00-0`). Po wyborze wariantu tabela „Zlecenia w wariancie” podaje kody do wyszukania na giełdzie.
-* **Miejsce startu pojazdu:** pole „Kraj” + „Kod pocztowy startu” (między krokiem 2 a 3). Wszystkie warianty są liczone od
+* **Krok 3 „Start pojazdu i punkty dodatkowe”:** pole „Kraj” + „Kod pocztowy startu” (między krokiem 2 a 3). Wszystkie warianty są liczone od
   tego miejsca: dojazd na pierwszy załadunek to puste kilometry w kosztach i zysku, wpływa też na kolejność punktów i
   ranking. Na mapie start to niebieska pinezka „S”, a w tabelach 🏁. Pusty kod = liczenie od pierwszego załadunku.
 * **Punkty dodatkowe (obowiązkowe):** tabela pod miejscem startu (kraj, kod, opis; można dodać kilka; opcjonalnie własny ładunek: LDM, tony, cena, data odbioru i miejsce zrzutu - jedzie w każdym wariancie; zlecenia z giełdy muszą mieć załadunek w limicie dni od daty odbioru). Trasa każdego
