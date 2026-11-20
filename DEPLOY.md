@@ -15,7 +15,7 @@ wszystkich i leżą w katalogu `data/` na serwerze.
 **Najprościej (skrypt):** w PowerShellu jako administrator
 
 ```powershell
-git clone --branch claude/ltl-route-optimizer-8v6qec https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
+git clone --branch Optymalizator_tras_LTL_serwer4 https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
 cd C:\umoyalogis
 Set-ExecutionPolicy -Scope Process Bypass -Force
 .\deploy\install.ps1
@@ -32,7 +32,7 @@ W PowerShellu:
 ```powershell
 git clone https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
 cd C:\umoyalogis
-git checkout claude/ltl-route-optimizer-8v6qec
+git checkout Optymalizator_tras_LTL_serwer4
 copy .env.example .env
 notepad .env                 # ustaw APP_PASSWORD (wspólne hasło) i ewentualnie VALHALLA_URL
 docker compose up -d --build
@@ -74,10 +74,10 @@ Kopia bazy (spójna także przy pracującej aplikacji), 30 ostatnich zostaje:
 docker compose exec -T app python scripts/backup_db.py /data/backups 30
 ```
 
-Codzienne wykonanie o 2:00 (Harmonogram zadań):
+Codzienne wykonanie o 15:30 (godzina lokalna komputera; skrypt instalacyjny ustawia to sam, parametr -BackupTime) (Harmonogram zadań):
 
 ```powershell
-schtasks /Create /TN "Umoyalogis backup" /SC DAILY /ST 02:00 /TR "cmd /c cd /d C:\umoyalogis && docker compose exec -T app python scripts/backup_db.py /data/backups 30"
+schtasks /Create /TN "Umoyalogis backup" /SC DAILY /ST 15:30 /TR "cmd /c cd /d C:\umoyalogis && docker compose exec -T app python scripts/backup_db.py /data/backups 30"
 ```
 
 Kopie trafiają do `C:\umoyalogis\data\backups`. Skopiuj je okresowo na drugi dysk lub dysk sieciowy: lustro dysków
