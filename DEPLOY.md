@@ -12,6 +12,21 @@ wszystkich i leżą w katalogu `data/` na serwerze.
 
 ## 2. Pierwsze uruchomienie
 
+**Najprościej (skrypt):** w PowerShellu jako administrator
+
+```powershell
+git clone --branch claude/ltl-route-optimizer-8v6qec https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
+cd C:\umoyalogis
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\deploy\install.ps1
+```
+
+Skrypt sprawdza Docker i Git, tworzy `.env` z losowym hasłem (wypisze je na ekranie), buduje i uruchamia aplikację,
+czeka na gotowość, otwiera port w zaporze (tylko sieć prywatna), ustawia codzienną kopię zapasową i podaje adres dla
+biura. Ten sam skrypt służy do aktualizacji. Dodatkowo `-Valhalla` uruchamia też własny serwer tras (sekcja 8).
+
+**Ręcznie** (to samo krok po kroku):
+
 W PowerShellu:
 
 ```powershell
@@ -83,7 +98,7 @@ i uruchom (`docker compose start`).
 Jest: wszystkie funkcje aplikacji, wspólna baza dla biura, wspólne hasło, kopie zapasowe, start po restarcie.
 
 Nie ma (kolejne kroki, w kolejności ważności):
-1. **Własny serwer tras Valhalla.** Publiczny serwer (`valhalla1.openstreetmap.de`) ma limit 1500 km na zapytanie
+1. **Własny serwer tras Valhalla** (instrukcja w sekcji 8). Publiczny serwer (`valhalla1.openstreetmap.de`) ma limit 1500 km na zapytanie
    (aplikacja dzieli trasy na odcinki), jest współdzielony i nie jest przeznaczony do codziennego ruchu kilku osób.
    Własny serwer wymaga zbudowania kafli dla Europy (kilkadziesiąt GB, wiele godzin) - warto go postawić od razu po
    uruchomieniu wersji początkowej.
@@ -96,3 +111,30 @@ Nie ma (kolejne kroki, w kolejności ważności):
 Każda osoba ma własną sesję (wklejone oferty, filtry, punkty na mapie), a wspólne są: baza (historia, zapisane tabele),
 pamięć podręczna kodów pocztowych i tras. Wyszukiwanie na kilkuset ofertach potrafi zająć do ok. 30 s i obciąża jeden
 rdzeń, więc przy kilku osobach naraz ostatnia może chwilę poczekać. Przy 8-10 osobach pracujących na zmianę to bez problemu.
+
+## 8. Własny serwer tras (Valhalla)
+
+Plik `docker-compose.valhalla.yml` dodaje do aplikacji własny serwer tras dla ciężarówek, bez limitu 1500 km na zapytanie
+i bez współdzielenia z innymi użytkownikami:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.valhalla.yml up -d
+```
+
+(albo `.\deploy\install.ps1 -Valhalla`). Aplikacja łączy się z nim sama (`VALHALLA_URL=http://valhalla:8002`).
+
+Co warto wiedzieć przed startem:
+
+* **Pierwsze uruchomienie buduje kafle z map** pobranych z Geofabrik (lista krajów w pliku `docker-compose.valhalla.yml`).
+  Dla ok. 12 krajów to kilkadziesiąt GB na dysku i od kilku do kilkunastu godzin pracy. W tym czasie aplikacja działa
+  na publicznym serwerze tras albo w trybie linii prostych. Postęp: `docker compose logs -f valhalla`.
+* **Pamięć.** Docker Desktop przydziela WSL2 domyślnie połowę RAM-u. Przy 16 GB RAM i budowie kafli dla wielu krajów
+  ustaw w `C:\Users\<ty>\.wslconfig`: `[wsl2]` / `memory=12GB`, potem `wsl --shutdown` i restart Dockera. Jeśli budowa
+  się wywala (brak pamięci), zmniejsz listę krajów albo buduj je po kilka.
+* **Kafle lądują w `valhalla_data\`** (zostają po restarcie; mapy odświeżaj raz na kilka miesięcy: usuń ten katalog
+  i uruchom ponownie).
+* **Uwaga:** ten plik compose nie był przetestowany na prawdziwym Dockerze (środowisko, w którym powstał, nie miało
+  Dockera). Jeśli obraz zgłosi nieznaną zmienną, sprawdź jej nazwę w opisie obrazu `gis-ops/docker-valhalla` i popraw
+  plik.
+* Czy działa: w aplikacji wyszukaj wariant i sprawdź, czy komunikat pod mapą mówi „Trasa po drogach dla ciężarówek
+  (Valhalla…)” bez ostrzeżeń o odcinkach liczonych linią prostą.
