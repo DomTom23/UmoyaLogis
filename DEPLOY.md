@@ -131,8 +131,11 @@ Co warto wiedzieć przed startem:
 * **Pamięć.** Docker Desktop przydziela WSL2 domyślnie połowę RAM-u. Przy 16 GB RAM i budowie kafli dla wielu krajów
   ustaw w `C:\Users\<ty>\.wslconfig`: `[wsl2]` / `memory=12GB`, potem `wsl --shutdown` i restart Dockera. Jeśli budowa
   się wywala (brak pamięci), zmniejsz listę krajów albo buduj je po kilka.
-* **Kafle lądują w `valhalla_data\`** (zostają po restarcie; mapy odświeżaj raz na kilka miesięcy: usuń ten katalog
-  i uruchom ponownie).
+* **Kafle lądują w wolumenie Dockera `valhalla_data`** (zostają po restarcie). Odświeżanie map raz na kilka miesięcy:
+  `docker compose -f docker-compose.yml -f docker-compose.valhalla.yml down`, `docker volume rm umoyalogis_valhalla_data`
+  (nazwa może mieć inny prefiks - sprawdź `docker volume ls`) i uruchom ponownie.
+* **Dla 32 GB RAM i ok. 350 GB dysku** wystarczy ustawienie `memory=24GB` w `.wslconfig` (jak wyżej); lista 12 krajów
+  zajmie ok. 40-80 GB. Wszystko jest na dysku C: (wirtualny dysk Dockera), więc tam musi być wolne miejsce.
 * **Uwaga:** ten plik compose nie był przetestowany na prawdziwym Dockerze (środowisko, w którym powstał, nie miało
   Dockera). Jeśli obraz zgłosi nieznaną zmienną, sprawdź jej nazwę w opisie obrazu `gis-ops/docker-valhalla` i popraw
   plik.

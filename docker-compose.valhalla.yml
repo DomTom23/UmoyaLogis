@@ -10,7 +10,7 @@ services:
     ports:
       - "127.0.0.1:8002:8002"        # tylko z tego komputera; aplikacja łączy się przez sieć Dockera
     volumes:
-      - ./valhalla_data:/custom_files
+      - valhalla_data:/custom_files   # wolumen Dockera (szybszy niz folder Windows; dane zostaja po restarcie)
     environment:
       # kraje, po których jeździmy (Geofabrik). Dodawaj/usuwaj wpisy; mniej krajów = szybciej i mniej RAM-u
       tile_urls: >-
@@ -31,7 +31,7 @@ services:
       build_admins: "True"
       build_time_zones: "False"
       serve_tiles: "True"
-      server_threads: "4"
+      server_threads: "6"
       # bez limitu 1500 km na zapytanie (publiczny serwer ma 1500 km)
       service_limits_truck_max_distance: "5000000"
       service_limits_max_exclude_polygons_length: "100000"
@@ -40,3 +40,6 @@ services:
       VALHALLA_URL: http://valhalla:8002
     depends_on:
       - valhalla
+
+volumes:
+  valhalla_data:
