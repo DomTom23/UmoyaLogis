@@ -120,3 +120,9 @@ wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląd
   tabeli powód „duplikat Tn” i nie wchodzą do wariantów.
 * Ten sam ładunek ofertowany kilka razy (np. z różnymi stawkami) nigdy nie trafia do jednego wariantu dwa razy.
 * Stratne warianty (zysk ≤ 0) są ukrywane.
+
+## Interfejs (zakładki etapów)
+
+Aplikacja jest podzielona na pięć zakładek: **1 · Dane**, **2 · Zlecenia**, **3 · Start i punkty**, **4 · Warianty**, **5 · Trasa**.
+Po „Szukaj doładunków” widok sam przechodzi do zakładki Zlecenia, a przyciski „Dalej →” prowadzą do kolejnych etapów.
+Wygląd (kolory, czcionka Inter) ustawia `.streamlit/config.toml` oraz `ltl/ui.py`. Wymaga Streamlit ≥ 1.67.

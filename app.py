@@ -25,10 +25,13 @@ from ltl.schedule import ScheduleParams, from_h, order_windows
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
 from ltl.routing import VALHALLA_URL, RouteOptions, RouteResult, TruckProfile
 from ltl.sample import SAMPLE_TEXT
+from ltl.ui import STAGES, STAGE_KEY, cards, empty_state, go_to, hero, inject_css, kpis, next_button, step
 from ltl.variant_detail import order_table, route_chain_html, stop_table
 from ltl.storage import OUTCOMES, InvalidName, NameExists, Store
 
 st.set_page_config(page_title="Optymalizator Tras LTL", page_icon="🚛", layout="wide")
+
+inject_css()
 
 # opcjonalne wspólne hasło (serwer biurowy): ustaw APP_PASSWORD w pliku .env
 _APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
@@ -43,52 +46,10 @@ if _APP_PASSWORD and not st.session_state.get("authed"):
             st.error("Nieprawidłowe hasło.")
     st.stop()
 
-st.markdown("""
-<style>
-  .block-container { padding-top: 2rem; max-width: 1400px; }
-  .step { display: flex; align-items: center; gap: .6rem; margin: .2rem 0 .4rem 0; font-size: 1.35rem; font-weight: 650; }
-  .step .n { background: #1f6feb; color: #fff; width: 1.9rem; height: 1.9rem; border-radius: 50%;
-             display: inline-flex; align-items: center; justify-content: center; font-size: 1rem; }
-  .hint { opacity: .75; font-size: .92rem; margin-bottom: .6rem; }
-  .kpis { display: flex; flex-wrap: wrap; gap: .6rem 1rem; margin: .4rem 0 .6rem 0; }
-  .kpi { flex: 1 1 125px; min-width: 110px; }
-  .kpi .l { font-size: .85rem; opacity: .7; }
-  .kpi .v { font-size: 1.45rem; font-weight: 600; line-height: 1.25; white-space: nowrap; }
-  .kpi .d { font-size: .8rem; opacity: .8; }
-  .kpi .d.pos { color: #1a9850; } .kpi .d.neg { color: #d73027; }
-  .chain { margin: .2rem 0 .6rem 0; line-height: 1.9; }
-  .anchor { scroll-margin-top: 4rem; }
-  .nav { display: flex; flex-wrap: wrap; gap: .4rem .6rem; align-items: center; margin: .1rem 0 .8rem 0; font-size: .92rem; }
-  .nav a { text-decoration: none; padding: .15rem .65rem; border-radius: 999px; border: 1px solid rgba(128,128,128,.35); color: inherit; }
-  .nav a:hover { background: rgba(31,111,235,.12); border-color: #1f6feb; }
-  .nav .sum { opacity: .75; margin-left: .4rem; }
-  .best { border-left: 5px solid #1a9850; padding: .5rem .9rem; background: rgba(26,152,80,.08);
-          border-radius: 6px; margin-bottom: .8rem; }
-</style>
-""", unsafe_allow_html=True)
-
-
-def step(n, title: str, hint: str = "") -> None:
-    st.markdown(f"<div id='krok-{n}' class='anchor'></div><div class='step'><span class='n'>{n}</span>{title}</div>",
-                unsafe_allow_html=True)
-    if hint:
-        st.markdown(f"<div class='hint'>{hint}</div>", unsafe_allow_html=True)
 
 
 def plural(n: int) -> str:
     return "zlecenie" if n == 1 else "zlecenia" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "zleceń"
-
-
-def kpis(items: list[tuple]) -> None:
-    """Wskaźniki w układzie, który zawija się na wąskich ekranach (st.metric ucina wartości w wąskich kolumnach).
-    items: (etykieta, wartość, podpis | None, 'pos' | 'neg' | '', podpowiedź)."""
-    parts = []
-    for label, value, delta, tone, help_ in items:
-        delta_html = "<div class='d %s'>%s</div>" % (tone, delta) if delta else ""
-        parts.append("<div class='kpi' title='%s'><div class='l'>%s</div><div class='v'>%s</div>%s</div>"
-                     % (help_, label, value, delta_html))
-    html = "".join(parts)
-    st.markdown(f"<div class='kpis'>{html}</div>", unsafe_allow_html=True)
 
 
 def eur(x: float) -> str:
@@ -283,11 +244,15 @@ opt = OptimizerParams(max_detour_km=max_detour, top_n=max(n_check, top_n),   # k
                       hard_cap_orders=max_orders, max_load_date_gap_days=int(date_gap) or None)
 
 # ------------------------------------------------------------------ nagłówek
-st.title("🚛 Optymalizator Tras LTL")
-st.caption("Wklej oferty z giełdy, a aplikacja znajdzie najbardziej opłacalne doładunki "
-           "(naczepa 13,6 LDM / 24 t, trasa kończy się na ostatnim rozładunku).")
+HERO_TITLE = "🚛 Optymalizator tras LTL"
+HERO_SUB = "Wklej oferty z giełdy, a aplikacja znajdzie najbardziej opłacalne doładunki: naczepa 13,6 LDM / 24 t, terminy i trasy po drogach."
+hero_slot = st.empty()          # nagłówek ze wskaźnikami; dopisujemy je na końcu skryptu, gdy znane są wyniki
+with hero_slot:
+    hero(HERO_TITLE, HERO_SUB)
 
-nav_slot = st.empty()          # pasek skrótów do kroków; wypełniany na końcu skryptu (znane są już wyniki)
+# etapy pracy: zakładki (wszystkie są zawsze „narysowane”, więc wpisane dane nie giną przy przełączaniu)
+tab_data, tab_orders, tab_start, tab_variants, tab_route = st.tabs(STAGES, key=STAGE_KEY, on_change="rerun")
+
 
 # ------------------------------------------------------------ krok 1: dane
 st.session_state.setdefault("uploader_n", 0)
@@ -304,11 +269,16 @@ def _clear_all() -> None:
     st.session_state.uploader_n += 1
 
 
-_has_data = bool(st.session_state.get("analysis"))
-with (st.expander("1 · Dane z giełdy - zmień lub dodaj oferty", expanded=False) if _has_data
-      else st.container(border=True)):
-    if not _has_data:
-        step(1, "Dane z giełdy", "Wklej tekst z Timocom lub Trans.eu i/lub dodaj pliki. Format jest rozpoznawany automatycznie.")
+def _after_search() -> None:
+    """Po „Szukaj” przechodzimy od razu do sprawdzania zleceń (o ile coś wklejono lub dodano)."""
+    has_text = bool(str(st.session_state.get("raw_text", "")).strip())
+    has_files = bool(st.session_state.get(f"files_{st.session_state.uploader_n}"))
+    if has_text or has_files:
+        go_to(1)
+
+
+with tab_data:
+    step(1, "Dane z giełdy", "Wklej tekst z Timocom lub Trans.eu i/lub dodaj pliki. Format jest rozpoznawany automatycznie.")
     with st.form("input_form", border=False):
         left, right = st.columns([3, 2])
         raw_text = left.text_area("Wklejone oferty", key="raw_text", height=190,
@@ -323,8 +293,9 @@ with (st.expander("1 · Dane z giełdy - zmień lub dodaj oferty", expanded=Fals
         keep_history = st.checkbox("Zapisz oferty w historii", value=True, key="opt_history",
                                    help="Każdy import trafia do historii ofert (bez duplikatów); w historii można "
                                         "szukać po zleceniodawcy i wpisywać ceny zrealizowane.")
-        submitted = st.form_submit_button("🔍 Szukaj doładunków", type="primary", width="stretch")
-    b1, b2, _ = st.columns([1, 1, 4])
+        submitted = st.form_submit_button("🔍 Szukaj doładunków", type="primary", width="stretch",
+                                          on_click=_after_search)
+    b1, b2, _ = st.columns([1.7, 1.2, 3])
     b1.button("📋 Wczytaj przykład", on_click=_load_example, width="stretch")
     b2.button("🗑️ Wyczyść", on_click=_clear_all, width="stretch")
 
@@ -339,6 +310,7 @@ def _load_saved(name: str) -> None:
                                  "online": st.session_state.get("opt_online", True)}
     st.session_state.pop("ranked", None)
     st.session_state.loaded_name = st.session_state.save_name = name
+    go_to(1)
     st.toast(f"Wczytano tabelę „{name}” ({len(df)} zleceń).", icon="📂")
 
 
@@ -347,38 +319,41 @@ def _delete_saved(name: str) -> None:
         st.toast(f"Usunięto tabelę „{name}”.", icon="🗑️")
 
 
-with st.expander(f"📂 Zapisane tabele zleceń ({len(_store().list_tables('orders'))})"):
-    saved = _store().list_tables("orders")
-    if saved.empty:
-        st.caption("Nic jeszcze nie zapisano. Po wczytaniu danych użyj „Zapisz tabelę” w kroku 2.")
-    else:
-        info = {r.name: f"{r.name} · {r.n_rows} zleceń · {r.updated_at.replace('T', ' ')}" for r in saved.itertuples()}
-        choice = st.selectbox("Wybierz zapisaną tabelę", list(info), format_func=info.get, key="saved_choice")
-        c_load, c_del, c_ok = st.columns([1, 1, 2])
-        c_load.button("📂 Wczytaj", on_click=_load_saved, args=(choice,), width="stretch", key="btn_load_saved")
-        confirm = c_ok.checkbox("Potwierdzam usunięcie", key="confirm_delete")
-        c_del.button("🗑️ Usuń", on_click=_delete_saved, args=(choice,), width="stretch", disabled=not confirm,
-                     key="btn_del_saved")
+with tab_data:
+    with st.expander(f"📂 Zapisane tabele zleceń ({len(_store().list_tables('orders'))})"):
+        saved = _store().list_tables("orders")
+        if saved.empty:
+            st.caption("Nic jeszcze nie zapisano. Po wczytaniu danych użyj „Zapisz tabelę” w kroku 2.")
+        else:
+            info = {r.name: f"{r.name} · {r.n_rows} zleceń · {r.updated_at.replace('T', ' ')}" for r in saved.itertuples()}
+            choice = st.selectbox("Wybierz zapisaną tabelę", list(info), format_func=info.get, key="saved_choice")
+            c_load, c_del, c_ok = st.columns([1, 1, 2])
+            c_load.button("📂 Wczytaj", on_click=_load_saved, args=(choice,), width="stretch", key="btn_load_saved")
+            confirm = c_ok.checkbox("Potwierdzam usunięcie", key="confirm_delete")
+            c_del.button("🗑️ Usuń", on_click=_delete_saved, args=(choice,), width="stretch", disabled=not confirm,
+                         key="btn_del_saved")
 
-if submitted:
-    st.session_state.pop("loaded_name", None)
-    named, read_errors = [("Wklejony tekst", raw_text)], []
-    for f in files:
-        try:
-            named.append((f.name, read_uploaded(f.name, f.getvalue())))
-        except UnreadableFile as e:
-            read_errors.append(f"Plik „{f.name}”: {e}.")
-    if any(t.strip() for _, t in named):
-        prev = st.session_state.get("analysis", {}).get("id", 0)
-        st.session_state.analysis = {"id": prev + 1, "texts": tuple(named), "drop": drop_no_price, "online": online,
-                                     "record": keep_history, "errors": read_errors}
-        st.session_state.pop("ranked", None)
-        st.rerun()                   # od razu zwija krok 1 (inaczej strona przeskoczyłaby przy następnym kliknięciu)
-    else:
-        for msg in read_errors:
-            st.error(msg)
-        st.warning("Wklej oferty albo dodaj plik, a potem kliknij „Szukaj doładunków”." if not files else
-                   "Z dodanych plików nie udało się odczytać żadnych danych.")
+input_problems: list[tuple] = []      # (poziom, komunikat) - pokazujemy też w zakładce Zlecenia, bo tam przeskakuje widok
+with tab_data:
+    if submitted:
+        st.session_state.pop("loaded_name", None)
+        named, read_errors = [("Wklejony tekst", raw_text)], []
+        for f in files:
+            try:
+                named.append((f.name, read_uploaded(f.name, f.getvalue())))
+            except UnreadableFile as e:
+                read_errors.append(f"Plik „{f.name}”: {e}.")
+        if any(t.strip() for _, t in named):
+            prev = st.session_state.get("analysis", {}).get("id", 0)
+            st.session_state.analysis = {"id": prev + 1, "texts": tuple(named), "drop": drop_no_price, "online": online,
+                                         "record": keep_history, "errors": read_errors}
+            st.session_state.pop("ranked", None)
+        else:
+            input_problems += [("error", msg) for msg in read_errors]
+            input_problems.append(("warning", "Wklej oferty albo dodaj plik, a potem kliknij „Szukaj doładunków”." if not files else
+                                   "Z dodanych plików nie udało się odczytać żadnych danych."))
+            for level, msg in input_problems:
+                getattr(st, level)(msg)
 
 analysis = st.session_state.get("analysis")
 parsed = None
@@ -485,26 +460,41 @@ def render_history() -> None:
                            file_name="historia_ofert.csv", mime="text/csv", width="stretch")
 
 
-render_history()
+with tab_data:
+    render_history()
+
+def _no_data_tabs(reason: str, tabs: tuple = ()) -> None:
+    for t in (tabs or (tab_orders, tab_start, tab_variants, tab_route)):
+        with t:
+            if t is tab_orders:
+                for level, msg in input_problems:
+                    getattr(st, level)(msg)
+            empty_state("📥", reason)
+
 
 if not analysis:
-    with st.expander("ℹ️ Jak to działa", expanded=True):
-        st.markdown(
-            "1. **Wklej oferty** z giełdy (lub kliknij *Wczytaj przykład*) i naciśnij **Szukaj doładunków**.\n"
-            "2. **Sprawdź zlecenia** - popraw błędy, uzupełnij brakujące ceny.\n"
-            "3. **Podaj start pojazdu** (kod pocztowy) i ewentualne **punkty dodatkowe** - lub pomiń.\n"
-            "4. **Wybierz wariant** z listy najlepszych doładunków (zakładka „Warianty”).\n"
-            "5. **Dopracuj trasę** na mapie: przeciągnij fragment linii, a koszty przeliczą się same.")
+    with tab_data:
+        with st.expander("ℹ️ Jak to działa", expanded=True):
+            st.markdown(
+                "1. **Wklej oferty** z giełdy (lub kliknij *Wczytaj przykład*) i naciśnij **Szukaj doładunków**.\n"
+                "2. **Sprawdź zlecenia** - popraw błędy, uzupełnij brakujące ceny.\n"
+                "3. **Podaj start pojazdu** (kod pocztowy) i ewentualne **punkty dodatkowe** - lub pomiń.\n"
+                "4. **Wybierz wariant** z listy najlepszych doładunków (zakładka „Warianty”).\n"
+                "5. **Dopracuj trasę** na mapie: przeciągnij fragment linii, a koszty przeliczą się same.")
+    _no_data_tabs("Najpierw wczytaj oferty w zakładce „Dane”.")
     st.stop()
 
 if parsed.empty:
-    source_notes(src_report, analysis.get("errors", []))
-    st.error("Nie rozpoznano żadnych zleceń. W danych muszą być kody w formacie „kraj kod” "
-             "(np. FR 77140, GB G1 1) dla miejsca załadunku i rozładunku każdej oferty.")
+    for t in (tab_data, tab_orders):
+        with t:
+            source_notes(src_report, analysis.get("errors", []))
+            st.error("Nie rozpoznano żadnych zleceń. W danych muszą być kody w formacie „kraj kod” "
+                     "(np. FR 77140, GB G1 1) dla miejsca załadunku i rozładunku każdej oferty.")
+    _no_data_tabs("Nie rozpoznano żadnych zleceń - sprawdź dane w zakładce „Dane”.")
     st.stop()
 
 # --------------------------------------------------------- krok 2: zlecenia
-with st.container(border=True):
+with tab_orders:
     step(2, "Sprawdź zlecenia",
          f"{'Wczytano zapisaną tabelę „' + st.session_state['loaded_name'] + '”: ' if st.session_state.get('loaded_name') else 'Rozpoznano '}"
          f"{len(parsed)} ofert (źródło: {', '.join(sorted(set(parsed['source'])) or ['—'])}). "
@@ -586,10 +576,11 @@ with st.container(border=True):
     orders = clean_edited(merge_edits(work, view["id"].tolist(), edited))
     if orders.empty:
         st.warning("Brak poprawnych wierszy - potrzebne są kraj i kod pocztowy załadunku oraz rozładunku.")
+        _no_data_tabs("Brak poprawnych zleceń - uzupełnij tabelę w zakładce „Zlecenia”.", (tab_start, tab_variants, tab_route))
         st.stop()
 
     with st.form("save_orders_form", border=False):
-        f1, f2, f3 = st.columns([3, 2, 1])
+        f1, f2, f3 = st.columns([3, 2, 1.4])
         save_name = f1.text_input("Nazwa tabeli", key="save_name", placeholder="np. Tydzień 42 - Francja → UK",
                                   help="Zapisuje tabelę z Twoimi poprawkami; można ją później wczytać w kroku 1.")
         overwrite = f2.checkbox("Nadpisz, jeśli nazwa już istnieje", key="save_overwrite")
@@ -646,7 +637,10 @@ with st.container(border=True):
                                    for p, d in zip(orders["price_used_eur"], dist_used)]
 
     n_use = int(use.sum())
-    st.markdown(f"**Do wyszukiwania weszło {n_use} z {len(orders)} ofert.**")
+    cards([("Wczytane oferty", f"{len(orders)}", None, "", "Ile ofert jest w tabeli."),
+           ("Weszło do wyszukiwania", f"{n_use}", f"{n_use / max(len(orders), 1):.0%} ofert", "accent",
+            "Oferty pasujące do zestawu, z ceną (z oferty albo szacunkową)."),
+           ("Wykluczone", f"{len(orders) - n_use}", None, "", "Oferty, które nie wejdą do wariantów (powody poniżej).")])
     if n_use < len(orders):
         reasons = Counter(r.split(":")[0] if r.startswith("bez ceny") else "duplikat" if r.startswith("duplikat") else r
                           for why in orders.loc[~use, "exclusion"] for r in why.split(", ") if r)
@@ -673,12 +667,16 @@ with st.container(border=True):
                            "distance_est_km": "Dystans szac. (km)",
                            "profit_single_eur": st.column_config.NumberColumn("Zysk samodzielnie (EUR)", format="%.0f")})
 
+with tab_orders:
+    st.write("")
+    next_button("Dalej: start i punkty dodatkowe →", 2, "next_2")
+
 orders_opt = orders[use].assign(price_eur=orders.loc[use, "price_used_eur"])    # cena z oferty lub szacunkowa
 client_map = dict(zip(orders["id"], orders["client"].fillna("")))
 est_ids = set(orders.loc[orders["price_kind"] == "szacunek", "id"])
 price_map = dict(zip(orders["id"], orders["price_used_eur"]))
 # ---------------------------------------------------- start pojazdu
-with st.container(border=True):
+with tab_start:
     step(3, "Start pojazdu i punkty dodatkowe", "Wszystkie warianty liczone są od miejsca startu: dojazd na pierwszy "
          "załadunek to puste kilometry w kosztach i zysku. Zostaw kod pusty, aby liczyć od pierwszego załadunku. "
          "Ten krok jest opcjonalny.")
@@ -725,7 +723,7 @@ with st.container(border=True):
                       "Zrzut: opis": pd.Series(dtype=str)}),
         key="waypoints_editor", num_rows="dynamic", hide_index=True, width="stretch",
         column_config={
-            "Kraj": st.column_config.TextColumn("Kraj", max_chars=2, width=55, default="PL",
+            "Kraj": st.column_config.TextColumn("Kraj", max_chars=2, width=70, default="PL",
                                                 help="Dwuliterowy kod kraju, np. PL."),
             "Kod pocztowy": st.column_config.TextColumn("Kod", width=110),
             "Opis": st.column_config.TextColumn("Opis (opcjonalnie)", width=160),
@@ -733,13 +731,13 @@ with st.container(border=True):
                                                          width=105, help="Pusty = punkt bez ładunku."),
             "Ładunek (t)": st.column_config.NumberColumn("Tony", min_value=0.0, max_value=24.0, format="%.1f",
                                                          width=95, help="Pusty = wyliczone z LDM."),
-            "Cena (EUR)": st.column_config.NumberColumn("Cena EUR", min_value=0.0, format="%.0f", width=90,
+            "Cena (EUR)": st.column_config.NumberColumn("Cena EUR", min_value=0.0, format="%.0f", width=105,
                                                         help="Przychód za ten ładunek; puste = 0 (własny towar)."),
-            "Data odbioru": st.column_config.DateColumn("Data odbioru", format="DD.MM.YYYY", width=115,
+            "Data odbioru": st.column_config.DateColumn("Data odbioru", format="DD.MM.YYYY", width=130,
                                                         help="Opcjonalnie. Zlecenia z giełdy w wariancie muszą mieć "
                                                              "załadunek w limicie dni od tej daty (ustawienie "
                                                              "„Maks. różnica dat załadunku”)."),
-            "Zrzut: kraj": st.column_config.TextColumn("Zrzut kraj", max_chars=2, width=95,
+            "Zrzut: kraj": st.column_config.TextColumn("Zrzut kraj", max_chars=2, width=105,
                                                        help="Puste = ten sam kraj co punkt."),
             "Zrzut: kod": st.column_config.TextColumn("Zrzut kod", width=95,
                                                       help="Wymagany, gdy punkt ma ładunek."),
@@ -763,6 +761,9 @@ waypoints = tuple(waypoints)
 if len(own_orders):                      # własne ładunki: obowiązkowe zlecenia w każdym wariancie
     orders_opt = pd.concat([orders_opt, own_orders.reindex(columns=orders_opt.columns)], ignore_index=True)
     client_map = {**client_map, **dict(zip(own_orders["id"], own_orders["client"]))}
+with tab_start:
+    st.write("")
+    next_button("Dalej: najlepsze warianty →", 3, "next_3")
 forced_ids = tuple(own_orders["id"]) if len(own_orders) else ()
 origin_sig = None if origin is None else (origin.country, origin.postal, round(origin.lat, 4), round(origin.lon, 4))
 sched_params = ScheduleParams(
@@ -774,7 +775,7 @@ time_ctx = TimeCtx(sched_params, order_windows(orders_opt, sched_params))
 candidates, stats = _search(orders_opt, cost, opt, origin, waypoints, forced_ids, time_ctx)
 
 # ------------------------------------------------------- krok 3: warianty
-with st.container(border=True):
+with tab_variants:
     step(4, "Najlepsze doładunki", "Kombinacje zleceń na jednej naczepie, od najbardziej zyskownej - liczone po "
                                    "rzeczywistych trasach. Kliknij wiersz, aby zobaczyć szczegóły i trasę.")
     if stats["truncated"]:
@@ -790,6 +791,7 @@ with st.container(border=True):
                 + (" Masz własny ładunek w punkcie dodatkowym: jest w każdym wariancie, więc sprawdź jego datę "
                    "odbioru (zlecenia z giełdy muszą mieć załadunek w limicie dni od niej), miejsce zrzutu i LDM."
                    if forced_ids else ""))
+        _no_data_tabs("Nie ma wariantu do pokazania - zobacz wskazówki w zakładce „Warianty”.", (tab_route,))
         st.stop()
 
     # ranking po trasach rzeczywistych: liczony od razu, pamiętany do zmiany danych lub ustawień
@@ -828,10 +830,11 @@ with st.container(border=True):
         st.warning("⏰ Żaden z wariantów nie mieści się w oknach czasowych ofert - pokazuję najlepsze z ostrzeżeniem w "
                    "kolumnie „Harmonogram”. Zmień datę wyjazdu, zwiększ tolerancję spóźnienia albo wyłącz „Uwzględniaj "
                    "okna czasowe ofert” w ustawieniach („Terminy i czas pracy”).")
-    st.markdown(f"<div class='best'>🏆 <b>Najlepszy wariant: {len(bv.order_ids)} {plural(len(bv.order_ids))} "
-                f"({' + '.join(bv.order_ids)})</b> · zysk <b>{eur(bev['profit'])}</b> · {bev['days']:.1f} dnia · "
-                f"{eur(bev['profit'] / max(bev['days'], 1))}/dzień · naczepa {bv.peak_ldm:.1f}/13,6 LDM, "
-                f"{bv.peak_weight_t:.1f}/24 t{'' if estimated else ' (trasa po drogach)'}</div>",
+    st.markdown(f"<div class='best'><div class='big'>🏆 Najlepszy wariant: {len(bv.order_ids)} {plural(len(bv.order_ids))} "
+                f"({' + '.join(bv.order_ids)}) · zysk {eur(bev['profit'])} · {bev['days']:.1f} dnia · "
+                f"{eur(bev['profit'] / max(bev['days'], 1))}/dzień</div><div class='sub'>naczepa {bv.peak_ldm:.1f}/13,6 LDM, "
+                f"{bv.peak_weight_t:.1f}/24 t{'' if estimated else ' · trasa po drogach dla ciężarówek'}. "
+                "Kliknij wiersz w tabeli, aby wybrać inny wariant.</div></div>",
                 unsafe_allow_html=True)
 
     vclients = sorted({c for r in ranked for i in r.variant.order_ids if (c := client_map.get(i))})
@@ -921,11 +924,12 @@ with st.container(border=True):
                 _store().delete("ranking", rk_pick)
                 st.rerun()
 
-nav_slot.markdown(
-    "<div class='nav'><a href='#krok-2'>2 · Zlecenia</a><a href='#krok-3'>3 · Start i punkty</a>"
-    "<a href='#krok-4'>4 · Warianty</a><a href='#krok-5'>5 · Trasa i koszty</a>"
-    f"<span class='sum'>{len(orders)} ofert · {n_use} w wyszukiwaniu · najlepszy wariant: {eur(bev['profit'])}</span></div>",
-    unsafe_allow_html=True)
+with tab_variants:
+    st.write("")
+    next_button("Pokaż trasę i harmonogram wybranego wariantu →", 4, "next_4")
+with hero_slot:
+    hero(HERO_TITLE, HERO_SUB, [f"{len(orders)} ofert", f"{n_use} w wyszukiwaniu",
+                                f"najlepszy wariant: {eur(bev['profit'])}", f"{len(ranked)} wariantów"])
 selected = event.selection.rows[0] if event.selection.rows else 0
 v = shown[min(selected, len(shown) - 1)].variant
 vkey = _variant_key(v)
@@ -936,7 +940,7 @@ via_key = (hash(orders_opt[["id", "start_lat", "start_lon", "end_lat", "end_lon"
 vias = st.session_state.vias.get(via_key, [])
 
 # ----------------------------------------------------- krok 4: trasa i koszty
-with st.container(border=True):
+with tab_route:
     step(5, f"Trasa i koszty: {' + '.join(v.order_ids)}",
          "Przeciągnij fragment niebieskiej linii, aby zmienić przebieg trasy. Punkt pośredni przesuniesz "
          "przeciągnięciem, a usuniesz dwuklikiem.")
