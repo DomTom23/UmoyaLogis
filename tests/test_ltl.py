@@ -1003,3 +1003,143 @@ def test_near_duplicates_same_codes_similar_codes_weight_ldm_and_date():
     t = time.time()
     find_duplicates(big, pd.Series(0.0, index=big.index))
     assert time.time() - t < 5
+
+
+def _win(day, h1, h2):
+    from ltl.schedule import to_h
+    import datetime as _dt
+    return (to_h(_dt.datetime(2026, 11, day, h1)), to_h(_dt.datetime(2026, 11, day, h2)))
+
+
+def test_schedule_simulation_rest_waiting_windows_and_tolerance():
+    from ltl.schedule import ScheduleParams, StopSpec, from_h, simulate
+    p = ScheduleParams()
+    L = StopSpec("L", "A", _win(2, 8, 12), 2)
+    U = StopSpec("U", "A", _win(3, 6, 18), 2)
+    r = simulate([13.0], [L, U], p)                                   # 2 h obsługi + 13 h jazdy: odpoczynek dobowy w drodze
+    assert r.feasible and from_h(r.stops[0].arrive_h).hour == 8 and r.stops[1].rest_h == 11.0
+    assert from_h(r.stops[1].arrive_h).strftime("%d %H:%M") == "03 10:00" and abs(r.total_h - 28) < 1e-6
+    # przyjazd przed otwarciem okna = czekanie; za późno = niezgodne z terminami, tolerancja to łagodzi
+    early = simulate([1.0], [StopSpec("S", "S"), StopSpec("L", "A", _win(2, 8, 12), 2)], ScheduleParams(start_at=from_h(_win(2, 6, 7)[0])))
+    assert early.feasible and early.stops[1].wait_h == 1.0            # start 6:00 + 1 h jazdy = 7:00, okno od 8:00
+    assert simulate([5.0], [StopSpec("S", "S"), StopSpec("L", "A", _win(2, 8, 12), 2)],
+                    ScheduleParams(start_at=from_h(_win(2, 8, 9)[0]))).feasible is False   # 8:00 + 5 h = 13:00 > 12:00
+    assert simulate([5.0], [StopSpec("S", "S"), StopSpec("L", "A", _win(2, 8, 12), 2)],
+                    ScheduleParams(start_at=from_h(_win(2, 8, 9)[0]), tolerance_h=1.5)).feasible
+    # limity jazdy: 56 h w tygodniu -> odpoczynek tygodniowy
+    long = simulate([20.0] * 4, [StopSpec("S", "S")] + [StopSpec("W", f"P{i}") for i in range(4)], ScheduleParams(start_at=from_h(_win(2, 6, 7)[0])))
+    assert long.rest_h >= 48 and long.stops[-1].rest_h > 0 or long.rest_h >= 48
+    # start automatyczny: pojazd rusza tak, by zdążyć na początek pierwszego okna (bez czekania)
+    auto = simulate([6.0], [StopSpec("S", "S"), StopSpec("L", "A", _win(5, 8, 12), 2)], p)
+    assert from_h(auto.stops[1].arrive_h).strftime("%d %H:%M") == "05 08:00" and auto.stops[1].wait_h == 0
+    assert from_h(auto.start_h).strftime("%d %H:%M") == "05 02:00"
+
+
+def test_order_windows_from_columns_and_date_only_defaults():
+    import datetime as _dt
+    from ltl.schedule import ScheduleParams, from_h, order_windows, resolve_window, sync_windows
+    p = ScheduleParams()
+    df = pd.DataFrame([{"id": "A", "load_date": _dt.date(2026, 11, 2), "unload_date": _dt.date(2026, 11, 3),
+                        "load_from": pd.Timestamp("2026-11-02 08:00"), "load_to": pd.Timestamp("2026-11-02 15:00"),
+                        "unload_from": pd.NaT, "unload_to": pd.NaT},
+                       {"id": "B", "load_date": _dt.date(2026, 11, 2), "unload_date": None,
+                        "load_from": pd.Timestamp("2026-11-02 00:00:00"), "load_to": pd.Timestamp("2026-11-04 23:59:59"),
+                        "unload_from": pd.NaT, "unload_to": pd.NaT}])
+    w = order_windows(df, p)
+    assert (from_h(w["A"]["L"][0]).hour, from_h(w["A"]["L"][1]).hour) == (8, 15)       # godziny z oferty
+    assert (from_h(w["A"]["U"][0]).hour, from_h(w["A"]["U"][1]).hour) == (6, 18)       # sama data = godziny przeładunków
+    assert from_h(w["B"]["L"][1]).strftime("%d %H") == "04 18" and w["B"]["U"] is None   # zakres dat, brak rozładunku = bez okna
+    assert resolve_window(None, None, None, p) is None
+    # ręczna zmiana daty unieważnia stare godziny z oferty
+    changed = df.copy()
+    changed.loc[0, "load_date"] = _dt.date(2026, 11, 9)
+    assert pd.isna(sync_windows(changed).loc[0, "load_from"])
+
+
+def test_cards_give_time_windows_and_storage_roundtrip(tmp_path):
+    df = parse_sources([CARDS])
+    first = df[df.start_postal == "53021"].iloc[0]                       # "30.10, 13:00" ... "02.11, 08:00"
+    assert str(first.load_from) == "2026-10-30 13:00:00" and str(first.unload_from) == "2026-11-02 08:00:00"
+    two = df[df.start_postal == "57800"].iloc[0]                         # "30.10, 08:00 - 15:00"
+    assert (str(two.load_from), str(two.load_to)) == ("2026-10-30 08:00:00", "2026-10-30 15:00:00")
+    ranged = df[df.start_postal == "38590"].iloc[0]                      # dwie linie dat: 29.10 12:00 -> 02.11 12:00
+    assert (str(ranged.load_from), str(ranged.load_to)) == ("2026-10-29 12:00:00", "2026-11-02 12:00:00")
+    st = Store(tmp_path / "w.db")
+    st.save_orders("okna", df)
+    back = st.load_orders("okna")
+    assert back.load_from.notna().sum() == df.load_from.notna().sum() and back.load_to.iloc[0] == df.load_to.iloc[0]
+
+
+def test_optimizer_orders_stops_by_windows_and_rejects_impossible():
+    import datetime as _dt
+    from ltl.optimizer import TimeCtx
+    from ltl.schedule import ScheduleParams, order_windows
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500)]
+    df = _orders(rows)
+    df["load_date"] = _dt.date(2026, 11, 2)
+    df["unload_date"] = _dt.date(2026, 11, 6)
+    df["load_from"], df["load_to"] = pd.Timestamp("2026-11-02 06:00"), pd.Timestamp("2026-11-02 18:00")
+    df["unload_from"], df["unload_to"] = pd.Timestamp("2026-11-03 06:00"), pd.Timestamp("2026-11-10 18:00")
+    p = ScheduleParams()
+
+    def seqs(d, **kw):
+        v, _ = find_best_combinations(d, CostParams(), OptimizerParams(max_detour_km=800),
+                                      time_ctx=TimeCtx(p, order_windows(d, p)), **kw)
+        return [[(s.order_id, s.kind) for s in x.stops] for x in v]
+
+    assert seqs(df)[0] == [("B", "L"), ("A", "L"), ("A", "U"), ("B", "U")]            # najkrótsza kolejność mieści się w oknach
+    a_first = df.copy()
+    a_first["load_from"] = [pd.Timestamp("2026-11-02 06:00"), pd.Timestamp("2026-11-02 13:00")]
+    a_first["load_to"] = [pd.Timestamp("2026-11-02 08:00"), pd.Timestamp("2026-11-02 18:00")]
+    assert seqs(a_first)[0][:2] == [("A", "L"), ("B", "L")]                            # okna wymuszają A przed B
+    b_first = df.copy()
+    b_first["load_from"] = [pd.Timestamp("2026-11-02 13:00"), pd.Timestamp("2026-11-02 06:00")]
+    b_first["load_to"] = [pd.Timestamp("2026-11-02 18:00"), pd.Timestamp("2026-11-02 08:00")]
+    assert seqs(b_first)[0][:2] == [("B", "L"), ("A", "L")]
+    both_early = df.copy()
+    both_early["load_to"] = pd.Timestamp("2026-11-02 07:00")                          # dwa załadunki 300 km od siebie w godzinę
+    assert seqs(both_early) == []
+    tight = df.copy()
+    tight["unload_to"] = [pd.Timestamp("2026-11-10 18:00"), pd.Timestamp("2026-11-03 18:00")]   # B rozładunek dzień po załadunku (>1000 km)
+    assert seqs(tight) == []
+    # bez okien (wyłączone w ustawieniach) ta sama para jest dozwolona
+    off = TimeCtx(ScheduleParams(enabled=False), order_windows(tight, p))
+    assert find_best_combinations(tight, CostParams(), OptimizerParams(max_detour_km=800), time_ctx=off)[0]
+    # punkt dodatkowy trafia w miejsce, które mieści się w oknach; start pojazdu liczy się do harmonogramu
+    from ltl.optimizer import Stop
+    on_way = Stop("P1", "W", "DE", "50667", "Kolonia", 50.94, 6.96)
+    assert any(k == "W" for _, k in sum(seqs(df, waypoints=(on_way,)), []))
+    far_start = Stop("START", "S", "ES", "28001", "", 40.4, -3.7)
+    assert seqs(df, origin=far_start)                                                 # start automatyczny: pojazd ruszy odpowiednio wcześniej
+    fixed = ScheduleParams(start_at=pd.Timestamp("2026-11-02 06:00").to_pydatetime())  # a przy stałym starcie o 6:00 z Madrytu nie zdąży
+    v, _ = find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=800), origin=far_start,
+                                  time_ctx=TimeCtx(fixed, order_windows(df, fixed)))
+    assert v == []
+
+
+def test_idle_days_waiting_for_windows_cost_money():
+    import datetime as _dt
+    from ltl.optimizer import TimeCtx, Stop
+    from ltl.route_edit import evaluate_route, route_for_variant
+    from ltl.routing import TruckProfile
+    from ltl.schedule import ScheduleParams, order_windows
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500)]
+    df = _orders(rows)
+    df["load_date"] = _dt.date(2026, 11, 2)
+    df["unload_date"] = _dt.date(2026, 11, 6)
+    df["load_from"], df["load_to"] = pd.Timestamp("2026-11-02 06:00"), pd.Timestamp("2026-11-02 18:00")
+    df["unload_from"], df["unload_to"] = pd.Timestamp("2026-11-12 06:00"), pd.Timestamp("2026-11-20 18:00")   # okno otwiera się dopiero 12.11
+    for charge in (True, False):
+        p = ScheduleParams(charge_idle_days=charge)
+        ctx = TimeCtx(p, order_windows(df, p))
+        v, _ = find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=800), time_ctx=ctx)
+        r = route_for_variant(v[0], [], TruckProfile(), "none", "", "", 65.0)
+        ev = evaluate_route(v[0], r, CostParams(), ctx)
+        assert ev["schedule"].wait_h > 24                                   # pojazd czeka na otwarcie okna rozładunku
+        if charge:
+            assert ev["idle_days"] >= 1 and ev["idle_cost"] == ev["idle_days"] * 300.0
+            charged, idle_cost = ev["profit"], ev["idle_cost"]
+        else:
+            assert ev["idle_cost"] == 0
+            free = ev["profit"]
+    assert charged < free and abs((free - charged) - idle_cost) < 1e-6              # różnica to dokładnie koszt dni czekania

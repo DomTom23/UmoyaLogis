@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import date, datetime, time as dtime
 from collections import Counter
 
 import pandas as pd
@@ -15,11 +16,12 @@ from ltl.eligibility import ALL_BODIES, DEFAULT_BODIES, FleetProfile, check_elig
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.ingest import UnreadableFile, clean_edited, parse_sources_report, read_uploaded
 from ltl.mapview import route_map
-from ltl.optimizer import OptimizerParams, Stop, find_best_combinations
+from ltl.optimizer import OptimizerParams, Stop, TimeCtx, find_best_combinations
 from ltl.ownpoints import build_extra_points
 from ltl.ordertable import code_match, filter_orders, merge_edits, parse_codes
 from ltl.pricing import DEFAULT_RULES, RULE_COLUMNS, DIRECTION_LABELS, apply_price_rules, frame_to_rules, rules_to_frame
 from ltl.ranking import Ranked, rank_by_real_routes, ranked_to_frame, variant_key
+from ltl.schedule import ScheduleParams, from_h, order_windows
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
 from ltl.routing import VALHALLA_URL, RouteOptions, RouteResult, TruckProfile
 from ltl.sample import SAMPLE_TEXT
@@ -118,8 +120,8 @@ def _parse(named: tuple, drop_no_price: bool, pln_per_eur: float):
 
 @st.cache_data(show_spinner="Szukanie najlepszych doładunków…")
 def _search(orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Stop | None = None,
-            waypoints: tuple = (), forced_ids: tuple = ()):
-    return find_best_combinations(orders, cost, opt, origin, waypoints, forced_ids)
+            waypoints: tuple = (), forced_ids: tuple = (), time_ctx: TimeCtx | None = None):
+    return find_best_combinations(orders, cost, opt, origin, waypoints, forced_ids, time_ctx)
 
 
 _variant_key = variant_key
@@ -176,6 +178,27 @@ with st.sidebar:
         n_check = st.slider("Ile kandydatów sprawdzić na drogach", 10, 40, 20,
                             help="Najlepsze warianty wg szacunku są liczone po rzeczywistych trasach, a ranking "
                                  "układany od nowa. Więcej = dokładniej, ale dłużej (publiczny serwer tras).")
+
+    with st.expander("🕒 Terminy i czas pracy"):
+        use_windows = st.checkbox("Uwzględniaj okna czasowe ofert", True,
+                                  help="Wariant musi mieścić się w oknach załadunku i rozładunku z ofert (przy zadanej "
+                                       "prędkości, dniu pracy 9 h i odpoczynkach). Kolejność punktów jest dobierana tak, "
+                                       "żeby zdążyć. Po wyłączeniu harmonogram jest tylko pokazywany.")
+        w1, w2 = st.columns(2)
+        open_h = w1.number_input("Przeładunki od (godz.)", 0, 23, 6, 1,
+                                 help="Gdy oferta podaje tylko datę, przyjmujemy, że przeładunek jest możliwy w tych godzinach.")
+        close_h = w2.number_input("do (godz.)", 1, 24, 18, 1)
+        tol_h = st.number_input("Tolerancja spóźnienia (h)", 0.0, 24.0, 0.0, 0.5,
+                                help="O tyle godzin wolno się spóźnić na koniec okna (kierowca dzwoni do klienta).")
+        r1, r2 = st.columns(2)
+        daily_rest = r1.number_input("Odpoczynek dobowy (h)", 0.0, 24.0, 11.0, 0.5)
+        weekly_rest = r2.number_input("Odpoczynek tyg. (h)", 0.0, 96.0, 45.0, 1.0,
+                                      help="Po 56 h jazdy w tygodniu.")
+        charge_idle = st.checkbox("Doliczaj dni czekania do kosztów", True,
+                                  help="Gdy pojazd czeka na otwarcie okna (np. noc i dzień), dni kalendarzowe ponad dni pracy "
+                                       "wchodzą do kosztów (koszt dnia pracy). Bez tego czekanie jest „za darmo”.")
+        st.caption("Dzień pracy (9 h jazdy i obsługi) i limit 56 h jazdy w tygodniu są stałe; prędkość i czas "
+                   "załadunku ustawisz w sekcji „Koszty”.")
 
     with st.expander("🚚 Dopasowanie ofert do zestawu"):
         st.caption("Oferty niespełniające warunków nie trafiają do wariantów (powód widać w tabeli).")
@@ -525,7 +548,8 @@ with st.container(border=True):
         column_order=["id", "source", "client", "start_country", "start_postal", "start_city", "end_country",
                       "end_postal", "end_city", "load_date", "unload_date", "weight_t", "ldm", "distance_km",
                       "price_eur", "load_type", "status", "defaults_used",
-                      *(["vehicles", "body", "extras", "description"] if show_details else [])],
+                      *(["load_from", "load_to", "unload_from", "unload_to", "vehicles", "body", "extras", "description"]
+                        if show_details else [])],
         column_config={
             "id": st.column_config.TextColumn("Nr", width="small"),
             "source": st.column_config.TextColumn("Źródło", width="small"),
@@ -538,6 +562,12 @@ with st.container(border=True):
             "end_city": st.column_config.TextColumn("Miasto rozł."),
             "load_date": st.column_config.DateColumn("Data zał.", format="DD.MM.YYYY"),
             "unload_date": st.column_config.DateColumn("Data rozł.", format="DD.MM.YYYY"),
+            "load_from": st.column_config.DatetimeColumn("Okno zał. od", format="DD.MM HH:mm",
+                                                         help="Początek okna załadunku (00:00 = tylko data)."),
+            "load_to": st.column_config.DatetimeColumn("Okno zał. do", format="DD.MM HH:mm",
+                                                       help="Koniec okna załadunku (23:59 = tylko data)."),
+            "unload_from": st.column_config.DatetimeColumn("Okno rozł. od", format="DD.MM HH:mm"),
+            "unload_to": st.column_config.DatetimeColumn("Okno rozł. do", format="DD.MM HH:mm"),
             "weight_t": st.column_config.NumberColumn("Waga (t)", min_value=0.0, max_value=40.0, format="%.2f"),
             "ldm": st.column_config.NumberColumn("LDM", min_value=0.0, max_value=13.6, format="%.2f"),
             "distance_km": st.column_config.NumberColumn("Dystans (km)", min_value=0.0, format="%.0f"),
@@ -672,6 +702,16 @@ with st.container(border=True):
                            "więc dojazd jest bardzo przybliżony. Sprawdź kod lub połączenie z internetem.")
             else:
                 o3.success(f"Start: {o_country} {o_postal} ({o_lat:.2f}, {o_lon:.2f}).")
+    s1, s2, s3 = st.columns([3, 2, 2])
+    start_manual = s1.checkbox("Podaj datę i godzinę wyjazdu pojazdu", key="start_manual",
+                               help="Bez tego pojazd rusza „automatycznie”: dokładnie tak, żeby zdążyć na początek okna "
+                                    "pierwszego załadunku. Z datą wyjazdu pojazd czeka, jeśli przyjedzie za wcześnie, "
+                                    "a warianty niemieszczące się w oknach odpadają.")
+    start_at = None
+    if start_manual:
+        sd = s2.date_input("Data wyjazdu", value=date.today(), key="start_date", format="DD.MM.YYYY")
+        stm = s3.time_input("Godzina", value=dtime(8, 0), key="start_time", step=900)
+        start_at = datetime.combine(sd, stm)
     st.markdown("**Punkty dodatkowe (obowiązkowe)** - miejsca, które trasa musi zahaczyć po drodze (np. magazyn, "
                 "warsztat). Każdy trafia w najtańsze miejsce trasy: po starcie, przed ostatnim rozładunkiem. "
                 "Opcjonalnie możesz podać **własny ładunek** zbierany w tym punkcie (LDM i/lub waga) oraz **miejsce "
@@ -725,7 +765,13 @@ if len(own_orders):                      # własne ładunki: obowiązkowe zlecen
     client_map = {**client_map, **dict(zip(own_orders["id"], own_orders["client"]))}
 forced_ids = tuple(own_orders["id"]) if len(own_orders) else ()
 origin_sig = None if origin is None else (origin.country, origin.postal, round(origin.lat, 4), round(origin.lon, 4))
-candidates, stats = _search(orders_opt, cost, opt, origin, waypoints, forced_ids)
+sched_params = ScheduleParams(
+    enabled=use_windows, speed_kmh=cost.avg_speed_kmh, max_work_h_day=cost.max_drive_h_day,
+    max_drive_h_week=cost.max_drive_h_week, daily_rest_h=daily_rest, weekly_rest_h=weekly_rest,
+    handling_h=cost.handling_h_per_stop, waypoint_h=cost.waypoint_stop_h, open_h=float(open_h), close_h=float(close_h),
+    tolerance_h=tol_h, charge_idle_days=charge_idle, start_at=start_at)
+time_ctx = TimeCtx(sched_params, order_windows(orders_opt, sched_params))
+candidates, stats = _search(orders_opt, cost, opt, origin, waypoints, forced_ids, time_ctx)
 
 # ------------------------------------------------------- krok 3: warianty
 with st.container(border=True):
@@ -738,6 +784,9 @@ with st.container(border=True):
     if not candidates:
         st.info("Nie znaleziono doładunków spełniających warunki. Potrzeba co najmniej 2 ofert z ceną, "
                 "a ich trasy muszą mieścić się w limicie odchylenia - spróbuj go zwiększyć w ustawieniach."
+                + (" Okna czasowe są włączone: warianty muszą mieścić się w terminach z ofert, więc sprawdź datę "
+                   "wyjazdu (oferty z datami w przeszłości się nie zmieszczą), tolerancję spóźnienia albo wyłącz "
+                   "„Uwzględniaj okna czasowe ofert” w ustawieniach." if sched_params.enabled else "")
                 + (" Masz własny ładunek w punkcie dodatkowym: jest w każdym wariancie, więc sprawdź jego datę "
                    "odbioru (zlecenia z giełdy muszą mieć załadunek w limicie dni od niej), miejsce zrzutu i LDM."
                    if forced_ids else ""))
@@ -747,18 +796,19 @@ with st.container(border=True):
     sig = (analysis["id"], hash(orders.drop(columns=["start_geo", "end_geo"]).to_csv()), cost, opt, provider,
            valhalla_url, ors_key, truck, route_opts, top_n, origin_sig,
            tuple((w.country, w.postal, round(w.lat, 4), round(w.lon, 4)) for w in waypoints),
-           hash(own_orders.to_csv()) if len(own_orders) else 0)
+           hash(own_orders.to_csv()) if len(own_orders) else 0, sched_params)
     cache = st.session_state.get("ranked")
     if not cache or cache["sig"] != sig:
         bar = st.progress(0.0, text="Wyznaczanie tras po drogach dla najlepszych wariantów…")
         ranked = rank_by_real_routes(
             candidates, cost, lambda x: get_route(x, []), top_n, workers=4,
-            progress=lambda done, total: bar.progress(done / total, text=f"Trasy po drogach: {done}/{total}"))
+            progress=lambda done, total: bar.progress(done / total, text=f"Trasy po drogach: {done}/{total}"),
+            sched=time_ctx)
         bar.empty()
         estimated = ranked is None
         if estimated:  # routing niedostępny: ranking szacunkowy (linie proste)
             ranked = [Ranked(x, (r := route_for_variant(x, [], truck, "none", "", valhalla_url, speed, route_opts)),
-                             evaluate_route(x, r, cost)) for x in candidates[:top_n]]
+                             evaluate_route(x, r, cost, time_ctx)) for x in candidates[:top_n]]
         cache = st.session_state.ranked = {"sig": sig, "ranked": ranked, "estimated": estimated}
     ranked, estimated = cache["ranked"], cache["estimated"]
     profitable = [r for r in ranked if r.ev["profit"] > 0]
@@ -774,6 +824,10 @@ with st.container(border=True):
 
     best = ranked[0]
     bv, bev = best.variant, best.ev
+    if sched_params.enabled and not bev["schedule"].feasible:
+        st.warning("⏰ Żaden z wariantów nie mieści się w oknach czasowych ofert - pokazuję najlepsze z ostrzeżeniem w "
+                   "kolumnie „Harmonogram”. Zmień datę wyjazdu, zwiększ tolerancję spóźnienia albo wyłącz „Uwzględniaj "
+                   "okna czasowe ofert” w ustawieniach („Terminy i czas pracy”).")
     st.markdown(f"<div class='best'>🏆 <b>Najlepszy wariant: {len(bv.order_ids)} {plural(len(bv.order_ids))} "
                 f"({' + '.join(bv.order_ids)})</b> · zysk <b>{eur(bev['profit'])}</b> · {bev['days']:.1f} dnia · "
                 f"{eur(bev['profit'] / max(bev['days'], 1))}/dzień · naczepa {bv.peak_ldm:.1f}/13,6 LDM, "
@@ -812,7 +866,7 @@ with st.container(border=True):
     all_cols = st.toggle("Pokaż wszystkie kolumny tabeli", key="vt_all",
                          help="Domyślnie tabela pokazuje najważniejsze kolumny: zlecenia, zysk, koszty, dystans, cena/km, czas i trasę.")
     core = ["#", "Zlecenia", "Zysk (EUR)", "Zysk/dzień (EUR)", "Przychód (EUR)", "Koszty (EUR)", "Dystans (km)",
-            "Cena/km (EUR)", "Czas (dni)", "Zapełnienie (LDM)", "Trasa"]
+            "Cena/km (EUR)", "Czas (dni)", "Harmonogram", "Zakończenie", "Zapełnienie (LDM)", "Trasa"]
     if (frame["Przeprawy i tunele"] != "—").any():
         core.append("Przeprawy i tunele")
     shown_cols = [c for c in frame.columns if c not in blank] if all_cols else [c for c in core if c in frame.columns]
@@ -891,7 +945,8 @@ with st.container(border=True):
         st.caption(f"Zleceniodawcy: {v_clients}")
     with st.spinner("Wyznaczanie trasy po drogach…"):
         route = get_route(v, vias)
-    ev = evaluate_route(v, route, cost)
+    ev = evaluate_route(v, route, cost, time_ctx)
+    sch = ev["schedule"]
 
     d_est = ev["profit"] - v.profit
     kpis([
@@ -905,9 +960,16 @@ with st.container(border=True):
          "Przychód podzielony przez cały przejechany dystans (z pustymi kilometrami)."),
         ("Czas", f"{ev['days']:.1f} dnia", f"jazda {ev['drive_h']:.1f} h", "",
          "Dni pracy z limitem 9 h dziennie i odpoczynkiem tygodniowym."),
+        ("Terminy", "✓ w oknach" if sch.feasible else f"⚠ +{sch.max_late_h:.1f} h",
+         f"{sch.total_h / 24:.1f} dnia od wyjazdu", "pos" if sch.feasible else "neg",
+         "Harmonogram z oknami czasowymi ofert, limitami jazdy i odpoczynkami. Czas od wyjazdu do końca ostatniego rozładunku."),
     ])
+    st.caption(f"Harmonogram: wyjazd {from_h(sch.start_h):%d.%m %H:%M} → koniec {from_h(sch.end_h):%d.%m %H:%M}"
+               f" (czekanie na okna {sch.wait_h:.0f} h, odpoczynki {sch.rest_h:.0f} h)."
+               + ("" if sched_params.start_at else " Wyjazd automatyczny: pojazd rusza tak, żeby zdążyć na początek pierwszego okna."))
     st.caption(f"Koszty: paliwo {eur(ev['fuel'])} + myto {eur(ev['tolls'])} + praca {eur(ev['labor'])}"
-               f"{' + przeprawy ' + eur(ev['fees']) if ev['fees'] else ''} "
+               f"{' + przeprawy ' + eur(ev['fees']) if ev['fees'] else ''}"
+               f"{' + czekanie ' + eur(ev['idle_cost']) + ' (' + format(ev['idle_days'], 'g') + ' dni ponad dni pracy)' if ev['idle_cost'] else ''} "
                f"({ev['days']:.1f} dnia × {day_cost:,.0f} EUR; {handling_h:g} h na każdy załadunek i rozładunek). Naczepa: maks. {v.peak_ldm:.1f} LDM, "
                f"{v.peak_weight_t:.1f} t.")
 
@@ -931,6 +993,12 @@ with st.container(border=True):
     else:
         st.success(f"Trasa po drogach dla ciężarówek ({route.provider}): {route.km:,.0f} km, "
                    f"{route.hours:.1f} h jazdy.")
+
+    if not sch.feasible:
+        late = [f"{x.order_id} {'załadunek' if x.kind == 'L' else 'rozładunek'} (+{x.late_h:.1f} h)"
+                for x in sch.stops if x.late_h > 1e-9]
+        st.warning("⏰ Ten wariant nie mieści się w oknach czasowych: " + "; ".join(late) + ". Zmień datę wyjazdu, "
+                   "tolerancję spóźnienia albo wybierz inny wariant.")
 
     # przeprawy, płatne tunele, Szwajcaria
     crossings = ev["crossings"]
@@ -957,15 +1025,20 @@ with st.container(border=True):
 
     tab_steps, tab_orders = st.tabs(["Przebieg krok po kroku", "Zlecenia w wariancie"])
     with tab_steps:
-        stops_df = stop_table(v, route, orders_opt)
+        stops_df = stop_table(v, route, orders_opt, sch)
         if (stops_df["Zleceniodawca"] == "—").all():
             stops_df = stops_df.drop(columns="Zleceniodawca")
         st.dataframe(stops_df, width="stretch", hide_index=True, column_config={
             "Krok": st.column_config.NumberColumn("Krok", width=55),
-            "Operacja": st.column_config.TextColumn("Operacja", width=135),
+            "Operacja": st.column_config.TextColumn("Operacja", width=120),
             "Zlecenie": st.column_config.TextColumn("Zlecenie", width=80),
-            "Miejsce": st.column_config.TextColumn("Miejsce", width=165),
+            "Miejsce": st.column_config.TextColumn("Miejsce", width=150),
             "Data": st.column_config.TextColumn("Data", width=60),
+            "Przyjazd": st.column_config.TextColumn("Przyjazd", width=100),
+            "Okno": st.column_config.TextColumn("Okno", width=150, help="Okno załadunku/rozładunku z oferty."),
+            "Status": st.column_config.TextColumn("Status", width=210),
+            "Odpoczynek w drodze": st.column_config.TextColumn("Odpoczynek", width=95, help="Odpoczynki w drodze do tego punktu."),
+            "Koniec obsługi": st.column_config.TextColumn("Koniec obsługi", width=105),
             "Ładunek": st.column_config.TextColumn("Ładunek", width=135,
                                                    help="Ile ładunku zlecenia jest brane lub zostawiane w tym punkcie."),
             "Na naczepie po": st.column_config.TextColumn(

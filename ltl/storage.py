@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .parsers import COLUMNS, TEXT_COLUMNS
+from .parsers import COLUMNS, TEXT_COLUMNS, WINDOW_COLUMNS
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "umoyalogis.db"
 KINDS = ("orders", "ranking")
@@ -71,6 +71,7 @@ class Store:
                     start_country TEXT, start_postal TEXT, start_city TEXT,
                     end_country TEXT, end_postal TEXT, end_city TEXT,
                     load_date TEXT, unload_date TEXT,
+                    load_from TEXT, load_to TEXT, unload_from TEXT, unload_to TEXT,
                     weight_t REAL, ldm REAL, distance_km REAL, price_eur REAL,
                     client TEXT, load_type TEXT, vehicles TEXT, body TEXT, extras TEXT, description TEXT,
                     status TEXT, defaults_used TEXT,
@@ -101,7 +102,8 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_history_seen ON offer_history(first_seen_at);
             """)
             # migracja baz utworzonych we wcześniejszych wersjach (nowe kolumny dopisujemy na końcu)
-            for table, new_cols in (("saved_orders", ("client", "load_type", "vehicles", "body", "extras", "description")),
+            for table, new_cols in (("saved_orders", ("client", "load_type", "vehicles", "body", "extras", "description",
+                                       *WINDOW_COLUMNS)),
                                     ("offer_history", ("load_type", "vehicles", "body", "extras", "description"))):
                 have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
                 for col in new_cols:
@@ -143,6 +145,8 @@ class Store:
                     v = r[col]
                     if col in DATE_COLS:
                         v = None if pd.isna(v) else pd.Timestamp(v).date().isoformat()
+                    elif col in WINDOW_COLUMNS:
+                        v = None if pd.isna(v) else pd.Timestamp(v).isoformat(timespec="seconds")
                     elif col in NUM_COLS:
                         v = None if pd.isna(v) else float(v)
                     else:
@@ -183,6 +187,8 @@ class Store:
         for col in DATE_COLS:
             df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
             df[col] = df[col].where(df[col].notna(), None)
+        for col in WINDOW_COLUMNS:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
         for col in NUM_COLS:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         for col in (*TEXT_COLUMNS, "status"):

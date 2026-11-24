@@ -6,7 +6,8 @@ import io
 
 import pandas as pd
 
-from .parsers import COLUMNS, TEXT_COLUMNS, parse_orders
+from .parsers import COLUMNS, TEXT_COLUMNS, WINDOW_COLUMNS, parse_orders
+from .schedule import sync_windows
 from .tabular import has_header, rows_to_text
 
 TEXT_ENCODINGS = ("utf-8-sig", "cp1250", "latin-1")
@@ -123,4 +124,6 @@ def clean_edited(df: pd.DataFrame) -> pd.DataFrame:
     too_big = (df["weight_t"] > 24.0 + 1e-9) | (df["ldm"] > 13.6 + 1e-9)
     df["status"] = ["Za duże dla naczepy" if big else ("OK" if pd.notna(p) else "Do negocjacji")
                     for p, big in zip(df["price_eur"], too_big)]
-    return df
+    for c in WINDOW_COLUMNS:                         # kolumny okien mogły zniknąć (np. stare zapisane tabele)
+        df[c] = pd.to_datetime(df[c], errors="coerce") if c in df.columns else pd.NaT
+    return sync_windows(df)

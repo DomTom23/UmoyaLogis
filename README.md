@@ -104,6 +104,15 @@ wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląd
 * „Dopasowanie ofert do zestawu” (panel boczny): tylko oferty dopuszczające naczepę, nadwozia zestawu, ADR, winda,
   FTL. Powód wykluczenia każdej oferty widać w szczegółach pod tabelą zleceń. Położenie kodów pocztowych jest ustalane
   tylko dla ofert, które wejdą do wyszukiwania (równolegle, z paskiem postępu).
+* **Okna czasowe i harmonogram** (panel boczny „Terminy i czas pracy”, krok 3 „Data i godzina wyjazdu”): parser kart
+  Trans.eu czyta okna załadunku i rozładunku (godziny, zakresy „od - do”, dwie linie dat); oferta z samą datą ma okno w
+  godzinach przeładunków z ustawień (domyślnie 6-18). Optymalizator dobiera KOLEJNOŚĆ punktów tak, żeby wariant mieścił
+  się w oknach przy zadanej prędkości, dniu pracy 9 h (jazda + obsługa), limicie 56 h jazdy w tygodniu i odpoczynkach
+  (dobowy 11 h, tygodniowy 45 h); warianty, które się nie mieszczą (także po prawdziwych trasach), odpadają. Przyjazd przed
+  otwarciem okna = czekanie; dni kalendarzowe ponad dni pracy wchodzą do kosztów (można wyłączyć). Wyjazd: automatyczny
+  (pojazd rusza tak, by zdążyć na początek pierwszego okna) albo z podanej daty i godziny. Tabela „krok po kroku” pokazuje
+  przyjazd, okno, status (czeka / spóźnienie / odpoczynek), a ranking kolumny „Harmonogram” i „Zakończenie”. Okna można
+  poprawić w tabeli zleceń (przełącznik „Pokaż szczegóły ofert”). Tolerancja spóźnienia i wyłączenie okien: w ustawieniach.
 * **Duplikaty ofert** (panel boczny „Duplikaty ofert”): dwie oferty to duplikat, gdy mają taką samą (lub bardzo zbliżoną,
   domyślnie ±5%) wagę i LDM, niewykluczające się daty załadunku oraz: ten sam kod pocztowy odbioru i zrzutu (nazwa
   miejscowości nie ma znaczenia) ALBO jeden koniec identyczny, a drugi z podobnym kodem (ten sam kraj, wspólne 3 pierwsze

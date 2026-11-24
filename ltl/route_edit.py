@@ -6,12 +6,14 @@ na mapie -> powstaje punkt via przypisany do odcinka (leg) między dwoma przysta
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass
 
 import numpy as np
 
 from .costs import CostParams, profit
-from .optimizer import Variant
+from .optimizer import TimeCtx, Variant
+from .schedule import simulate, specs_for_stops
 from .crossings import detect_crossings
 from .routing import RouteOptions, RouteResult, TruckProfile, compute_route
 
@@ -77,7 +79,7 @@ def route_for_variant(variant: Variant, vias: list[Via], truck: TruckProfile, pr
     return compute_route(build_points(variant, vias), truck, provider, ors_key, valhalla_url, speed, opts)
 
 
-def evaluate_route(variant: Variant, route: RouteResult, cost: CostParams) -> dict:
+def evaluate_route(variant: Variant, route: RouteResult, cost: CostParams, sched: TimeCtx | None = None) -> dict:
     """Koszty i zysk dla trasy rzeczywistej: km pełne/puste z odcinków, reszta wg CostParams."""
     loaded = empty = 0.0
     on_board: set[str] = set()
@@ -102,4 +104,14 @@ def evaluate_route(variant: Variant, route: RouteResult, cost: CostParams) -> di
     c["total"] += fees
     c["profit"] -= fees
     c.update(loaded_km=loaded, empty_km=empty, total_km=route.km, route_hours=route.hours, crossings=crossings)
+    if sched is not None:                         # harmonogram z prawdziwych odcinków trasy (km / średnia prędkość)
+        hp = sched.params
+        specs = specs_for_stops(variant.stops, sched.windows, hp)
+        sch = c["schedule"] = simulate([leg.km / hp.speed_kmh for leg in route.legs], specs, hp)
+        c["idle_days"] = c["idle_cost"] = 0.0
+        if hp.charge_idle_days and sch.total_h > 0:      # dni kalendarzowe ponad dni pracy (czekanie na okna, odpoczynki)
+            c["idle_days"] = max(0.0, math.ceil(sch.total_h / 24.0 - 1e-9) - c["days"])
+            c["idle_cost"] = c["idle_days"] * cost.day_cost_eur
+            c["total"] += c["idle_cost"]
+            c["profit"] -= c["idle_cost"]
     return c

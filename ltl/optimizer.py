@@ -18,6 +18,7 @@ przycinanie nie gubi żadnego poprawnego wariantu.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Optional
@@ -27,6 +28,7 @@ import pandas as pd
 
 from .costs import CostParams, profit
 from .geo import ROAD_FACTOR, haversine_km, road_distance_matrix
+from .schedule import ScheduleParams, StopSpec, simulate
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,13 @@ class OptimizerParams:
     candidate_limit: int = 300
     max_evaluations: int = 300_000   # bezpiecznik czasu obliczeń (dzielony sprawiedliwie między zlecenia główne)
     compat_limit: int = 40           # ile najlepszych zgodnych zleceń rozważać przy jednym zleceniu głównym
+
+
+@dataclass(frozen=True)
+class TimeCtx:
+    """Okna czasowe i zasady jazdy dla optymalizatora (None = czas nie jest brany pod uwagę)."""
+    params: ScheduleParams
+    windows: dict            # numer zlecenia -> {"L": (od_h, do_h) | None, "U": ...}
 
 
 @dataclass
@@ -75,7 +84,7 @@ class Variant:
         return self.profit / self.days if self.days else 0.0
 
 
-def _best_route(idx, D, ldm, wt, max_ldm, max_wt, bound=float("inf"), d0=None):
+def _best_route(idx, D, ldm, wt, max_ldm, max_wt, bound=float("inf"), d0=None, ok=None):
     """Najkrótsza kolejność punktów (DFS z odcinaniem). Punkty zlecenia i: 2i (L), 2i+1 (U).
 
     Zwraca (dystans, [kolejność punktów]) lub None. `idx` to lista indeksów zleceń. `d0` (opcjonalnie) to
@@ -89,6 +98,8 @@ def _best_route(idx, D, ldm, wt, max_ldm, max_wt, bound=float("inf"), d0=None):
         if dist >= best[0]:
             return
         if done_mask == (1 << k) - 1:
+            if ok is not None and not ok(order):       # kolejność niemieszcząca się w oknach czasowych
+                return
             best[0], best[1] = dist, order.copy()
             return
         for j in range(k):
@@ -124,7 +135,7 @@ def _date_ok(a, b, gap) -> bool:
     return abs((a - b).days) <= gap
 
 
-def _insert(seq, j, D, ldm, wt, max_ldm, max_wt):
+def _insert(seq, j, D, ldm, wt, max_ldm, max_wt, ok=None):
     """Najtańsze dołożenie zlecenia j (punkty 2j, 2j+1) do istniejącej kolejności `seq`.
 
     Zwraca (nowa kolejność, przyrost dystansu) albo None, gdy nie mieści się na naczepie.
@@ -143,6 +154,7 @@ def _insert(seq, j, D, ldm, wt, max_ldm, max_wt):
         return 0.0 if a is None or b is None else float(D[a, b])
 
     best = None
+    cands = [] if ok is not None else None            # z oknami czasowymi: najtańsza POZYCJA, która się mieści w terminach
     for i in range(L + 1):
         prev_i = seq[i - 1] if i > 0 else None
         next_i = seq[i] if i < L else None
@@ -157,8 +169,16 @@ def _insert(seq, j, D, ldm, wt, max_ldm, max_wt):
             else:
                 prev_k, next_k = seq[k - 1], (seq[k] if k < L else None)
                 delta = pd_ + d(prev_k, Q) + d(Q, next_k) - d(prev_k, next_k)
-            if best is None or delta < best[0]:
+            if cands is not None:
+                cands.append((delta, i, k))
+            elif best is None or delta < best[0]:
                 best = (delta, i, k)
+    if cands is not None:
+        for delta, i, k in sorted(cands):
+            new_seq = seq[:i] + [P] + seq[i:k] + [Q] + seq[k:]
+            if ok(new_seq):
+                return new_seq, delta
+        return None
     if best is None:
         return None
     delta, i, k = best
@@ -168,7 +188,8 @@ def _insert(seq, j, D, ldm, wt, max_ldm, max_wt):
 def find_best_combinations(
     orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Optional["Stop"] = None,
     waypoints: tuple = (),
-    forced_ids: tuple = ()
+    forced_ids: tuple = (),
+    time_ctx: Optional[TimeCtx] = None
 ) -> tuple[list[Variant], dict]:
     """Zwraca (TOP warianty, statystyki). `orders` musi mieć kolumny współrzędnych (ltl.geo.add_coordinates).
 
@@ -180,6 +201,8 @@ def find_best_combinations(
     każdy trafia w najtańsze miejsce trasy (po starcie, przed ostatnim punktem zlecenia), a jego objazd liczy się do kosztów.
     `forced_ids` = numery zleceń, które muszą być w każdym wariancie (np. własny ładunek zbierany w punkcie dodatkowym);
     nie liczą się do limitu zleceń w wariancie, a limit odchylenia mierzony jest od trasy bazowej z nimi.
+    `time_ctx` = okna czasowe ofert i zasady jazdy: kolejność punktów musi dać harmonogram mieszczący się w oknach
+    (prędkość z ustawień, dzień pracy 9 h, odpoczynki); punkty dodatkowe trafiają w najtańsze miejsce, które się mieści.
     """
     stats = {"candidates": 0, "eligible": 0, "evaluated": 0, "truncated": False}
     forced_ids = set(forced_ids)
@@ -217,7 +240,16 @@ def find_best_combinations(
     forced = [i for i in range(n) if df["id"].iloc[i] in forced_ids]
     market = [i for i in range(n) if i not in set(forced)]
     d0 = None if origin is None else haversine_km(origin.lat, origin.lon, lats, lons) * ROAD_FACTOR
-    plan = _Planner(D, lats, lons, d0, origin, tuple(waypoints))
+    time_on = time_ctx is not None and time_ctx.params.enabled
+    pspec = None
+    if time_on:
+        hp = time_ctx.params
+        ids = df["id"].tolist()
+        pspec = [StopSpec("L" if p % 2 == 0 else "U", ids[p // 2],
+                          (time_ctx.windows.get(ids[p // 2]) or {}).get("L" if p % 2 == 0 else "U"), hp.handling_h)
+                 for p in range(2 * n)]
+    plan = _Planner(D, lats, lons, d0, origin, tuple(waypoints), time_ctx if time_on else None, pspec)
+    ok_seq = plan.seq_feasible if time_on else None
     wp_h = cost.waypoint_stop_h * len(waypoints)
     ldates = list(df["load_date"])
 
@@ -241,7 +273,7 @@ def find_best_combinations(
             continue
         seq, ok = [2 * m, 2 * m + 1], True
         for f in sorted(forced, key=lambda f: D[2 * m, 2 * f]):
-            ins = _insert(seq, f, D, ldm, wt, opt.max_ldm, opt.max_weight_t)
+            ins = _insert(seq, f, D, ldm, wt, opt.max_ldm, opt.max_weight_t, ok_seq)
             if ins is None:
                 ok = False
                 break
@@ -249,9 +281,11 @@ def find_best_combinations(
         if not ok:
             continue
         if forced and len(forced) + 1 <= 3:
-            r = _best_route(sorted([m, *forced]), D, ldm, wt, opt.max_ldm, opt.max_weight_t)
+            r = _best_route(sorted([m, *forced]), D, ldm, wt, opt.max_ldm, opt.max_weight_t, ok=ok_seq)
             if r and r[0] < plan_len(D, seq):
                 seq = r[1]
+        if ok_seq is not None and not ok_seq(seq):         # zlecenie główne (z własnymi ładunkami) nie mieści się w oknach
+            continue
         seed[m] = (seq, plan_len(D, seq))
     market = [m for m in market if m in seed]
 
@@ -262,14 +296,18 @@ def find_best_combinations(
         for j in market:
             if j == m or pos[j] < pos[m] or not pair_ok(m, j):
                 continue
-            r = _best_route([m, j], D, ldm, wt, opt.max_ldm, opt.max_weight_t)
+            r = _best_route([m, j], D, ldm, wt, opt.max_ldm, opt.max_weight_t, ok=ok_seq)
             if r and r[0] - single[m] <= opt.max_detour_km + slack:       # wstępne odsiewanie; limit sprawdza wiązka
                 lst.append((price[j] / (max(r[0] - single[m] - slack, 0.0) + 50.0), j))   # przychód za dodatkowy km
         lst.sort(reverse=True)
         compat[m] = [j for _, j in lst[: opt.compat_limit]]
 
-    def score(idx, total):
-        return profit(float(sum(price[i] for i in idx)), total, 2 * len(idx), cost, wp_h)["profit"]
+    def score(idx, total, cal_h=0.0):
+        c = profit(float(sum(price[i] for i in idx)), total, 2 * len(idx), cost, wp_h)
+        pr = c["profit"]
+        if time_on and time_ctx.params.charge_idle_days and cal_h > 0:      # dni kalendarzowe ponad dni pracy (czekanie)
+            pr -= max(0.0, math.ceil(cal_h / 24.0 - 1e-9) - c["days"]) * cost.day_cost_eur
+        return pr
 
     best: dict[frozenset, tuple] = {}     # zestaw -> (zysk, indeksy, kolejność punktów, dystans)
     evals = 0
@@ -301,7 +339,7 @@ def find_best_combinations(
                     if evals > budget_end:        # budżet tego zlecenia głównego wyczerpany - idziemy do następnego
                         cut = stats["truncated"] = True
                         break
-                    ins = _insert(seq, j, D, ldm, wt, opt.max_ldm, opt.max_weight_t)
+                    ins = _insert(seq, j, D, ldm, wt, opt.max_ldm, opt.max_weight_t, ok_seq)
                     if ins is None:
                         continue
                     nseq, delta = ins
@@ -317,17 +355,27 @@ def find_best_combinations(
             if not new:
                 break
             scored = []
+            infeasible = []
             for fk, (nseq, ntotal) in new.items():
-                full = ntotal if plan.trivial else plan.length(nseq)
+                cal_h = 0.0
+                if plan.trivial:
+                    full = ntotal
+                else:
+                    full, cal_h = plan.length_and_hours(nseq)
                 if len(fk) <= 3:  # małe zestawy: dokładna kolejność (z dojazdem ze startu)
-                    r = _best_route(sorted(fk), D, ldm, wt, opt.max_ldm, opt.max_weight_t, d0=d0)
+                    r = _best_route(sorted(fk), D, ldm, wt, opt.max_ldm, opt.max_weight_t, d0=d0, ok=ok_seq)
                     if r:
-                        alt = r[0] if plan.trivial else plan.length(r[1])
+                        alt, alt_h = (r[0], 0.0) if plan.trivial else plan.length_and_hours(r[1])
                         if alt < full - 1e-9:
-                            nseq, full = r[1], alt
+                            nseq, full, cal_h = r[1], alt, alt_h
                             ntotal = plan.seq_length(nseq)
                             new[fk] = (nseq, ntotal)
-                scored.append((score(fk, full), fk))
+                if full == float("inf"):               # nie mieści się w oknach czasowych (np. z punktem dodatkowym)
+                    infeasible.append(fk)
+                    continue
+                scored.append((score(fk, full, cal_h), fk))
+            for fk in infeasible:
+                del new[fk]
             for pr, fk in scored:
                 if fk not in best or best[fk][0] < pr:
                     best[fk] = (pr, tuple(sorted(fk)), new[fk][0], new[fk][1])
@@ -348,9 +396,10 @@ class _Planner:
 
     Węzły: p >= 0 = punkt zlecenia (2i załadunek, 2i+1 rozładunek), -1 = start, -2-k = k-ty punkt dodatkowy."""
 
-    def __init__(self, D, lats, lons, d0, origin, waypoints):
+    def __init__(self, D, lats, lons, d0, origin, waypoints, tctx=None, pspec=None):
         self.D, self.d0, self.origin, self.wps = D, d0, origin, waypoints
-        self.trivial = origin is None and not waypoints
+        self.tctx, self.pspec = tctx, pspec
+        self.trivial = origin is None and not waypoints and tctx is None
         self.dw = [haversine_km(w.lat, w.lon, lats, lons) * ROAD_FACTOR for w in waypoints]
         pts = ([(origin.lat, origin.lon)] if origin else []) + [(w.lat, w.lon) for w in waypoints]
         ids = ([-1] if origin else []) + [-2 - k for k in range(len(waypoints))]
@@ -368,27 +417,74 @@ class _Planner:
     def seq_length(self, seq):
         return sum(float(self.D[a, b]) for a, b in zip(seq, seq[1:]))
 
+    def feasible(self, nodes) -> bool:
+        """Czy trasa [start] + punkty + punkty dodatkowe mieści się w oknach czasowych (przy zadanych zasadach jazdy)."""
+        if self.tctx is None:
+            return True
+        hp = self.tctx.params
+        specs = []
+        for n in nodes:
+            if n >= 0:
+                specs.append(self.pspec[n])
+            elif n == -1:
+                specs.append(StopSpec("S", "START"))
+            else:
+                specs.append(StopSpec("W", self.wps[-n - 2].order_id, None, hp.waypoint_h))
+        legs = [self.dist(a, b) / hp.speed_kmh for a, b in zip(nodes, nodes[1:])]
+        return simulate(legs, specs, hp, fast=True).feasible
+
+    def seq_feasible(self, seq) -> bool:
+        return self.feasible(([-1] if self.origin else []) + list(seq))
+
     def nodes(self, seq):
+        """Węzły trasy z wstawionymi punktami dodatkowymi (w najtańszym miejscu, które mieści się w terminach).
+        None = nie da się wstawić punktu dodatkowego bez złamania okien czasowych."""
         nodes = ([-1] if self.origin else []) + list(seq)
         for k in range(len(self.wps)):
             w = -2 - k
-            best = None
+            cands = []
             for i in range(1, len(nodes)):         # po starcie / pierwszym punkcie, przed ostatnim punktem zlecenia
                 a, b = nodes[i - 1], nodes[i]
-                delta = self.dist(a, w) + self.dist(w, b) - self.dist(a, b)
-                if best is None or delta < best[0]:
-                    best = (delta, i)
-            nodes.insert(best[1], w)
+                cands.append((self.dist(a, w) + self.dist(w, b) - self.dist(a, b), i))
+            cands.sort()
+            for _, i in cands:
+                trial = nodes[:i] + [w] + nodes[i:]
+                if self.tctx is None or self.feasible(trial):
+                    nodes = trial
+                    break
+            else:
+                return None
+        if self.tctx is not None and not self.wps and not self.feasible(nodes):
+            return None
         return nodes
 
     def length(self, seq):
+        return self.length_and_hours(seq)[0]
+
+    def length_and_hours(self, seq):
+        """(dystans, czas od wyjazdu do końca w godzinach); dystans = inf, gdy nie mieści się w oknach czasowych."""
         nodes = self.nodes(seq)
-        return sum(self.dist(a, b) for a, b in zip(nodes, nodes[1:]))
+        if nodes is None:
+            return float("inf"), 0.0
+        dist = sum(self.dist(a, b) for a, b in zip(nodes, nodes[1:]))
+        if self.tctx is None:
+            return dist, 0.0
+        hp = self.tctx.params
+        specs = []
+        for n in nodes:
+            if n >= 0:
+                specs.append(self.pspec[n])
+            elif n == -1:
+                specs.append(StopSpec("S", "START"))
+            else:
+                specs.append(StopSpec("W", self.wps[-n - 2].order_id, None, hp.waypoint_h))
+        legs = [self.dist(a, b) / hp.speed_kmh for a, b in zip(nodes, nodes[1:])]
+        return dist, simulate(legs, specs, hp, fast=True).total_h
 
 
 def _build_variant(df, D, single, res, cost: CostParams, ldm=None, wt=None, plan=None, wp_h=0.0) -> Variant:
     pr, idx, total, seq = res
-    nodes = plan.nodes(seq) if plan else list(seq)
+    nodes = (plan.nodes(seq) if plan else None) or list(seq)
     stops, loaded, empty = [], 0.0, 0.0
     on_board = set()
     for step, p in enumerate(nodes):
@@ -423,6 +519,11 @@ def _build_variant(df, D, single, res, cost: CostParams, ldm=None, wt=None, plan
     revenue = float(sum(df.iloc[i]["price_eur"] for i in idx))
     main = max(single[i] for i in idx)
     c = profit(revenue, total, len(seq), cost, wp_h)
+    if plan is not None and plan.tctx is not None and plan.tctx.params.charge_idle_days:
+        cal_h = plan.length_and_hours(seq)[1]
+        extra = max(0.0, math.ceil(cal_h / 24.0 - 1e-9) - c["days"]) if cal_h > 0 else 0.0
+        c["profit"] -= extra * cost.day_cost_eur
+        c["total"] += extra * cost.day_cost_eur
     return Variant(
         order_ids=[df.iloc[i]["id"] for i in idx], stops=stops, revenue=revenue, cost=c,
         profit=c["profit"], total_km=total, loaded_km=loaded, empty_km=empty,
