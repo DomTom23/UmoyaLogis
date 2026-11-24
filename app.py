@@ -10,6 +10,7 @@ import streamlit as st
 
 from ltl.auth import password_ok
 from ltl.costs import CostParams, profit
+from ltl.duplicates import DupParams, find_duplicates
 from ltl.eligibility import ALL_BODIES, DEFAULT_BODIES, FleetProfile, check_eligibility
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.ingest import UnreadableFile, clean_edited, parse_sources_report, read_uploaded
@@ -192,6 +193,23 @@ with st.sidebar:
                                   help="FTL zwykle oznacza cały pojazd dla jednego zleceniodawcy. "
                                        "Odznacz, aby do doładunków brać tylko oferty LTL."),
         )
+
+    with st.expander("🧬 Duplikaty ofert"):
+        dup_params = DupParams(
+            enabled=st.checkbox("Wykrywaj duplikaty", True,
+                                help="To samo zlecenie wystawione kilka razy (np. przez różnych spedytorów, z inną "
+                                     "nazwą miejscowości) nie wchodzi do wariantów wielokrotnie. Zostaje oferta "
+                                     "pasująca do zestawu i z najwyższą ceną; reszta ma w tabeli powód „duplikat”."),
+            tolerance_pct=st.number_input("Tolerancja wagi i LDM (%)", 0.0, 50.0, 5.0, 1.0,
+                                          help="Duplikat tylko wtedy, gdy waga i LDM są identyczne albo różnią się "
+                                               "o mniej niż tyle procent."),
+            prefix_len=int(st.number_input("Podobny kod: wspólne początkowe znaki", 2, 5, 3, 1,
+                                           help="Gdy jeden koniec trasy (odbiór lub zrzut) ma identyczny kod, drugi "
+                                                "może mieć podobny: ten sam kraj i tyle samo pierwszych znaków kodu "
+                                                "(np. 3 = 20095 i 20099). Więcej = ostrzej.")))
+        st.caption("Duplikat: ten sam kod odbioru i zrzutu (nazwa miejscowości nie ma znaczenia) albo jeden koniec "
+                   "identyczny, a drugi z podobnym kodem - ale tylko przy tej samej (lub bardzo zbliżonej) wadze i LDM "
+                   "oraz niewykluczających się datach załadunku.")
 
     with st.expander("💱 Ceny szacunkowe (oferty bez ceny)"):
         use_est = st.checkbox("Używaj cen szacunkowych", value=True,
@@ -565,6 +583,12 @@ with st.container(border=True):
     fleet_why = check_eligibility(orders, fleet)
     orders["exclusion"] = [w or ("bez ceny: " + note if kind == "brak" else "")
                            for w, kind, note in zip(fleet_why, orders["price_kind"], orders["price_note"])]
+    # duplikaty: z grupy zostaje oferta pasująca do zestawu i najlepiej płatna; reszta dostaje powód „duplikat”
+    prio = (orders["exclusion"] == "").astype(float) * 1e9 + orders["price_used_eur"].fillna(0.0)
+    dup_of = find_duplicates(orders, prio, dup_params)
+    if dup_of:
+        orders["exclusion"] = [(f"{e}, " if e else "") + f"duplikat {dup_of[i]}" if i in dup_of else e
+                               for i, e in zip(orders.index, orders["exclusion"])]
     use = orders["exclusion"] == ""
 
     # 2) położenie tylko dla ofert, które wejdą do wyszukiwania (duże wklejki mają setki kodów)
@@ -594,7 +618,7 @@ with st.container(border=True):
     n_use = int(use.sum())
     st.markdown(f"**Do wyszukiwania weszło {n_use} z {len(orders)} ofert.**")
     if n_use < len(orders):
-        reasons = Counter(r.split(":")[0] if r.startswith("bez ceny") else r
+        reasons = Counter(r.split(":")[0] if r.startswith("bez ceny") else "duplikat" if r.startswith("duplikat") else r
                           for why in orders.loc[~use, "exclusion"] for r in why.split(", ") if r)
         st.caption("Wykluczone (oferta może mieć kilka powodów): " +
                    "; ".join(f"{r} - {n}" for r, n in reasons.most_common()) +

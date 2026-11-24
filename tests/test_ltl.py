@@ -966,3 +966,40 @@ def test_own_cargo_date_two_digit_year_and_invalid_values():
     assert _date(pd.Timestamp("2026-11-02")) == datetime.date(2026, 11, 2)
     assert _date("2026-11-02") == datetime.date(2026, 11, 2)
     assert _date(None) is None and _date(float("nan")) is None and _date(pd.NaT) is None and _date("to nie data") is None
+
+
+def test_near_duplicates_same_codes_similar_codes_weight_ldm_and_date():
+    import datetime, time
+    from ltl.duplicates import DupParams, find_duplicates, is_duplicate, prefix, similar_place
+
+    def r(i, sc, sp, ec, ep, w, l, d=datetime.date(2026, 11, 2), city_a="", city_b=""):
+        return dict(id=i, start_country=sc, start_postal=sp, start_city=city_a, end_country=ec, end_postal=ep,
+                    end_city=city_b, weight_t=w, ldm=l, load_date=d)
+
+    df = pd.DataFrame([r("A", "DE", "20095", "PL", "00-001", 5, 3, city_a="Hamburg", city_b="Warszawa"),
+                       r("B", "DE", "20095", "PL", "00-001", 5.2, 3.1, city_a="Altona", city_b="Mokotów"),   # inne miejscowości
+                       r("C", "DE", "20099", "PL", "00-001", 5, 3),            # odbiór: podobny kod, zrzut identyczny
+                       r("D", "DE", "20095", "PL", "00-002", 5, 3),            # odbiór identyczny, zrzut podobny
+                       r("E", "DE", "30095", "PL", "00-001", 5, 3),            # inny rejon odbioru
+                       r("F", "DE", "20095", "PL", "00-001", 9, 3),            # inna waga
+                       r("G", "DE", "20095", "PL", "00-001", 5, 6),            # inny LDM
+                       r("H", "DE", "20095", "PL", "00-001", 5, 3, d=datetime.date(2026, 11, 5)),   # inna data
+                       r("I", "DE", "21095", "PL", "01-001", 5, 3),            # oba końce tylko "podobne" (inne rejony)
+                       r("J", "DE", "20095", "FR", "00-001", 5, 3)])           # inny kraj zrzutu
+    prio = pd.Series([100, 300, 10, 50, 10, 10, 10, 10, 10, 10], index=df.index)
+    dup = find_duplicates(df, prio)
+    assert dup == {0: "B", 2: "B", 3: "B"}                     # zostaje B (najwyższy priorytet), reszta to duplikaty B
+    assert find_duplicates(df, prio, DupParams(enabled=False)) == {}
+    assert find_duplicates(df, prio, DupParams(tolerance_pct=0.0, weight_abs_t=0.0, ldm_abs=0.0)).get(0) is None   # B != A przy zerowej tolerancji
+    assert find_duplicates(df, prio, DupParams(prefix_len=5)).keys() == {0}                                          # ostry próg: tylko A~B
+    # wyższy priorytet (kwalifikuje się do zestawu) wygrywa nawet z droższą ofertą
+    assert find_duplicates(df.head(2), pd.Series([1e9, 900.0], index=df.index[:2])) == {1: "A"}
+    # GB: porównanie po części przed spacją, kody krótsze niż próg muszą być identyczne
+    assert prefix("GB", "WF5 9TG", 3) == "WF5" and similar_place("GB", "WF5 9TG", "GB", "WF5 1AB", 3)
+    assert not similar_place("GB", "WF5 9TG", "GB", "WF6 9TG", 3) and not similar_place("PL", "00-001", "DE", "00001", 3)
+    assert similar_place("BE", "1000", "BE", "1000", 5) and not similar_place("BE", "1000", "BE", "1001", 5)
+    # szybkość: 700 ofert
+    big = pd.concat([df.assign(id=df.id + str(k)) for k in range(70)], ignore_index=True)
+    t = time.time()
+    find_duplicates(big, pd.Series(0.0, index=big.index))
+    assert time.time() - t < 5

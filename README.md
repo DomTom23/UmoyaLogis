@@ -104,5 +104,10 @@ wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląd
 * „Dopasowanie ofert do zestawu” (panel boczny): tylko oferty dopuszczające naczepę, nadwozia zestawu, ADR, winda,
   FTL. Powód wykluczenia każdej oferty widać w szczegółach pod tabelą zleceń. Położenie kodów pocztowych jest ustalane
   tylko dla ofert, które wejdą do wyszukiwania (równolegle, z paskiem postępu).
+* **Duplikaty ofert** (panel boczny „Duplikaty ofert”): dwie oferty to duplikat, gdy mają taką samą (lub bardzo zbliżoną,
+  domyślnie ±5%) wagę i LDM, niewykluczające się daty załadunku oraz: ten sam kod pocztowy odbioru i zrzutu (nazwa
+  miejscowości nie ma znaczenia) ALBO jeden koniec identyczny, a drugi z podobnym kodem (ten sam kraj, wspólne 3 pierwsze
+  znaki; w GB część przed spacją). Z grupy zostaje oferta pasująca do zestawu i najlepiej płatna, pozostałe mają w
+  tabeli powód „duplikat Tn” i nie wchodzą do wariantów.
 * Ten sam ładunek ofertowany kilka razy (np. z różnymi stawkami) nigdy nie trafia do jednego wariantu dwa razy.
 * Stratne warianty (zysk ≤ 0) są ukrywane.
