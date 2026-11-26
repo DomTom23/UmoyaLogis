@@ -267,8 +267,13 @@ def render_workspace_tab(ctx: WsContext) -> None:
     default_section = SECTIONS[0] if pc.plan["orders"] else SECTIONS[3]
     st.session_state.setdefault("ws_section", default_section)
     section = st.segmented_control("Sekcja", SECTIONS, key="ws_section", label_visibility="collapsed") or default_section
+    e, why, problems = _evaluate(pc)                 # koszty i trasa liczone po każdej zmianie, w każdej sekcji
+    for prob in problems:
+        st.warning(prob)
+    if e is not None:
+        _cost_strip(pc, e)
     if section == SECTIONS[0]:
-        _section_route(pc)
+        _section_route(pc, e, why)
     elif section == SECTIONS[1]:
         _section_orders(pc)
     elif section == SECTIONS[2]:
@@ -280,34 +285,45 @@ def render_workspace_tab(ctx: WsContext) -> None:
     pc.mark_seen()
 
 
-# --- sekcja: trasa i koszty
+# --- wyliczenia planu (trasa, koszty, harmonogram) - wspólne dla wszystkich sekcji
 def _vias(plan: dict) -> list[Via]:
     return [Via(id=i + 1, leg=int(v["leg"]), lat=float(v["lat"]), lon=float(v["lon"])) for i, v in enumerate(plan["vias"])]
 
 
-def _section_route(pc: PlanCtx) -> None:
+@dataclass
+class Eval:
+    v: object
+    route: RouteResult
+    ev: dict
+    sch: object
+    frame: pd.DataFrame
+    vias: list
+
+
+def _evaluate(pc: PlanCtx):
+    """(Eval | None, powód braku, lista problemów). Liczone od nowa przy każdym przebiegu; trasy są w pamięci
+    podręcznej, więc ponowne wyznaczanie następuje tylko po zmianie punktów."""
     ctx, plan, vehicle = pc.ctx, pc.plan, pc.vehicle
+    problems = ws.validate(plan, vehicle["max_ldm"], vehicle["max_weight_t"]) if (plan["orders"] or plan["stops"]) else []
     if not plan["orders"] and not plan["stops"]:
-        empty_state("🧰", "Plan jest pusty. Dodaj zlecenia w sekcji „➕ Dodaj” albo wyślij tu wariant z zakładki „5 · Trasa”.")
-        return
-    for p in ws.validate(plan, vehicle["max_ldm"], vehicle["max_weight_t"]):
-        st.warning(p)
+        return None, "empty", problems
     start = ws.vehicle_start(vehicle, ctx.geocode)
-    if start is None:
-        st.info("Pojazd nie ma miejsca startu (zakładka „🚛 Pojazdy”) - trasa jest liczona od pierwszego punktu.")
     v = ws.to_variant(plan, start, ctx.cost)
     if v is None:
-        empty_state("📍", "Za mało punktów do wyznaczenia trasy (potrzebne co najmniej dwa) albo brak współrzędnych kodów.")
-        return
+        return None, "few", problems
     start_at = datetime.fromisoformat(plan["start_at"]) if plan.get("start_at") else None
     sched = ctx.make_sched(start_at)
     frame = ws.orders_frame(plan)
     time_ctx = TimeCtx(sched, order_windows(frame, sched))
     vias = _vias(plan)
-    with st.spinner("Wyznaczanie trasy po drogach…"):
+    with st.spinner("Przeliczanie trasy i kosztów…"):
         route = ctx.get_route(v, vias)
-    ev = evaluate_route(v, route, ctx.cost, time_ctx)
-    sch = ev["schedule"]
+        ev = evaluate_route(v, route, ctx.cost, time_ctx)
+    return Eval(v, route, ev, ev["schedule"], frame, vias), "", problems
+
+
+def _cost_strip(pc: PlanCtx, e: Eval) -> None:
+    v, ev, sch, vehicle, plan = e.v, e.ev, e.sch, pc.vehicle, pc.plan
     d_est = ev["profit"] - v.profit
     cards([
         ("Zysk", f"{ev['profit']:,.0f} EUR".replace(",", " "), f"{d_est:+,.0f} EUR vs szacunek".replace(",", " "),
@@ -324,9 +340,27 @@ def _section_route(pc: PlanCtx) -> None:
          "pos" if v.peak_ldm <= vehicle["max_ldm"] + 1e-9 and v.peak_weight_t <= vehicle["max_weight_t"] + 1e-9 else "neg",
          "Największe zapełnienie w trakcie trasy."),
     ])
-    st.caption(f"Harmonogram: wyjazd {from_h(sch.start_h):%d.%m %H:%M} → koniec {from_h(sch.end_h):%d.%m %H:%M} "
+    def n(x: float) -> str:
+        return f"{x:,.0f}".replace(",", " ")
+    extra = (f" + przeprawy {n(ev['fees'])}" if ev["fees"] else "") + (f" + czekanie {n(ev['idle_cost'])}" if ev["idle_cost"] else "")
+    st.caption(f"Koszty: paliwo {n(ev['fuel'])} + myto {n(ev['tolls'])} + praca {n(ev['labor'])}{extra} EUR. "
+               f"Harmonogram: wyjazd {from_h(sch.start_h):%d.%m %H:%M} → koniec {from_h(sch.end_h):%d.%m %H:%M} "
                f"(czekanie {sch.wait_h:.0f} h, odpoczynki {sch.rest_h:.0f} h)."
-               + ("" if plan.get("start_at") else " Wyjazd automatyczny (ustaw datę w sekcji „⚙️ Plan”)."))
+               + ("" if plan.get("start_at") else " Wyjazd automatyczny (datę ustawisz w sekcji „⚙️ Plan”)."))
+
+
+# --- sekcja: trasa i koszty (mapa, przebieg, tabele)
+def _section_route(pc: PlanCtx, e: Eval | None, why: str) -> None:
+    ctx, plan, vehicle = pc.ctx, pc.plan, pc.vehicle
+    if e is None:
+        if why == "empty":
+            empty_state("🧰", "Plan jest pusty. Dodaj zlecenia w sekcji „➕ Dodaj” albo wyślij tu wariant z zakładki „5 · Trasa”.")
+        else:
+            empty_state("📍", "Za mało punktów do wyznaczenia trasy (potrzebne co najmniej dwa) albo brak współrzędnych kodów.")
+        return
+    v, route, sch, frame, vias = e.v, e.route, e.sch, e.frame, e.vias
+    if ws.vehicle_start(vehicle, ctx.geocode) is None:
+        st.info("Pojazd nie ma miejsca startu (zakładka „🚛 Pojazdy”) - trasa jest liczona od pierwszego punktu.")
     st.markdown("<div class='chain'>" + route_chain_html(v) + "</div>", unsafe_allow_html=True)
     map_id = f"ws-{pc.scope}-{vehicle['id']}-{pc.version}"
     event = route_map(v, route, vias, map_id=map_id, fit_id=map_id, height=560, key=f"ws_map_{pc.scope}_{vehicle['id']}")
@@ -408,41 +442,41 @@ def _rows_from_editor(plan: dict, edited: pd.DataFrame) -> list[dict]:
 
 def _section_orders(pc: PlanCtx) -> None:
     ctx, plan = pc.ctx, pc.plan
-    st.caption("Popraw dane zleceń w tabeli (kody pocztowe, daty, LDM, wagę, cenę). Wiersz możesz dodać (puste zlecenie "
-               "dostanie numer M1, M2…) lub usunąć. Po zmianie kraju albo kodu położenie jest ustalane od nowa.")
+    st.caption("Popraw dane zleceń w tabeli (kody pocztowe, daty, LDM, wagę, cenę) - zmiany zapisują się i przeliczają koszty "
+               "od razu. Nowy wiersz (numer zostaw pusty, dostanie M1, M2…) zapisze się, gdy uzupełnisz kraj i kod "
+               "załadunku oraz rozładunku. Wiersz usuniesz zaznaczeniem i klawiszem Delete.")
     key = f"ws_orders_{pc.scope}_{pc.vehicle['id']}_{pc.nonce}"
-    with st.form(f"form_ws_orders_{pc.scope}_{pc.vehicle['id']}"):
-        edited = st.data_editor(
-            _orders_editor_frame(plan), key=key, num_rows="dynamic", hide_index=True, width="stretch",
-            column_config={
-                "Nr": st.column_config.TextColumn("Nr", width=80),
-                "Zleceniodawca": st.column_config.TextColumn("Zleceniodawca", width=130),
-                "Zał. kraj": st.column_config.TextColumn("Zał. kraj", max_chars=2, width=75),
-                "Zał. kod": st.column_config.TextColumn("Zał. kod", width=90),
-                "Zał. miasto": st.column_config.TextColumn("Zał. miasto", width=120),
-                "Data zał.": st.column_config.DateColumn("Data zał.", format="DD.MM.YYYY", width=115),
-                "Rozł. kraj": st.column_config.TextColumn("Rozł. kraj", max_chars=2, width=80),
-                "Rozł. kod": st.column_config.TextColumn("Rozł. kod", width=90),
-                "Rozł. miasto": st.column_config.TextColumn("Rozł. miasto", width=120),
-                "Data rozł.": st.column_config.DateColumn("Data rozł.", format="DD.MM.YYYY", width=115),
-                "LDM": st.column_config.NumberColumn("LDM", min_value=0.0, max_value=13.6, format="%.1f", width=70),
-                "Waga (t)": st.column_config.NumberColumn("Waga (t)", min_value=0.0, max_value=24.0, format="%.1f", width=80),
-                "Cena (EUR)": st.column_config.NumberColumn("Cena (EUR)", min_value=0.0, format="%.0f", width=95),
-                "Uwaga": st.column_config.TextColumn("Uwaga", width=160)})
-        saved = st.form_submit_button("💾 Zapisz zmiany w zleceniach", type="primary")
-    if saved:
-        rows = _rows_from_editor(plan, edited)
-
+    edited = st.data_editor(
+        _orders_editor_frame(plan), key=key, num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={
+            "Nr": st.column_config.TextColumn("Nr", width=80),
+            "Zleceniodawca": st.column_config.TextColumn("Zleceniodawca", width=130),
+            "Zał. kraj": st.column_config.TextColumn("Zał. kraj", max_chars=2, width=75),
+            "Zał. kod": st.column_config.TextColumn("Zał. kod", width=90),
+            "Zał. miasto": st.column_config.TextColumn("Zał. miasto", width=120),
+            "Data zał.": st.column_config.DateColumn("Data zał.", format="DD.MM.YYYY", width=115),
+            "Rozł. kraj": st.column_config.TextColumn("Rozł. kraj", max_chars=2, width=80),
+            "Rozł. kod": st.column_config.TextColumn("Rozł. kod", width=90),
+            "Rozł. miasto": st.column_config.TextColumn("Rozł. miasto", width=120),
+            "Data rozł.": st.column_config.DateColumn("Data rozł.", format="DD.MM.YYYY", width=115),
+            "LDM": st.column_config.NumberColumn("LDM", min_value=0.0, max_value=13.6, format="%.1f", width=70),
+            "Waga (t)": st.column_config.NumberColumn("Waga (t)", min_value=0.0, max_value=24.0, format="%.1f", width=80),
+            "Cena (EUR)": st.column_config.NumberColumn("Cena (EUR)", min_value=0.0, format="%.0f", width=95),
+            "Uwaga": st.column_config.TextColumn("Uwaga", width=160)})
+    rows = _rows_from_editor(plan, edited)
+    if ws.orders_differ(plan, rows):                    # każda zmiana zapisuje się i przelicza koszty od razu
         def mutate(p):
-            res = ws.update_orders(p, rows, geocode=ctx.geocode)
+            res = ws.update_orders(p, [r for r in rows if r["id"] in {x["id"] for x in p["orders"]}
+                                       or all(r.get(f) for f in ws.LOCATION_FIELDS)], geocode=ctx.geocode)
             parts = []
             if res["added"]:
-                parts.append(f"dodano {len(res['added'])}")
+                parts.append(f"dodano {', '.join(res['added'])}")
             if res["removed"]:
-                parts.append(f"usunięto {len(res['removed'])}")
+                parts.append(f"usunięto {', '.join(res['removed'])}")
             if res["relocated"]:
                 parts.append(f"nowe położenie: {', '.join(res['relocated'])}")
-            _flash("success", "Zapisano zlecenia" + (f" ({'; '.join(parts)})." if parts else " (bez zmian w liście)."))
+            if parts:
+                _flash("success", "Zapisano zlecenia (" + "; ".join(parts) + ").")
         pc.apply(mutate)
 
 
@@ -462,8 +496,9 @@ def _section_stops(pc: PlanCtx) -> None:
     if not plan["stops"]:
         empty_state("🧭", "Plan nie ma jeszcze punktów. Dodaj zlecenia w sekcji „➕ Dodaj”.")
         return
-    st.caption("Zmień numery w kolumnie „Nr”, aby przestawić punkty (mniejszy numer = wcześniej). Zaznacz „Usuń”, żeby wyrzucić "
-               "punkt dodatkowy albo całe zlecenie (usunięcie załadunku lub rozładunku usuwa oba punkty zlecenia).")
+    st.caption("Zmień numer w kolumnie „Nr”, aby przestawić punkt (mniejszy numer = wcześniej). Zaznacz „Usuń”, żeby wyrzucić "
+               "punkt dodatkowy albo całe zlecenie (usunięcie załadunku lub rozładunku usuwa oba punkty zlecenia). "
+               "Zmiany zapisują się i przeliczają koszty od razu.")
     kinds = {"L": "🟢▲ Załadunek", "U": "🔴▼ Rozładunek", "W": "📍 Punkt dodatkowy"}
     df = pd.DataFrame({
         "Nr": list(range(1, len(plan["stops"]) + 1)),
@@ -473,26 +508,22 @@ def _section_stops(pc: PlanCtx) -> None:
         "Uwaga": [s.get("note", "") if s["kind"] == "W" else "" for s in plan["stops"]],
         "Usuń": [False] * len(plan["stops"])})
     key = f"ws_stops_{pc.scope}_{pc.vehicle['id']}_{pc.nonce}"
-    with st.form(f"form_ws_stops_{pc.scope}_{pc.vehicle['id']}"):
-        edited = st.data_editor(df, key=key, hide_index=True, width="stretch", num_rows="fixed",
-                                disabled=["Typ", "Zlecenie / punkt", "Miejsce"],
-                                column_config={"Nr": st.column_config.NumberColumn("Nr", min_value=1, step=1, width=70),
-                                               "Typ": st.column_config.TextColumn("Typ", width=160),
-                                               "Zlecenie / punkt": st.column_config.TextColumn("Zlecenie / punkt", width=130),
-                                               "Miejsce": st.column_config.TextColumn("Miejsce", width=240),
-                                               "Uwaga": st.column_config.TextColumn("Uwaga (punkty dodatkowe)", width=200),
-                                               "Usuń": st.column_config.CheckboxColumn("Usuń", width=70)})
-        saved = st.form_submit_button("💾 Zapisz kolejność", type="primary")
-    for p in ws.validate(plan, pc.vehicle["max_ldm"], pc.vehicle["max_weight_t"]):
-        st.warning(p)
-    if saved:
-        nrs = [float(x) if pd.notna(x) else float(i + 1) for i, x in enumerate(edited["Nr"])]
-        dels = [bool(x) for x in edited["Usuń"]]
-        notes = list(edited["Uwaga"])
-
+    edited = st.data_editor(df, key=key, hide_index=True, width="stretch", num_rows="fixed",
+                            disabled=["Typ", "Zlecenie / punkt", "Miejsce"],
+                            column_config={"Nr": st.column_config.NumberColumn("Nr", min_value=1, step=1, width=70),
+                                           "Typ": st.column_config.TextColumn("Typ", width=160),
+                                           "Zlecenie / punkt": st.column_config.TextColumn("Zlecenie / punkt", width=130),
+                                           "Miejsce": st.column_config.TextColumn("Miejsce", width=240),
+                                           "Uwaga": st.column_config.TextColumn("Uwaga (punkty dodatkowe)", width=200),
+                                           "Usuń": st.column_config.CheckboxColumn("Usuń", width=70)})
+    nrs = [float(x) if pd.notna(x) else float(i + 1) for i, x in enumerate(edited["Nr"])]
+    dels = [bool(x) for x in edited["Usuń"]]
+    notes = list(edited["Uwaga"])
+    if ws.stop_edits_pending(plan, nrs, dels, notes):   # zmiana kolejności lub usunięcie zapisuje się od razu
         def mutate(p):
             dropped = ws.apply_stop_edits(p, nrs, dels, notes)
-            _flash("success", "Zapisano kolejność punktów" + (f" (usunięto zlecenia: {', '.join(sorted(dropped))})." if dropped else "."))
+            if dropped:
+                _flash("success", f"Usunięto zlecenia: {', '.join(sorted(dropped))}.")
         pc.apply(mutate)
 
 

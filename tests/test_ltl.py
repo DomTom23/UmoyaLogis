@@ -72,7 +72,7 @@ def test_costs():
     t = trip_time(585, 2, p)  # 9 h jazdy + 2 h postoju -> 2 dni
     assert t["days"] == 2
     c = operating_cost(1000, 2, p)
-    assert abs(c["fuel"] - 1000 * 0.30 * 1.55) < 1e-6 and abs(c["tolls"] - 200) < 1e-6
+    assert abs(c["fuel"] - 1000 * 0.27 * 1.70) < 1e-6 and abs(c["tolls"] - 200) < 1e-6
     assert trip_time(65 * 120, 2, p)["days"] > trip_time(65 * 56, 2, p)["days"] + 6  # tygodniowy odpoczynek
 
 
@@ -1276,3 +1276,26 @@ def test_workspace_stop_edits_and_editor_roundtrip():
     assert res["added"] == ["M1"] and res["removed"] == ["C"] and ws.order_ids(p) == ["A", "M1"]
     assert p["orders"][0]["price_eur"] == 999.0 and p["orders"][0]["start_lat"] == 52.0     # istniejące współrzędne zachowane
     assert p["orders"][1]["start_lat"] == 50.0 and p["orders"][1]["client"] == "Nowy"
+
+
+def test_workspace_live_edit_detection_and_blank_location():
+    from ltl import workspace as ws
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A"), _wo("B")])
+    same = [dict(o) for o in p["orders"]]
+    assert not ws.orders_differ(p, same)                                         # brak zmian = brak zapisu
+    assert ws.orders_differ(p, [dict(same[0], price_eur=1.0), same[1]])           # zmiana ceny
+    assert ws.orders_differ(p, same[:1])                                          # usunięty wiersz
+    partial = {"id": "N", "start_country": "PL", "start_postal": "00-001"}        # niepełny nowy wiersz: jeszcze nie liczymy
+    assert not ws.orders_differ(p, same + [partial])
+    full = {**_wo("N"), "start_lat": None, "end_lat": None}
+    assert ws.orders_differ(p, same + [full])
+    # kasowanie kodu czyści współrzędne (stara lokalizacja nie może zostać)
+    res = ws.update_orders(p, [dict(same[0], end_postal=""), same[1]], geocode=lambda c, pc: (1.0, 2.0))
+    assert p["orders"][0]["end_lat"] is None and any("nie ustalono położenia" in x for x in ws.validate(p))
+    # edycje kolejności
+    q = ws.new_plan()
+    ws.add_orders(q, [_wo("A"), _wo("B")])
+    assert not ws.stop_edits_pending(q, [1, 2, 3, 4], [False] * 4, [None] * 4)
+    assert ws.stop_edits_pending(q, [1, 3, 2, 4], [False] * 4, [None] * 4)
+    assert ws.stop_edits_pending(q, [1, 2, 3, 4], [False, False, True, False], [None] * 4)

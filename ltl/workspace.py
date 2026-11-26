@@ -153,6 +153,43 @@ def move_stop(plan: dict, index: int, delta: int) -> None:
     plan["vias"] = []
 
 
+EDITABLE_ORDER_FIELDS = tuple(f for f in ORDER_FIELDS if f not in
+                              ("start_lat", "start_lon", "end_lat", "end_lon", "load_from", "load_to", "unload_from",
+                               "unload_to", "source", "description", "load_type", "distance_km"))
+
+
+def orders_differ(plan: dict, rows: list[dict]) -> bool:
+    """Czy tabela zleceń z edytora różni się od planu (zmiana wartości, nowy lub usunięty wiersz)?
+    Nowy wiersz liczy się dopiero, gdy ma kraj i kod załadunku oraz rozładunku - do tego czasu można go spokojnie
+    uzupełniać (plan nie jest zapisywany ani przeliczany)."""
+    old = {o["id"]: o for o in plan["orders"]}
+    new = {}
+    for r in rows:
+        o = clean_order(r)
+        if not o["id"] or o["id"] in new:
+            continue
+        if o["id"] not in old and not all(o[f] for f in LOCATION_FIELDS):
+            continue
+        new[o["id"]] = o
+    if list(new) != list(old):
+        return True
+    return any(new[i][f] != old[i][f] for i in new for f in EDITABLE_ORDER_FIELDS)
+
+
+def stop_edits_pending(plan: dict, numbers: list, deletes: list, notes: list | None = None) -> bool:
+    """Czy tabela kolejności zawiera jakąkolwiek zmianę (numer inny niż pozycja, usunięcie, nowa uwaga)?"""
+    for i, s in enumerate(plan["stops"]):
+        if i < len(deletes) and deletes[i]:
+            return True
+        n = numbers[i] if i < len(numbers) else None
+        if n is not None and n == n and float(n) != i + 1:
+            return True
+        if s["kind"] == "W" and notes is not None and i < len(notes) and notes[i] is not None and notes[i] == notes[i] \
+                and str(notes[i]) != s.get("note", ""):
+            return True
+    return False
+
+
 def apply_stop_edits(plan: dict, numbers: list, deletes: list, notes: list | None = None) -> set:
     """Wynik edycji tabeli kolejności: ``numbers`` = nowe numery kolejności (mniejszy = wcześniej, remis = dotychczasowa
     kolejność), ``deletes`` = punkty do usunięcia (punkt dodatkowy znika sam; załadunek/rozładunek usuwa całe zlecenie),
@@ -198,7 +235,10 @@ def update_orders(plan: dict, rows: list[dict], geocode=None) -> dict:
                     o[from_f] = o[to_f] = None
         for side in ("start", "end"):
             changed = prev is None or any(prev[f"{side}_{k}"] != o[f"{side}_{k}"] for k in ("country", "postal"))
-            if (changed or o[f"{side}_lat"] is None) and geocode is not None and o[f"{side}_country"] and o[f"{side}_postal"]:
+            have_code = bool(o[f"{side}_country"] and o[f"{side}_postal"])
+            if changed and not have_code:                # kod wykasowany: stare współrzędne już nie pasują
+                o[f"{side}_lat"] = o[f"{side}_lon"] = None
+            elif (changed or o[f"{side}_lat"] is None) and geocode is not None and have_code:
                 o[f"{side}_lat"], o[f"{side}_lon"] = geocode(o[f"{side}_country"], o[f"{side}_postal"])
                 if prev is not None:
                     relocated.append(o["id"])

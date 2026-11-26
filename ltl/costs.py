@@ -9,8 +9,8 @@ from dataclasses import dataclass
 class CostParams:
     day_cost_eur: float = 300.0        # auto + kierowca za dzień pracy
     avg_speed_kmh: float = 65.0
-    fuel_l_per_100km: float = 30.0
-    fuel_price_eur: float = 1.55
+    fuel_l_per_100km: float = 27.0
+    fuel_price_eur: float = 1.70
     toll_eur_per_km: float = 0.20
     max_drive_h_day: float = 9.0       # limit jazdy na dobę
     max_drive_h_week: float = 56.0     # limit jazdy na tydzień

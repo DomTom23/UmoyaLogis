@@ -138,7 +138,8 @@ Zakładki **🧰 Workspace** i **🚛 Pojazdy** (po pięciu etapach wyszukiwania
 * **Praca osobista** - własne plany, widoczne po imieniu wpisanym w polu „Twoje imię” (imię jest zapamiętywane w
   adresie strony `?u=...`; to nie jest logowanie, tylko rozdzielenie planów). **Praca grupowa** - wspólne plany,
   które może edytować każdy pracownik; przy planie widać, kto zmienił go ostatnio.
-* Każda zmiana zapisuje się od razu w bazie (SQLite, tabele `vehicles` i `plans`; kopia zapasowa obejmuje je razem z resztą).
+* Zmiany w tabelach zleceń i kolejności punktów zapisują się od razu i **natychmiast przeliczają trasę, koszty, harmonogram i zysk**
+  (pasek kosztów jest widoczny w każdej sekcji). Wszystko trafia do bazy (SQLite, tabele `vehicles` i `plans`; kopia zapasowa obejmuje je razem z resztą).
   Gdy dwie osoby edytują ten sam plan grupowy, druga dostaje ostrzeżenie i najnowszą wersję zamiast po cichu nadpisanych danych.
 * Wariant z zakładki „5 · Trasa” wyślesz do workspace przyciskiem „Wyślij do workspace”; plan można skopiować między
   pracą osobistą a grupową (sekcja „Plan”).

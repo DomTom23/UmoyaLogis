@@ -108,8 +108,8 @@ with st.sidebar:
     st.caption("Zmiany działają od razu - nie trzeba ponownie wczytywać danych.")
 
     with st.expander("💶 Koszty", expanded=True):
-        fuel_price = st.number_input("Cena paliwa (EUR/l)", 0.5, 4.0, 1.55, 0.01)
-        consumption = st.number_input("Spalanie (l/100 km)", 10.0, 60.0, 30.0, 0.5)
+        fuel_price = st.number_input("Cena paliwa (EUR/l)", 0.5, 4.0, 1.70, 0.01)
+        consumption = st.number_input("Spalanie (l/100 km)", 10.0, 60.0, 27.0, 0.5)
         toll = st.number_input("Średnie myto (EUR/km)", 0.0, 1.0, 0.20, 0.01)
         day_cost = st.number_input("Koszt dnia pracy (EUR)", 0.0, 1000.0, 300.0, 10.0,
                                    help="Auto + kierowca za jeden dzień pracy.")
