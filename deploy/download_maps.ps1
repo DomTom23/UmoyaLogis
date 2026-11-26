@@ -58,7 +58,7 @@ docker volume rm vtest 2>&1 | Out-Null
 docker run --rm -v umoyalogis_valhalla_data:/d alpine sh -c "rm -rf /d/valhalla_tiles /d/valhalla_tiles.tar /d/admin_data /d/file_hashes.txt /d/duplicateways.txt" 2>&1 | Out-Null
 
 Step "Scalam mapy w jeden plik europe.osm.pbf (osmium, 30-90 min, bez komunikatow)"
-docker run --rm -v umoyalogis_valhalla_data:/d alpine sh -c "apk add --no-cache osmium-tool >/dev/null 2>&1 && cd /d && osmium merge *-latest.osm.pbf -o europe.osm.pbf --overwrite && rm -f /d/*-latest.osm.pbf && ls -la /d"
+docker run --rm -v umoyalogis_valhalla_data:/d debian:stable-slim sh -c "apt-get update -qq && apt-get install -y -qq osmium-tool && cd /d && osmium merge *-latest.osm.pbf -o europe.osm.pbf --overwrite && rm -f /d/*-latest.osm.pbf && ls -la /d"
 if ($LASTEXITCODE -ne 0) { Write-Host "BLAD scalania map. Wklej komunikat." -ForegroundColor Red; exit 1 }
 
 Step "Uruchamiam Valhalle (budowa kafli z jednego pliku potrwa kilka godzin)"
