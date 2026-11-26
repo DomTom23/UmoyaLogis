@@ -7,8 +7,6 @@ import streamlit as st
 
 # etapy wyboru wariantu = zakładki u góry strony (kolejność = kolejność pracy)
 STAGES = ["📥 1 · Dane", "📝 2 · Zlecenia", "🏁 3 · Start i punkty", "🏆 4 · Warianty", "🗺️ 5 · Trasa"]
-WORK_TABS = ["🧰 Workspace", "🚛 Pojazdy"]       # poza etapami wyszukiwania: ręczne plany tras i lista pojazdów
-ALL_TABS = STAGES + WORK_TABS
 STAGE_KEY = "stage"
 
 CSS = """
@@ -125,7 +123,7 @@ def empty_state(icon: str, message: str) -> None:
 
 def go_to(stage_index: int) -> None:
     """Callback przycisków „Dalej”: przełącza zakładkę (musi być ustawione przed utworzeniem zakładek, więc działa jako callback)."""
-    st.session_state[STAGE_KEY] = ALL_TABS[stage_index]
+    st.session_state[STAGE_KEY] = STAGES[stage_index]
 
 
 def next_button(label: str, stage_index: int, key: str, primary: bool = True) -> None:

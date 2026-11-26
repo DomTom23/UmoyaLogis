@@ -25,10 +25,9 @@ from ltl.schedule import ScheduleParams, from_h, order_windows
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
 from ltl.routing import VALHALLA_URL, RouteOptions, RouteResult, TruckProfile
 from ltl.sample import SAMPLE_TEXT
-from ltl.ui import ALL_TABS, STAGES, STAGE_KEY, cards, empty_state, go_to, hero, inject_css, kpis, next_button, step
+from ltl.ui import STAGES, STAGE_KEY, cards, empty_state, go_to, hero, inject_css, kpis, next_button, step
 from ltl.variant_detail import order_table, route_chain_html, stop_table
 from ltl.storage import OUTCOMES, InvalidName, NameExists, Store
-from ltl.workspace_ui import WsContext, render_vehicles_tab, render_workspace_tab, send_variant_ui
 
 st.set_page_config(page_title="Optymalizator Tras LTL", page_icon="🚛", layout="wide")
 
@@ -252,8 +251,7 @@ with hero_slot:
     hero(HERO_TITLE, HERO_SUB)
 
 # etapy pracy: zakładki (wszystkie są zawsze „narysowane”, więc wpisane dane nie giną przy przełączaniu)
-tab_data, tab_orders, tab_start, tab_variants, tab_route, tab_work, tab_vehicles = st.tabs(
-    ALL_TABS, key=STAGE_KEY, on_change="rerun")
+tab_data, tab_orders, tab_start, tab_variants, tab_route = st.tabs(STAGES, key=STAGE_KEY, on_change="rerun")
 
 
 # ------------------------------------------------------------ krok 1: dane
@@ -474,54 +472,6 @@ def _no_data_tabs(reason: str, tabs: tuple = ()) -> None:
             empty_state("📥", reason)
 
 
-# ------------------------------------------------------------ workspace (plany tras, pojazdy)
-def _ws_geocode(country: str, postal: str) -> tuple:
-    g = _geocoder(st.session_state.get("opt_online", True))
-    g.prefetch([(country, postal)])
-    lat, lon, _src = g.locate(country, postal)
-    g.save()
-    return float(lat), float(lon)
-
-
-def _ws_sched(start_at) -> ScheduleParams:
-    return ScheduleParams(
-        enabled=use_windows, speed_kmh=cost.avg_speed_kmh, max_work_h_day=cost.max_drive_h_day,
-        max_drive_h_week=cost.max_drive_h_week, daily_rest_h=daily_rest, weekly_rest_h=weekly_rest,
-        handling_h=cost.handling_h_per_stop, waypoint_h=cost.waypoint_stop_h, open_h=float(open_h),
-        close_h=float(close_h), tolerance_h=tol_h, charge_idle_days=charge_idle, start_at=start_at)
-
-
-def _ws_route(v, vias) -> RouteResult:
-    """Trasa planu z workspace: klucz pamięci podręcznej zawiera współrzędne wszystkich punktów (dane zleceń są edytowalne)."""
-    sig = ("ws", tuple((x.kind, round(x.lat, 5), round(x.lon, 5)) for x in v.stops),
-           tuple((x.leg, round(x.lat, 5), round(x.lon, 5)) for x in vias), provider, truck, valhalla_url, ors_key, route_opts)
-    hit = ROUTE_STORE.get(sig)
-    if hit and (hit[1].has_real or time.time() - hit[0] < 120):
-        return hit[1]
-    res = route_for_variant(v, vias, truck, provider, ors_key, valhalla_url, speed, route_opts)
-    ROUTE_STORE[sig] = (time.time(), res)
-    return res
-
-
-def _ws_ctx(pool=None, est=frozenset()) -> WsContext:
-    return WsContext(store=_store(), geocode=_ws_geocode, cost=cost, make_sched=_ws_sched, get_route=_ws_route,
-                     pool=pool, est_ids=frozenset(est))
-
-
-def _render_work(pool=None, est=frozenset()) -> None:
-    wctx = _ws_ctx(pool, est)
-    with tab_work:
-        render_workspace_tab(wctx)
-    with tab_vehicles:
-        render_vehicles_tab(wctx)
-
-
-def _stop_early() -> None:
-    """Brak danych do wyszukiwania: zakładki Workspace i Pojazdy działają mimo to."""
-    _render_work(None)
-    st.stop()
-
-
 if not analysis:
     with tab_data:
         with st.expander("ℹ️ Jak to działa", expanded=True):
@@ -532,7 +482,7 @@ if not analysis:
                 "4. **Wybierz wariant** z listy najlepszych doładunków (zakładka „Warianty”).\n"
                 "5. **Dopracuj trasę** na mapie: przeciągnij fragment linii, a koszty przeliczą się same.")
     _no_data_tabs("Najpierw wczytaj oferty w zakładce „Dane”.")
-    _stop_early()
+    st.stop()
 
 if parsed.empty:
     for t in (tab_data, tab_orders):
@@ -541,7 +491,7 @@ if parsed.empty:
             st.error("Nie rozpoznano żadnych zleceń. W danych muszą być kody w formacie „kraj kod” "
                      "(np. FR 77140, GB G1 1) dla miejsca załadunku i rozładunku każdej oferty.")
     _no_data_tabs("Nie rozpoznano żadnych zleceń - sprawdź dane w zakładce „Dane”.")
-    _stop_early()
+    st.stop()
 
 # --------------------------------------------------------- krok 2: zlecenia
 with tab_orders:
@@ -627,7 +577,7 @@ with tab_orders:
     if orders.empty:
         st.warning("Brak poprawnych wierszy - potrzebne są kraj i kod pocztowy załadunku oraz rozładunku.")
         _no_data_tabs("Brak poprawnych zleceń - uzupełnij tabelę w zakładce „Zlecenia”.", (tab_start, tab_variants, tab_route))
-        _stop_early()
+        st.stop()
 
     with st.form("save_orders_form", border=False):
         f1, f2, f3 = st.columns([3, 2, 1.4])
@@ -842,7 +792,7 @@ with tab_variants:
                    "odbioru (zlecenia z giełdy muszą mieć załadunek w limicie dni od niej), miejsce zrzutu i LDM."
                    if forced_ids else ""))
         _no_data_tabs("Nie ma wariantu do pokazania - zobacz wskazówki w zakładce „Warianty”.", (tab_route,))
-        _stop_early()
+        st.stop()
 
     # ranking po trasach rzeczywistych: liczony od razu, pamiętany do zmiany danych lub ustawień
     sig = (analysis["id"], hash(orders.drop(columns=["start_geo", "end_geo"]).to_csv()), cost, opt, provider,
@@ -997,8 +947,6 @@ with tab_route:
     v_clients = ", ".join(dict.fromkeys(c for i in v.order_ids if (c := client_map.get(i))))
     if v_clients:
         st.caption(f"Zleceniodawcy: {v_clients}")
-    with st.expander("🧰 Wyślij ten wariant do workspace (plan pojazdu do dalszej edycji)"):
-        send_variant_ui(_ws_ctx(orders_opt, est_ids), v, orders_opt, key=str(abs(hash(vkey)) % 10 ** 8))
     with st.spinner("Wyznaczanie trasy po drogach…"):
         route = get_route(v, vias)
     ev = evaluate_route(v, route, cost, time_ctx)
@@ -1120,5 +1068,3 @@ with tab_route:
             "EUR/km": st.column_config.NumberColumn("EUR/km", format="%.2f", width=65,
                                                      help="Cena zlecenia / jego własny dystans (z oferty lub szacowany)."),
             "Cena z": st.column_config.TextColumn("Cena z", width=70)})
-
-_render_work(orders_opt, est_ids)
