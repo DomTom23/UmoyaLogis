@@ -126,3 +126,19 @@ wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląd
 Aplikacja jest podzielona na pięć zakładek: **1 · Dane**, **2 · Zlecenia**, **3 · Start i punkty**, **4 · Warianty**, **5 · Trasa**.
 Po „Szukaj doładunków” widok sam przechodzi do zakładki Zlecenia, a przyciski „Dalej →” prowadzą do kolejnych etapów.
 Wygląd (kolory, czcionka Inter) ustawia `.streamlit/config.toml` oraz `ltl/ui.py`. Wymaga Streamlit ≥ 1.67.
+
+## Workspace i pojazdy
+
+Zakładki **🧰 Workspace** i **🚛 Pojazdy** (po pięciu etapach wyszukiwania) służą do ręcznego układania i poprawiania tras.
+
+* **Pojazdy** - lista pojazdów firmy (nazwa/numer, nadwozie, maks. LDM i ładowność, miejsce startu). Wspólna dla wszystkich.
+* **Workspace** - dla wybranego pojazdu jest osobny **plan**: zlecenia (z możliwością poprawiania danych), kolejność
+  załadunków i rozładunków, punkty dodatkowe, punkty pośrednie na mapie, data wyjazdu. Plan liczy się po drogach
+  (koszty, harmonogram z oknami czasowymi, kontrola limitu LDM/t i kolejności załadunek → rozładunek).
+* **Praca osobista** - własne plany, widoczne po imieniu wpisanym w polu „Twoje imię” (imię jest zapamiętywane w
+  adresie strony `?u=...`; to nie jest logowanie, tylko rozdzielenie planów). **Praca grupowa** - wspólne plany,
+  które może edytować każdy pracownik; przy planie widać, kto zmienił go ostatnio.
+* Każda zmiana zapisuje się od razu w bazie (SQLite, tabele `vehicles` i `plans`; kopia zapasowa obejmuje je razem z resztą).
+  Gdy dwie osoby edytują ten sam plan grupowy, druga dostaje ostrzeżenie i najnowszą wersję zamiast po cichu nadpisanych danych.
+* Wariant z zakładki „5 · Trasa” wyślesz do workspace przyciskiem „Wyślij do workspace”; plan można skopiować między
+  pracą osobistą a grupową (sekcja „Plan”).

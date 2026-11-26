@@ -1143,3 +1143,136 @@ def test_idle_days_waiting_for_windows_cost_money():
             assert ev["idle_cost"] == 0
             free = ev["profit"]
     assert charged < free and abs((free - charged) - idle_cost) < 1e-6              # różnica to dokładnie koszt dni czekania
+
+
+# ----------------------------------------------------------------- workspace
+def _wo(i, ldm=4.0, w=5.0, price=500.0, sp="62-800", ep="75001", lat=52.0, lon=17.0):
+    return {"id": i, "client": "K", "start_country": "pl", "start_postal": sp, "start_city": "A",
+            "end_country": "fr", "end_postal": ep, "end_city": "B", "start_lat": lat, "start_lon": lon,
+            "end_lat": 48.85, "end_lon": 2.35, "ldm": ldm, "weight_t": w, "price_eur": price,
+            "load_date": "2026-12-01", "unload_date": "2026-12-03"}
+
+
+def test_workspace_plan_edit_and_validate():
+    from ltl import workspace as ws
+    p = ws.new_plan("t")
+    assert ws.add_orders(p, [_wo("A"), _wo("B"), _wo("A")]) == ["A", "B"]       # duplikat numeru pominięty
+    assert [(s["kind"], s["order_id"]) for s in p["stops"]] == [("L", "A"), ("U", "A"), ("L", "B"), ("U", "B")]
+    assert ws.validate(p) == []
+    ws.reorder(p, [0, 2, 1, 3])                                                  # L A, L B, U A, U B
+    assert ws.validate(p) == [] and ws.peaks(p) == (8.0, 10.0)
+    ws.reorder(p, [2, 0, 1, 3])                                                  # U A przed L A
+    assert any("rozładunek jest przed załadunkiem" in x for x in ws.validate(p))
+    p2 = ws.new_plan()
+    ws.add_orders(p2, [_wo("X", ldm=9.0), _wo("Y", ldm=9.0)])
+    ws.reorder(p2, [0, 2, 1, 3])
+    assert any("Przeładowanie" in x for x in ws.validate(p2, max_ldm=13.6))
+    assert not any("Przeładowanie" in x for x in ws.validate(p2, max_ldm=20))
+
+
+def test_workspace_waypoints_and_removal():
+    from ltl import workspace as ws
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A"), _wo("B")])
+    w1 = ws.add_waypoint(p, "de", "10115", "Berlin", 52.5, 13.4, "magazyn", position=2)
+    w2 = ws.add_waypoint(p, "pl", "00-001", "", 52.2, 21.0)
+    assert (w1, w2) == ("P1", "P2") and p["stops"][2]["order_id"] == "P1"
+    ws.remove_stop(p, 2)                                                         # punkt dodatkowy znika sam
+    assert [s["order_id"] for s in p["stops"] if s["kind"] == "W"] == ["P2"] and len(p["orders"]) == 2
+    ws.remove_stop(p, 0)                                                         # załadunek A = usunięcie zlecenia A
+    assert ws.order_ids(p) == ["B"] and all(s.get("order_id") != "A" for s in p["stops"])
+
+
+def test_workspace_update_orders_geocodes_changes():
+    from ltl import workspace as ws
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A"), _wo("B")])
+    calls = []
+    rows = [dict(p["orders"][0], end_postal="69001"), _wo("C", ep="10115")]
+    res = ws.update_orders(p, rows, geocode=lambda c, pc: (calls.append((c, pc)), (1.0, 2.0))[1])
+    assert res["added"] == ["C"] and res["removed"] == ["B"] and "A" in res["relocated"]
+    assert ("FR", "69001") in calls and ("FR", "10115") in calls
+    assert ws.order_ids(p) == ["A", "C"]
+    assert [(s["kind"], s["order_id"]) for s in p["stops"]] == [("L", "A"), ("U", "A"), ("L", "C"), ("U", "C")]
+
+
+def test_workspace_variant_and_roundtrip():
+    from ltl import workspace as ws
+    from ltl.costs import CostParams
+    from ltl.optimizer import Stop
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A")])
+    v = ws.to_variant(p, Stop("START", "S", "PL", "62-800", "", 52.0, 17.0), CostParams())
+    assert [s.kind for s in v.stops] == ["S", "L", "U"] and v.revenue == 500.0 and v.total_km > 1000
+    assert ws.to_variant(ws.new_plan(), None, CostParams()) is None
+    frame = ws.orders_frame(p)
+    assert frame.loc[0, "id"] == "A" and frame.loc[0, "load_date"].isoformat() == "2026-12-01"
+    back = ws.from_variant(v, frame)
+    assert ws.order_ids(back) == ["A"] and [s["kind"] for s in back["stops"]] == ["L", "U"]
+
+
+def test_store_vehicles_and_plans_with_conflicts(tmp_path):
+    from ltl.storage import NameExists, PlanConflict, Store
+    s = Store(tmp_path / "w.db")
+    v = s.save_vehicle(name="WX 111", start_country="pl", start_postal="62-800", max_ldm=13.6)
+    s.save_vehicle(name="WX 222")
+    with __import__("pytest").raises(NameExists):
+        s.save_vehicle(name="WX 111")
+    assert list(s.vehicles()["name"]) == ["WX 111", "WX 222"]
+    # praca osobista: każdy użytkownik ma własny plan; grupowa: wspólny
+    assert s.save_plan("personal", "ala", v, {"orders": [1]}, 0, "ala") == 1
+    assert s.get_plan("personal", "ola", v) is None and s.get_plan("personal", "ala", v)["version"] == 1
+    assert s.save_plan("group", "", v, {"orders": [1, 2]}, 0, "ala") == 1
+    with __import__("pytest").raises(PlanConflict) as ei:                        # druga osoba nie zna wersji 1
+        s.save_plan("group", "", v, {"orders": []}, 0, "ola")
+    assert ei.value.current["updated_by"] == "ala"
+    assert s.save_plan("group", "", v, {"orders": [1, 2, 3]}, 1, "ola") == 2
+    assert s.plans_overview("group", "")[v]["n_orders"] == 3
+    s.retire_vehicle(v)
+    assert list(s.vehicles()["name"]) == ["WX 222"] and s.get_plan("group", "", v) is not None
+    s.delete_vehicle(v)
+    assert s.get_plan("group", "", v) is None
+
+
+def test_save_vehicles_editor_diff(tmp_path):
+    from ltl.storage import Store
+    from ltl.workspace_ui import VEHICLE_COLUMNS, save_vehicles
+    s = Store(tmp_path / "v.db")
+    a = s.save_vehicle(name="A1", start_country="PL", start_postal="62-800")
+    b = s.save_vehicle(name="B2")
+    before = s.vehicles()
+    shown = before.drop(columns=["active", "id"]).reset_index(drop=True).rename(columns=VEHICLE_COLUMNS)
+    edited = shown.copy()
+    edited.loc[0, VEHICLE_COLUMNS["note"]] = "zmieniony"
+    edited = edited.drop(index=1)                                           # B2 usunięty = wycofany
+    edited.loc[2] = ["C3", "", "firanka", 13.6, 24.0, "DE", "10115", "Berlin"]   # nowy wiersz
+    edited.loc[3] = ["A1", "", "", 13.6, 24.0, "", "", ""]                  # duplikat nazwy
+    msgs = save_vehicles(s, before, edited)
+    assert any("już istnieje" in m for _, m in msgs) and any("nowe 1, zaktualizowane 1, wycofane 1" in m for _, m in msgs)
+    names = list(s.vehicles()["name"])
+    assert names == ["A1", "C3"] and s.vehicles().iloc[0]["note"] == "zmieniony"
+
+
+def test_workspace_stop_edits_and_editor_roundtrip():
+    from ltl import workspace as ws
+    from ltl.workspace_ui import _orders_editor_frame, _rows_from_editor
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A"), _wo("B"), _wo("C")])
+    ws.add_waypoint(p, "de", "10115", "Berlin", 52.5, 13.4, "x")
+    # przestawienie: C na początek (numer 0), usunięcie punktu dodatkowego i zlecenia B
+    nums = [2, 3, 4, 5, 0, 0.5, 6]
+    dels = [False, False, True, False, False, False, True]
+    dropped = ws.apply_stop_edits(p, nums, dels, [None] * 7)
+    assert dropped == {"B"} and ws.order_ids(p) == ["A", "C"]
+    assert [(s["kind"], s["order_id"]) for s in p["stops"]] == [("L", "C"), ("U", "C"), ("L", "A"), ("U", "A")]
+    # tabela zleceń: edycja wartości, nowy wiersz bez numeru, usunięty wiersz
+    df = _orders_editor_frame(p)
+    assert list(df["Nr"]) == ["A", "C"]
+    df.loc[0, "Cena (EUR)"] = 999.0
+    df.loc[2] = [None, "Nowy", "PL", "00-001", "Warszawa", None, "DE", "10115", "Berlin", None, 3.0, 4.0, 700.0, ""]
+    df = df.drop(index=1)                                                        # zlecenie C usunięte
+    rows = _rows_from_editor(p, df)
+    res = ws.update_orders(p, rows, geocode=lambda c, pc: (50.0, 10.0))
+    assert res["added"] == ["M1"] and res["removed"] == ["C"] and ws.order_ids(p) == ["A", "M1"]
+    assert p["orders"][0]["price_eur"] == 999.0 and p["orders"][0]["start_lat"] == 52.0     # istniejące współrzędne zachowane
+    assert p["orders"][1]["start_lat"] == 50.0 and p["orders"][1]["client"] == "Nowy"
