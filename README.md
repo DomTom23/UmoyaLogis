@@ -152,3 +152,12 @@ znanych kodów (`prefiks`) → środek kraju. Chwilowe błędy sieci tylko na mi
 Kody bez dokładnej lokalizacji są wypisane w zakładce „2 · Zlecenia” (z możliwością ponowienia próby i ręcznego podania
 współrzędnych, zapamiętywanych na stałe), a w zakładce „1 · Dane” jest narzędzie „Sprawdź kod pocztowy” pokazujące krok po kroku,
 co zwróciła która usługa.
+
+## Wydajność
+
+Przeładowanie strony (kliknięcie, zmiana zakładki) trwa ułamek sekundy także przy kilkuset ofertach: kosztowne etapy
+(ceny, kwalifikacja, duplikaty, historia ofert) są buforowane do zmiany danych lub ustawień, scalanie poprawek z tabeli i
+wykrywanie duplikatów działa na całych kolumnach, a optymalizator (`ltl/optimizer.py`) używa szybszych struktur i odsiewa
+pary zleceń, które i tak nie zmieszczą się w limicie objazdu. Pamięć podręczna tras jest ograniczona (LRU), a równoległe
+zapytania o ten sam odcinek są łączone. Stare wersje funkcji są zachowane w `tests/ref_*.py`; testy sprawdzają, że nowe
+dają identyczne wyniki.

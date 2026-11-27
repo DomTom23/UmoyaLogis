@@ -11,7 +11,8 @@ import streamlit as st
 
 from ltl.auth import password_ok
 from ltl.costs import CostParams, profit
-from ltl.duplicates import DupParams, find_duplicates, find_geo_duplicates
+from ltl.duplicates import DupParams
+from ltl.pipeline import classify_orders, geo_duplicates, mark_duplicates
 from ltl.eligibility import ALL_BODIES, DEFAULT_BODIES, FleetProfile, check_eligibility
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.ingest import UnreadableFile, append_orders, clean_edited, parse_sources_report, read_source
@@ -23,7 +24,7 @@ from ltl.pricing import DEFAULT_RULES, RULE_COLUMNS, DIRECTION_LABELS, apply_pri
 from ltl.ranking import Ranked, rank_by_real_routes, ranked_to_frame, variant_key
 from ltl.schedule import ScheduleParams, from_h, order_windows
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
-from ltl.routing import VALHALLA_URL, RouteOptions, RouteResult, TruckProfile
+from ltl.routing import VALHALLA_URL, LRUCache, RouteOptions, RouteResult, TruckProfile
 from ltl.sample import SAMPLE_TEXT
 from ltl.ui import ALL_TABS, STAGES, STAGE_KEY, cards, empty_state, go_to, hero, inject_css, kpis, next_button, step
 from ltl.variant_detail import order_table, route_chain_html, stop_table
@@ -64,9 +65,9 @@ def _geocoder(online: bool) -> Geocoder:
 
 
 @st.cache_resource
-def _route_store() -> dict:
-    """Pamięć podręczna tras (zapisywane są trasy, w których choć część odcinków pochodzi z routingu)."""
-    return {}
+def _route_store() -> LRUCache:
+    """Pamięć podręczna tras (zapisywane są trasy, w których choć część odcinków pochodzi z routingu); ograniczona."""
+    return LRUCache(600)
 
 
 @st.cache_resource
@@ -74,16 +75,42 @@ def _store() -> Store:
     return Store()
 
 
-@st.cache_data(show_spinner="Rozpoznawanie zleceń…")
+@st.cache_data(show_spinner="Rozpoznawanie zleceń…", max_entries=8)
 def _parse(named: tuple, drop_no_price: bool, pln_per_eur: float):
     # format każdego źródła wykrywany automatycznie; zwraca (tabela, raport źródeł)
     return parse_sources_report(list(named), drop_without_price=drop_no_price, pln_per_eur=pln_per_eur)
 
 
-@st.cache_data(show_spinner="Szukanie najlepszych doładunków…")
+@st.cache_data(show_spinner="Szukanie najlepszych doładunków…", max_entries=10)
 def _search(orders: pd.DataFrame, cost: CostParams, opt: OptimizerParams, origin: Stop | None = None,
             waypoints: tuple = (), forced_ids: tuple = (), time_ctx: TimeCtx | None = None):
     return find_best_combinations(orders, cost, opt, origin, waypoints, forced_ids, time_ctx)
+
+
+@st.cache_data(show_spinner=False, max_entries=24)
+def _history_query(token: tuple, limit: int, **filters) -> pd.DataFrame:
+    """Odczyt historii ofert z bazy; ponowny odczyt dopiero po zmianie bazy (token) albo filtrów."""
+    return _store().query_history(limit=limit, **filters)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _history_count(token: tuple) -> int:
+    return _store().history_count()
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _history_clients(token: tuple) -> list:
+    return _store().history_clients()
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def _classify(orders: pd.DataFrame, price_rules, use_est: bool, fleet: FleetProfile, dup_params: DupParams) -> pd.DataFrame:
+    return classify_orders(orders, price_rules, use_est, fleet, dup_params)
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def _geo_dups(located: pd.DataFrame, prio: pd.Series, dup_params: DupParams) -> dict:
+    return geo_duplicates(located, prio, dup_params)
 
 
 _variant_key = variant_key
@@ -446,15 +473,16 @@ def source_notes(report: list, errors: list) -> None:
 
 def render_history() -> None:
     store = _store()
-    n_all = store.history_count()
+    token = store.version_token()
+    n_all = _history_count(token)
     with st.expander(f"📜 Historia ofert ({n_all})"):
         if n_all == 0:
             st.caption("Historia jest pusta. Oferty zapisują się automatycznie przy każdym wyszukiwaniu "
                        "(opcja „Zapisz oferty w historii” w kroku 1).")
             return
-        all_h = store.query_history(limit=50000)
+        all_h = _history_query(token, 50000)
         c1, c2, c3 = st.columns(3)
-        h_clients = c1.multiselect("Zleceniodawca", store.history_clients(), key="h_clients", placeholder="Wszyscy")
+        h_clients = c1.multiselect("Zleceniodawca", _history_clients(token), key="h_clients", placeholder="Wszyscy")
         h_text = c2.text_input("Szukaj (zleceniodawca, miasto, kod)", key="h_text")
         h_outcome = c3.selectbox("Wynik", ["(wszystkie)"] + OUTCOMES[1:], key="h_outcome")
         d1, d2, d3, d4 = st.columns(4)
@@ -468,7 +496,7 @@ def render_history() -> None:
         h_tc = e2.text_input("Kod rozładunku (początek)", key="h_tc", placeholder="np. PL 00, GB M")
         flt = dict(clients=h_clients, text=h_text, from_countries=h_from, to_countries=h_to, date_from=h_d1,
                    date_to=h_d2, outcome="" if h_outcome == "(wszystkie)" else h_outcome)
-        h = filter_orders(store.query_history(limit=3000, **flt), from_codes=h_fc, to_codes=h_tc)
+        h = filter_orders(_history_query(token, 3000, **flt), from_codes=h_fc, to_codes=h_tc)
         priced = h[h.price_eur.notna()]
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Oferty", len(h))
@@ -513,7 +541,7 @@ def render_history() -> None:
             diff = (old.fillna("") != new.fillna("")).any(axis=1)
             n_changed = _store().update_history(edited_h.loc[diff.reindex(edited_h["id"]).values, keys])
             st.toast(f"Zapisano zmiany w historii ({n_changed}).", icon="💾")
-        s2.download_button("⬇️ Pobierz CSV", h.to_csv(index=False, sep=";").encode("utf-8-sig"),
+        s2.download_button("⬇️ Pobierz CSV", lambda: h.to_csv(index=False, sep=";").encode("utf-8-sig"),     # tworzone dopiero po kliknięciu
                            file_name="historia_ofert.csv", mime="text/csv", width="stretch")
 
 
@@ -755,17 +783,10 @@ with tab_orders:
             st.warning(f"Tabela „{save_name.strip()}” już istnieje - zaznacz „Nadpisz” albo wybierz inną nazwę.")
         except InvalidName as e:
             st.warning(str(e))
-    # 1) ceny (z oferty / szacunkowe) i kwalifikacja ofert dla naszego zestawu - jeszcze bez geokodowania
-    orders = apply_price_rules(orders, price_rules, use_est)
-    fleet_why = check_eligibility(orders, fleet)
-    orders["exclusion"] = [w or ("bez ceny: " + note if kind == "brak" else "")
-                           for w, kind, note in zip(fleet_why, orders["price_kind"], orders["price_note"])]
-    # duplikaty: z grupy zostaje oferta pasująca do zestawu i najlepiej płatna; reszta dostaje powód „duplikat”
+    # 1) ceny (z oferty / szacunkowe), kwalifikacja ofert dla naszego zestawu i duplikaty - jeszcze bez geokodowania
+    #    (wynik pamiętany, dopóki dane i ustawienia się nie zmienią)
+    orders = _classify(orders, price_rules, use_est, fleet, dup_params)
     prio = (orders["exclusion"] == "").astype(float) * 1e9 + orders["price_used_eur"].fillna(0.0)
-    dup_of = find_duplicates(orders, prio, dup_params)
-    if dup_of:
-        orders["exclusion"] = [(f"{e}, " if e else "") + f"duplikat {dup_of[i]}" if i in dup_of else e
-                               for i, e in zip(orders.index, orders["exclusion"])]
     use = orders["exclusion"] == ""
 
     # 2) położenie tylko dla ofert, które wejdą do wyszukiwania (duże wklejki mają setki kodów)
@@ -786,10 +807,9 @@ with tab_orders:
         orders[col] = located[col].reindex(orders.index)
     orders["geo_precise"] = orders["geo_precise"].fillna(True).astype(bool)
     # duplikaty wg położenia na mapie (ten sam punkt załadunku i rozładunku, także przy różnych kodach i nazwach)
-    geo_dup = find_geo_duplicates(orders[use], prio, dup_params)
+    geo_dup = _geo_dups(orders[use], prio[use], dup_params)
     if geo_dup:
-        orders["exclusion"] = [(f"{e}, " if e else "") + f"duplikat {geo_dup[i]}" if i in geo_dup else e
-                               for i, e in zip(orders.index, orders["exclusion"])]
+        orders = mark_duplicates(orders, geo_dup)
         use = orders["exclusion"] == ""
 
     est = haversine_km(orders.start_lat, orders.start_lon, orders.end_lat, orders.end_lon) * ROAD_FACTOR

@@ -19,6 +19,7 @@ przycinanie nie gubi żadnego poprawnego wariantu.
 from __future__ import annotations
 
 import math
+from datetime import date
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Optional
@@ -89,15 +90,22 @@ def _best_route(idx, D, ldm, wt, max_ldm, max_wt, bound=float("inf"), d0=None, o
 
     Zwraca (dystans, [kolejność punktów]) lub None. `idx` to lista indeksów zleceń. `d0` (opcjonalnie) to
     odległości od miejsca startu pojazdu do punktów - wlicza dojazd do pierwszego załadunku.
+    `D` może być macierzą numpy albo listą list (ta druga jest ok. 3x szybsza przy odczycie pojedynczych komórek).
     """
     k = len(idx)
+    if not isinstance(D, list):
+        D = D.tolist()
+    if k == 2 and bound == float("inf"):
+        return _best_route_pair(idx, D, ldm, wt, max_ldm, max_wt, d0, ok)
     best = [bound, None]
     order = []
+    full = (1 << k) - 1
+    eps_l, eps_w = max_ldm + 1e-9, max_wt + 1e-9
 
     def rec(cur, dist, done_mask, picked_mask, l_ldm, l_wt):
         if dist >= best[0]:
             return
-        if done_mask == (1 << k) - 1:
+        if done_mask == full:
             if ok is not None and not ok(order):       # kolejność niemieszcząca się w oknach czasowych
                 return
             best[0], best[1] = dist, order.copy()
@@ -109,20 +117,61 @@ def _best_route(idx, D, ldm, wt, max_ldm, max_wt, bound=float("inf"), d0=None, o
             o = idx[j]
             if not picked_mask & bit:  # załadunek
                 n_ldm, n_wt = l_ldm + ldm[o], l_wt + wt[o]
-                if n_ldm > max_ldm + 1e-9 or n_wt > max_wt + 1e-9:
+                if n_ldm > eps_l or n_wt > eps_w:
                     continue
                 p = 2 * o
-                step = (0.0 if d0 is None else d0[p]) if cur is None else D[cur, p]
+                step = (0.0 if d0 is None else d0[p]) if cur is None else D[cur][p]
                 order.append(p)
                 rec(p, dist + step, done_mask, picked_mask | bit, n_ldm, n_wt)
             else:  # rozładunek
                 p = 2 * o + 1
                 order.append(p)
-                rec(p, dist + D[cur, p], done_mask | bit, picked_mask, l_ldm - ldm[o], l_wt - wt[o])
+                rec(p, dist + D[cur][p], done_mask | bit, picked_mask, l_ldm - ldm[o], l_wt - wt[o])
             order.pop()
 
     rec(None, 0.0, 0, 0, 0.0, 0.0)
     return (best[0], best[1]) if best[1] is not None else None
+
+
+# kolejność przeglądania sześciu możliwych układów dwóch zleceń (a = idx[0], b = idx[1]) - dokładnie taka, jak w DFS
+# powyżej; L/U + zlecenie: (0, 'L') = załadunek a, (1, 'U') = rozładunek b itd.
+_PAIR_ORDERS = (((0, 0), (0, 1), (1, 0), (1, 1)),
+                ((0, 0), (1, 0), (0, 1), (1, 1)),
+                ((0, 0), (1, 0), (1, 1), (0, 1)),
+                ((1, 0), (0, 0), (0, 1), (1, 1)),
+                ((1, 0), (0, 0), (1, 1), (0, 1)),
+                ((1, 0), (1, 1), (0, 0), (0, 1)))
+
+
+def _best_route_pair(idx, D, ldm, wt, max_ldm, max_wt, d0, ok):
+    """To samo co DFS w `_best_route` dla dokładnie dwóch zleceń, bez rekurencji: sprawdza sześć układów w tej samej
+    kolejności i wybiera pierwszy o najmniejszym dystansie (jak odcinanie `dist >= best` w DFS)."""
+    o = (idx[0], idx[1])
+    eps_l, eps_w = max_ldm + 1e-9, max_wt + 1e-9
+    best_d, best_seq = float("inf"), None
+    for seq in _PAIR_ORDERS:
+        cur_l = cur_w = 0.0
+        fits = True
+        for i, u in seq:                                   # zapełnienie naczepy po każdej operacji
+            if u == 0:
+                cur_l, cur_w = cur_l + ldm[o[i]], cur_w + wt[o[i]]
+                if cur_l > eps_l or cur_w > eps_w:
+                    fits = False
+                    break
+            else:
+                cur_l, cur_w = cur_l - ldm[o[i]], cur_w - wt[o[i]]
+        if not fits:
+            continue
+        pts = [2 * o[i] + u for i, u in seq]
+        dist = 0.0 if d0 is None else d0[pts[0]]
+        for a, b in zip(pts, pts[1:]):
+            dist += D[a][b]
+        if dist >= best_d:
+            continue
+        if ok is not None and not ok(pts):
+            continue
+        best_d, best_seq = dist, pts
+    return (best_d, best_seq) if best_seq is not None else None
 
 
 def plan_len(D, seq) -> float:
@@ -140,7 +189,10 @@ def _insert(seq, j, D, ldm, wt, max_ldm, max_wt, ok=None):
 
     Zwraca (nowa kolejność, przyrost dystansu) albo None, gdy nie mieści się na naczepie.
     Kolejność jest sprawdzana dla każdej pozycji załadunku i rozładunku (załadunek przed rozładunkiem).
+    Odległości łączące punkty `seq` z nowymi są liczone raz na punkt (a nie dla każdej pary pozycji).
     """
+    if not isinstance(D, list):
+        D = D.tolist()
     L = len(seq)
     la_l, la_w = [0.0], [0.0]
     for p in seq:
@@ -149,26 +201,34 @@ def _insert(seq, j, D, ldm, wt, max_ldm, max_wt, ok=None):
         la_w.append(la_w[-1] + sign * wt[p // 2])
     P, Q = 2 * j, 2 * j + 1
     dl, dw = ldm[j], wt[j]
-
-    def d(a, b):
-        return 0.0 if a is None or b is None else float(D[a, b])
+    eps_l, eps_w = max_ldm + 1e-9, max_wt + 1e-9
+    DP, DQ = D[P], D[Q]
+    d_pq = DP[Q]
+    # d(prev, X) dla prev = seq[i-1], d(X, next) dla next = seq[i], d(prev, next); brzeg (None) = 0
+    p_in = [0.0] + [D[seq[i - 1]][P] for i in range(1, L + 1)]          # d(seq[i-1], P)
+    p_out = [DP[seq[i]] for i in range(L)] + [0.0]                       # d(P, seq[i])
+    q_in = [0.0] + [D[seq[i - 1]][Q] for i in range(1, L + 1)]          # d(seq[i-1], Q)
+    q_out = [DQ[seq[i]] for i in range(L)] + [0.0]                       # d(Q, seq[i])
+    link = [0.0] + [D[seq[i - 1]][seq[i]] for i in range(1, L)] + [0.0]  # d(seq[i-1], seq[i])
 
     best = None
     cands = [] if ok is not None else None            # z oknami czasowymi: najtańsza POZYCJA, która się mieści w terminach
     for i in range(L + 1):
-        prev_i = seq[i - 1] if i > 0 else None
-        next_i = seq[i] if i < L else None
-        pd_ = d(prev_i, P) + d(P, next_i) - d(prev_i, next_i)
+        pd_ = p_in[i] + p_out[i] - link[i]
         run_l = run_w = -1e18
         for k in range(i, L + 1):
-            run_l, run_w = max(run_l, la_l[k]), max(run_w, la_w[k])
-            if run_l + dl > max_ldm + 1e-9 or run_w + dw > max_wt + 1e-9:
+            la = la_l[k]
+            if la > run_l:
+                run_l = la
+            lw = la_w[k]
+            if lw > run_w:
+                run_w = lw
+            if run_l + dl > eps_l or run_w + dw > eps_w:
                 break
             if k == i:
-                delta = d(prev_i, P) + d(P, Q) + d(Q, next_i) - d(prev_i, next_i)
+                delta = p_in[i] + d_pq + q_out[i] - link[i]
             else:
-                prev_k, next_k = seq[k - 1], (seq[k] if k < L else None)
-                delta = pd_ + d(prev_k, Q) + d(Q, next_k) - d(prev_k, next_k)
+                delta = pd_ + q_in[k] + q_out[k] - link[k]
             if cands is not None:
                 cands.append((delta, i, k))
             elif best is None or delta < best[0]:
@@ -234,6 +294,7 @@ def find_best_combinations(
         D = road_distance_matrix(lats, lons)
         single = np.array([D[2 * i, 2 * i + 1] for i in range(n)])
     stats["candidates"] = n
+    Dl = D.tolist()                       # odczyt pojedynczych komórek z listy list jest kilka razy szybszy niż z numpy
 
     ldm, wt = df["ldm"].to_numpy(float), df["weight_t"].to_numpy(float)
     price = df["price_eur"].to_numpy(float)
@@ -263,8 +324,23 @@ def find_best_combinations(
              for a, b, c, d, w, m, ld in zip(df["start_lat"], df["start_lon"], df["end_lat"], df["end_lon"],
                                               df["weight_t"], df["ldm"], df["load_date"])]
 
+    gap = opt.max_load_date_gap_days
+    if gap is None:
+        date_ord = None
+    elif all(x is None or type(x) is date for x in ldates):       # zwykłe daty: porównanie liczb zamiast obiektów pandas
+        date_ord = [None if x is None else x.toordinal() for x in ldates]
+    else:
+        date_ord = False
+
     def pair_ok(a, b):
-        return cargo[a] != cargo[b] and _date_ok(ldates[a], ldates[b], opt.max_load_date_gap_days)
+        if cargo[a] == cargo[b]:
+            return False
+        if gap is None:
+            return True
+        if date_ord is False:
+            return _date_ok(ldates[a], ldates[b], gap)
+        oa, ob = date_ord[a], date_ord[b]
+        return oa is None or ob is None or abs(oa - ob) <= gap
 
     # trasa bazowa: zlecenie główne + zlecenia obowiązkowe (własne ładunki); bez obowiązkowych = samo zlecenie główne
     seed: dict[int, tuple] = {}
@@ -273,7 +349,7 @@ def find_best_combinations(
             continue
         seq, ok = [2 * m, 2 * m + 1], True
         for f in sorted(forced, key=lambda f: D[2 * m, 2 * f]):
-            ins = _insert(seq, f, D, ldm, wt, opt.max_ldm, opt.max_weight_t, ok_seq)
+            ins = _insert(seq, f, Dl, ldm, wt, opt.max_ldm, opt.max_weight_t, ok_seq)
             if ins is None:
                 ok = False
                 break
@@ -281,7 +357,7 @@ def find_best_combinations(
         if not ok:
             continue
         if forced and len(forced) + 1 <= 3:
-            r = _best_route(sorted([m, *forced]), D, ldm, wt, opt.max_ldm, opt.max_weight_t, ok=ok_seq)
+            r = _best_route(sorted([m, *forced]), Dl, ldm, wt, opt.max_ldm, opt.max_weight_t, ok=ok_seq)
             if r and r[0] < plan_len(D, seq):
                 seq = r[1]
         if ok_seq is not None and not ok_seq(seq):         # zlecenie główne (z własnymi ładunkami) nie mieści się w oknach
@@ -290,13 +366,27 @@ def find_best_combinations(
     market = [m for m in market if m in seed]
 
     compat: dict[int, list[int]] = {}
+    mk = np.array(market, dtype=int)
     for m in market:
         lst = []
         slack = seed[m][1] - single[m]             # o tyle trasa bazowa jest dłuższa przez własne ładunki
+        limit = opt.max_detour_km + slack
+        # Dolna granica objazdu dla zlecenia j (z nierówności trójkąta): każdy punkt X trasy przez A=załadunek m i
+        # B=rozładunek m jest od niej oddalony co najmniej o min(|XA|, |XB|, |AX|+|XB|-|AB|). Jeśli któryś punkt
+        # zlecenia j przekracza limit objazdu, żadna kolejność nie zmieści się w nim - nie ma po co jej szukać
+        # (wynik jest ten sam, bo takie pary i tak odpadłyby w teście `r[0] - single[m] <= limit` poniżej).
+        A, B = 2 * m, 2 * m + 1
+        sm = D[A, B]
+        too_far = np.zeros(len(mk), dtype=bool)
+        for off in (0, 1):
+            X = 2 * mk + off
+            dA, dB = D[A, X], D[B, X]
+            too_far |= np.minimum(np.minimum(dA, dB), dA + dB - sm) > limit + 1.0       # 1 km zapasu na błędy zaokrągleń
+        far = dict(zip(market, too_far.tolist()))
         for j in market:
-            if j == m or pos[j] < pos[m] or not pair_ok(m, j):
+            if j == m or pos[j] < pos[m] or far[j] or not pair_ok(m, j):
                 continue
-            r = _best_route([m, j], D, ldm, wt, opt.max_ldm, opt.max_weight_t, ok=ok_seq)
+            r = _best_route([m, j], Dl, ldm, wt, opt.max_ldm, opt.max_weight_t, ok=ok_seq)
             if r and r[0] - single[m] <= opt.max_detour_km + slack:       # wstępne odsiewanie; limit sprawdza wiązka
                 lst.append((price[j] / (max(r[0] - single[m] - slack, 0.0) + 50.0), j))   # przychód za dodatkowy km
         lst.sort(reverse=True)
@@ -339,7 +429,7 @@ def find_best_combinations(
                     if evals > budget_end:        # budżet tego zlecenia głównego wyczerpany - idziemy do następnego
                         cut = stats["truncated"] = True
                         break
-                    ins = _insert(seq, j, D, ldm, wt, opt.max_ldm, opt.max_weight_t, ok_seq)
+                    ins = _insert(seq, j, Dl, ldm, wt, opt.max_ldm, opt.max_weight_t, ok_seq)
                     if ins is None:
                         continue
                     nseq, delta = ins
@@ -363,7 +453,7 @@ def find_best_combinations(
                 else:
                     full, cal_h = plan.length_and_hours(nseq)
                 if len(fk) <= 3:  # małe zestawy: dokładna kolejność (z dojazdem ze startu)
-                    r = _best_route(sorted(fk), D, ldm, wt, opt.max_ldm, opt.max_weight_t, d0=d0, ok=ok_seq)
+                    r = _best_route(sorted(fk), Dl, ldm, wt, opt.max_ldm, opt.max_weight_t, d0=d0, ok=ok_seq)
                     if r:
                         alt, alt_h = (r[0], 0.0) if plan.trivial else plan.length_and_hours(r[1])
                         if alt < full - 1e-9:

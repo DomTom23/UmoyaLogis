@@ -132,7 +132,7 @@ class Geocoder:
         self._cache: dict[str, list] = {}
         self._dirty = False
         self._miss: dict[str, float] = {}
-        self._health: dict[str, list] = {"zippopotam": [0, 0.0], "nominatim": [0, 0.0]}   # [kolejne porażki, wstrzymana do]
+        self._health: dict[str, list] = {"zippopotam": [0, 0.0, False], "nominatim": [0, 0.0, False]}   # [porażki, wstrzymana do, po wstrzymaniu]
         self._lock = threading.Lock()
         self._nom_lock = threading.Lock()
         if self.cache_path and self.cache_path.exists():
@@ -150,14 +150,15 @@ class Geocoder:
         return self._service_ok("nominatim")
 
     def _good(self, name: str) -> None:
-        self._health[name][0] = 0
+        h = self._health[name]
+        h[0], h[2] = 0, False
 
     def _failed(self, name: str, hard: bool = False) -> None:
         with self._lock:
             h = self._health[name]
             h[0] += 1
-            if hard or h[0] >= 3:
-                h[0], h[1] = 0, time.monotonic() + self.PAUSE_S
+            if hard or h[0] >= 3 or h[2]:                 # po wstrzymaniu wystarczy jedna nieudana próba, by wstrzymać znowu
+                h[0], h[1], h[2] = 0, time.monotonic() + self.PAUSE_S, True
 
     # ---- klucze i warianty kodu
     @staticmethod
@@ -199,8 +200,8 @@ class Geocoder:
                 self._good("zippopotam")
                 return None
             except (urllib.error.URLError, OSError, ValueError):
-                if attempt == 1:
-                    time.sleep(0.4)               # jedna szybka ponowna próba przy chwilowym błędzie
+                if attempt == 1 and not self._health["zippopotam"][2]:
+                    time.sleep(0.2)               # jedna szybka ponowna próba przy chwilowym błędzie (nie tuż po wstrzymaniu)
                     continue
                 self._failed("zippopotam")
                 return None
@@ -330,7 +331,7 @@ class Geocoder:
         with self._lock:
             self._miss.clear()
             for h in self._health.values():
-                h[0], h[1] = 0, 0.0
+                h[0], h[1], h[2] = 0, 0.0, False
 
     def set_manual(self, country: str, postal: str, lat: float, lon: float) -> None:
         """Ręcznie podane współrzędne kodu (zapamiętywane na dysku jak pozostałe)."""

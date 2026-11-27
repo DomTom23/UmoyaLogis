@@ -153,6 +153,18 @@ class Store:
         finally:
             conn.close()
 
+    def version_token(self) -> tuple:
+        """Tani znacznik „czy baza się zmieniła” (czas i rozmiar pliku bazy oraz dziennika WAL) - do buforowania
+        odczytów, które inaczej wykonywałyby się przy każdym przeładowaniu strony."""
+        out = []
+        for suffix in ("", "-wal"):
+            try:
+                st_ = os.stat(f"{self.path}{suffix}")
+                out.append((st_.st_mtime_ns, st_.st_size))
+            except OSError:
+                out.append((0, 0))
+        return tuple(out)
+
     # ------------------------------------------------------------ zapis
     def _upsert_header(self, c, kind: str, name: str, n_rows: int, note: str, overwrite: bool) -> int:
         now = datetime.now().isoformat(timespec="seconds")

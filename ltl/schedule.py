@@ -124,20 +124,28 @@ def order_windows(df: pd.DataFrame, p: ScheduleParams) -> dict:
 
 
 def sync_windows(df: pd.DataFrame) -> pd.DataFrame:
-    """Po ręcznej zmianie daty w tabeli stare okno (z godzinami) przestaje pasować: wracamy do okna z samej daty."""
+    """Po ręcznej zmianie daty w tabeli stare okno (z godzinami) przestaje pasować: wracamy do okna z samej daty.
+    (Operacje na całych kolumnach; wcześniejsza pętla po wierszach była wolna przy kilkuset zleceniach.)"""
     df = df.copy()
     for side in ("load", "unload"):
         fcol, tcol, dcol = f"{side}_from", f"{side}_to", f"{side}_date"
         if fcol not in df.columns:
             continue
-        for i in df.index:
-            f, d = df.at[i, fcol], df.at[i, dcol]
-            if not _is_na(f) and (_is_na(d) or pd.Timestamp(f).date() != pd.Timestamp(d).date()):
-                if _is_na(d):
-                    df.at[i, dcol] = pd.Timestamp(f).date()
-                else:                                   # data zmieniona ręcznie: okno z godzinami jest nieaktualne
-                    df.at[i, fcol] = pd.NaT
-                    df.at[i, tcol] = pd.NaT
+        f = pd.to_datetime(df[fcol], errors="coerce")
+        has_f = f.notna()
+        if not has_f.any():
+            continue
+        d = pd.to_datetime(df[dcol], errors="coerce")
+        d_na = d.isna()
+        fill = has_f & d_na                                   # brak daty, jest okno: data z okna
+        clear = has_f & ~d_na & (f.dt.normalize() != d.dt.normalize())   # data zmieniona ręcznie: okno nieaktualne
+        if fill.any():
+            col = df[dcol].astype(object)
+            col[fill] = f[fill].dt.date
+            df[dcol] = col
+        if clear.any():
+            df.loc[clear, fcol] = pd.NaT
+            df.loc[clear, tcol] = pd.NaT
     return df
 
 

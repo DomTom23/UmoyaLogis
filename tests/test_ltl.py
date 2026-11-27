@@ -1472,3 +1472,153 @@ def test_geocoder_nominatim_city_fallback(monkeypatch):
     assert g.locate("PL", "00-001", "Warszawa")[2] == "online"
     assert g.locate("PL", "00-002", "")[2] == "prefiks"       # bez miasta, ale podobny do znanego kodu
     assert g.locate("DE", "20095", "")[2] == "kraj"
+
+
+# ------------------------------------------- optymalizacja wydajności: wyniki muszą być identyczne jak we wzorcach
+def _synthetic_orders(n, seed):
+    import datetime as dt
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    base = dt.date(2026, 12, 1)
+    rows = []
+    for i in range(n):
+        a = rng.uniform([44.0, 0.0], [54.0, 18.0])
+        b = a + rng.uniform([-4.0, -5.0], [4.0, 6.0])
+        rows.append({"id": f"T{i + 1}", "start_country": "FR", "start_postal": f"{10000 + i}", "start_city": "A",
+                     "end_country": "DE", "end_postal": f"{20000 + i}", "end_city": "B",
+                     "start_lat": a[0], "start_lon": a[1], "end_lat": b[0], "end_lon": b[1],
+                     "ldm": float(rng.choice([0.5, 1.2, 2.0, 3.5, 5.0, 8.0, 13.6])), "weight_t": float(rng.choice([0.5, 2.0, 6.0, 12.0, 24.0])),
+                     "price_eur": float(rng.integers(200, 2500)), "load_date": base + dt.timedelta(days=int(rng.integers(0, 4)))})
+    return pd.DataFrame(rows)
+
+
+def test_optimizer_matches_reference_implementation():
+    import ref_optimizer as old
+    from ltl import optimizer as new
+    from ltl.optimizer import OptimizerParams, Stop
+    origin = Stop("START", "S", "PL", "62-800", "", 52.0, 17.0)
+    wp = (Stop("P1", "W", "DE", "10115", "Berlin", 52.52, 13.4),)
+
+    def sig(vs):
+        return [(tuple(v.order_ids), round(v.profit, 6), round(v.total_km, 6), [(s.kind, s.order_id) for s in v.stops]) for v in vs]
+    for seed, kw, prm in ((1, {}, {}), (2, {"origin": origin}, {"max_detour_km": 150.0}),
+                          (3, {"origin": origin, "waypoints": wp}, {"hard_cap_orders": 4}),
+                          (4, {}, {"max_load_date_gap_days": None})):
+        df = _synthetic_orders(60, seed)
+        a, sa = old.find_best_combinations(df, CostParams(), OptimizerParams(top_n=15, **prm), **kw)
+        b, sb = new.find_best_combinations(df, CostParams(), OptimizerParams(top_n=15, **prm), **kw)
+        assert a and sig(a) == sig(b) and sa == sb, f"różnice dla ziarna {seed}"
+
+
+def test_best_route_and_insert_match_reference_on_random_inputs():
+    import random
+    import numpy as np
+    import ref_optimizer as old
+    from ltl import optimizer as new
+    from ltl.geo import road_distance_matrix
+    random.seed(11)
+    np.random.seed(11)
+    for _ in range(600):
+        n = random.randint(2, 8)
+        D = road_distance_matrix(np.random.uniform(40, 55, 2 * n), np.random.uniform(-5, 20, 2 * n))
+        ldm = np.random.choice([0.5, 2, 4, 6, 8, 10, 13.6], n).astype(float)
+        wt = np.random.choice([1, 5, 12, 20, 24], n).astype(float)
+        mx_l, mx_w = random.choice([13.6, 10.0]), random.choice([24.0, 15.0])
+        d0 = None if random.random() < 0.5 else np.random.uniform(0, 500, 2 * n)
+        forb = random.randint(0, 2 * n - 1)
+        ok = None if random.random() < 0.6 else (lambda seq, f=forb: seq[-1] != f)
+        idx = random.sample(range(n), min(random.choice([1, 2, 2, 3]), n))
+        assert old._best_route(idx, D, ldm, wt, mx_l, mx_w, d0=d0, ok=ok) == new._best_route(idx, D, ldm, wt, mx_l, mx_w, d0=d0, ok=ok)
+        base = random.sample(range(n), random.randint(1, n - 1))
+        j = random.choice([x for x in range(n) if x not in base])
+        r = old._best_route(sorted(base), D, ldm, wt, mx_l, mx_w)
+        if r:
+            assert old._insert(r[1], j, D, ldm, wt, mx_l, mx_w, ok) == new._insert(r[1], j, D.tolist(), ldm, wt, mx_l, mx_w, ok)
+
+
+def test_merge_edits_matches_reference_implementation():
+    from ltl.ingest import parse_sources_report
+    import random
+    import numpy as np
+    import ref_ordertable as old
+    from ltl.ordertable import merge_edits
+    from ltl.sample import SAMPLE_TEXT
+    work, _ = parse_sources_report([("p", SAMPLE_TEXT)])
+    random.seed(5)
+    for trial in range(40):
+        ids = list(work["id"])
+        view = random.sample(ids, random.randint(2, len(ids)))
+        ed = work[work["id"].isin(view)].copy()
+        for i in random.sample(list(ed.index), min(3, len(ed))):
+            ed.loc[i, "price_eur"] = random.choice([100.0, np.nan, 555.5])
+        ed = ed.drop(index=random.sample(list(ed.index), min(2, max(len(ed) - 1, 0))))      # zawsze coś zostaje
+        for k in range(random.randint(0, 3)):
+            r = ed.iloc[0].copy()
+            r["id"] = None if k % 2 == 0 else f"X{k}{trial}"
+            ed = pd.concat([ed, r.to_frame().T], ignore_index=True)
+        if trial % 7 == 0 and len(ed):
+            ed = pd.concat([ed, ed.iloc[[0]]], ignore_index=True)
+        pd.testing.assert_frame_equal(old.merge_edits(work, view, ed).reset_index(drop=True),
+                                      merge_edits(work, view, ed).reset_index(drop=True), check_dtype=False)
+
+
+def test_sync_windows_and_duplicates_match_reference():
+    import datetime as dt
+    import random
+    import ref_duplicates as dold
+    import ref_schedule as sold
+    from ltl.duplicates import DupParams, find_duplicates, find_geo_duplicates
+    from ltl.schedule import sync_windows
+    random.seed(3)
+    base = dt.date(2026, 12, 1)
+    for _ in range(80):
+        rows = []
+        for _i in range(random.randint(1, 25)):
+            r = {}
+            for side in ("load", "unload"):
+                f = random.choice([pd.NaT, pd.Timestamp(base) + pd.Timedelta(days=random.randint(0, 4), hours=random.randint(0, 20))])
+                r[f"{side}_date"] = random.choice([None, base + dt.timedelta(days=random.randint(0, 4))])
+                r[f"{side}_from"] = f
+                r[f"{side}_to"] = f + pd.Timedelta(hours=3) if f is not pd.NaT else pd.NaT
+            rows.append(r)
+        df = pd.DataFrame(rows)
+        for c in ("load_from", "load_to", "unload_from", "unload_to"):
+            df[c] = pd.to_datetime(df[c])
+        pd.testing.assert_frame_equal(sold.sync_windows(df), sync_windows(df), check_dtype=False)
+    from ltl.ingest import parse_sources_report
+    from ltl.sample import SAMPLE_TEXT
+    df, _ = parse_sources_report([("p", SAMPLE_TEXT)])
+    extra = df.copy()
+    extra["id"] = ["Z" + i for i in extra["id"]]
+    extra["start_postal"] = extra["start_postal"].astype(str).str[:3] + "99"
+    both = pd.concat([df, extra], ignore_index=True)
+    prio = pd.Series(range(len(both)), index=both.index, dtype=float)
+    for prm in (DupParams(), DupParams(tolerance_pct=0.0), DupParams(prefix_len=4)):
+        assert dold.find_duplicates(both, prio, prm) == find_duplicates(both, prio, prm)
+    g = both.assign(start_lat=48.0 + (both.index % 5) * 0.01, start_lon=2.0, end_lat=52.0, end_lon=13.0, start_geo="cache", end_geo="cache")
+    for r in (3.0, 30.0):
+        prm = DupParams(geo_radius_km=r)
+        assert dold.find_geo_duplicates(g, prio, prm) == find_geo_duplicates(g, prio, prm)
+
+
+def test_route_cache_is_bounded_and_dedupes_parallel_requests():
+    import threading
+    import time as _t
+    from ltl import routing
+    c = routing.LRUCache(3)
+    for i in range(6):
+        c[i] = i
+    assert len(c) == 3 and 0 not in c and c.get(5) == 5
+    calls = []
+
+    def slow():
+        calls.append(1)
+        _t.sleep(0.15)
+        return "leg"
+    routing._LEG_CACHE.clear()
+    out = []
+    ts = [threading.Thread(target=lambda: out.append(routing._cached(("k", 1), slow))) for _ in range(6)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert out == ["leg"] * 6 and len(calls) == 1            # sześć wątków, jedno zapytanie
+    routing._LEG_CACHE.clear()
