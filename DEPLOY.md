@@ -15,7 +15,7 @@ wszystkich i leżą w katalogu `data/` na serwerze.
 **Najprościej (skrypt):** w PowerShellu jako administrator
 
 ```powershell
-git clone --branch claude/ltl-route-optimizer-8v6qec https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
+git clone --branch Optymalizator_tras_LTL_serwer4 https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
 cd C:\umoyalogis
 Set-ExecutionPolicy -Scope Process Bypass -Force
 .\deploy\install.ps1
@@ -32,7 +32,7 @@ W PowerShellu:
 ```powershell
 git clone https://github.com/DomTom23/UmoyaLogis.git C:\umoyalogis
 cd C:\umoyalogis
-git checkout claude/ltl-route-optimizer-8v6qec
+git checkout Optymalizator_tras_LTL_serwer4
 copy .env.example .env
 notepad .env                 # ustaw APP_PASSWORD (wspólne hasło) i ewentualnie VALHALLA_URL
 docker compose up -d --build
@@ -74,10 +74,10 @@ Kopia bazy (spójna także przy pracującej aplikacji), 30 ostatnich zostaje:
 docker compose exec -T app python scripts/backup_db.py /data/backups 30
 ```
 
-Codzienne wykonanie o 2:00 (Harmonogram zadań):
+Codzienne wykonanie o 15:30 (godzina lokalna komputera; skrypt instalacyjny ustawia to sam, parametr -BackupTime) (Harmonogram zadań):
 
 ```powershell
-schtasks /Create /TN "Umoyalogis backup" /SC DAILY /ST 02:00 /TR "cmd /c cd /d C:\umoyalogis && docker compose exec -T app python scripts/backup_db.py /data/backups 30"
+schtasks /Create /TN "Umoyalogis backup" /SC DAILY /ST 15:30 /TR "cmd /c cd /d C:\umoyalogis && docker compose exec -T app python scripts/backup_db.py /data/backups 30"
 ```
 
 Kopie trafiają do `C:\umoyalogis\data\backups`. Skopiuj je okresowo na drugi dysk lub dysk sieciowy: lustro dysków
@@ -131,10 +131,27 @@ Co warto wiedzieć przed startem:
 * **Pamięć.** Docker Desktop przydziela WSL2 domyślnie połowę RAM-u. Przy 16 GB RAM i budowie kafli dla wielu krajów
   ustaw w `C:\Users\<ty>\.wslconfig`: `[wsl2]` / `memory=12GB`, potem `wsl --shutdown` i restart Dockera. Jeśli budowa
   się wywala (brak pamięci), zmniejsz listę krajów albo buduj je po kilka.
-* **Kafle lądują w `valhalla_data\`** (zostają po restarcie; mapy odświeżaj raz na kilka miesięcy: usuń ten katalog
-  i uruchom ponownie).
+* **Kafle lądują w wolumenie Dockera `valhalla_data`** (zostają po restarcie). Odświeżanie map raz na kilka miesięcy:
+  `docker compose -f docker-compose.yml -f docker-compose.valhalla.yml down`, `docker volume rm umoyalogis_valhalla_data`
+  (nazwa może mieć inny prefiks - sprawdź `docker volume ls`) i uruchom ponownie.
+* **Dla 32 GB RAM i ok. 350 GB dysku** wystarczy ustawienie `memory=24GB` w `.wslconfig` (jak wyżej); lista 12 krajów
+  zajmie ok. 40-80 GB. Wszystko jest na dysku C: (wirtualny dysk Dockera), więc tam musi być wolne miejsce.
 * **Uwaga:** ten plik compose nie był przetestowany na prawdziwym Dockerze (środowisko, w którym powstał, nie miało
   Dockera). Jeśli obraz zgłosi nieznaną zmienną, sprawdź jej nazwę w opisie obrazu `gis-ops/docker-valhalla` i popraw
   plik.
 * Czy działa: w aplikacji wyszukaj wariant i sprawdź, czy komunikat pod mapą mówi „Trasa po drogach dla ciężarówek
   (Valhalla…)” bez ostrzeżeń o odcinkach liczonych linią prostą.
+
+### Dodawanie krajów do działającego serwera tras
+
+Domyślna lista to: PL, DE, FR, BE, NL, LU, IT, AT, CZ, CH, ES, GB, DK, SK, HU. Żeby dodać kolejny kraj do już zbudowanego
+serwera (kafle trzeba zbudować od nowa dla całego zbioru, to kilkanaście godzin), użyj skryptu, który buduje w osobnym
+kontenerze i **nie wyłącza routingu** na czas budowy:
+
+```
+.\deploy\add_maps.ps1 -Countries denmark,slovakia,hungary   # pobranie, scalenie z europe.osm.pbf i start budowy
+.\deploy\add_maps.ps1 -Status                                # postęp
+.\deploy\add_maps.ps1 -Finish                                # po „Finished tarring”: podmiana kafli i restart (kilka minut przerwy)
+```
+
+W trakcie budowy potrzeba ok. 150 GB wolnego miejsca na dysku C:. Nazwy krajów to nazwy z Geofabrik (np. `denmark`, `slovakia`, `hungary`).

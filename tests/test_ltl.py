@@ -72,7 +72,7 @@ def test_costs():
     t = trip_time(585, 2, p)  # 9 h jazdy + 2 h postoju -> 2 dni
     assert t["days"] == 2
     c = operating_cost(1000, 2, p)
-    assert abs(c["fuel"] - 1000 * 0.30 * 1.55) < 1e-6 and abs(c["tolls"] - 200) < 1e-6
+    assert abs(c["fuel"] - 1000 * 0.27 * 1.70) < 1e-6 and abs(c["tolls"] - 200) < 1e-6
     assert trip_time(65 * 120, 2, p)["days"] > trip_time(65 * 56, 2, p)["days"] + 6  # tygodniowy odpoczynek
 
 
@@ -966,3 +966,400 @@ def test_own_cargo_date_two_digit_year_and_invalid_values():
     assert _date(pd.Timestamp("2026-11-02")) == datetime.date(2026, 11, 2)
     assert _date("2026-11-02") == datetime.date(2026, 11, 2)
     assert _date(None) is None and _date(float("nan")) is None and _date(pd.NaT) is None and _date("to nie data") is None
+
+
+def test_near_duplicates_same_codes_similar_codes_weight_ldm_and_date():
+    import datetime, time
+    from ltl.duplicates import DupParams, find_duplicates, is_duplicate, prefix, similar_place
+
+    def r(i, sc, sp, ec, ep, w, l, d=datetime.date(2026, 11, 2), city_a="", city_b=""):
+        return dict(id=i, start_country=sc, start_postal=sp, start_city=city_a, end_country=ec, end_postal=ep,
+                    end_city=city_b, weight_t=w, ldm=l, load_date=d)
+
+    df = pd.DataFrame([r("A", "DE", "20095", "PL", "00-001", 5, 3, city_a="Hamburg", city_b="Warszawa"),
+                       r("B", "DE", "20095", "PL", "00-001", 5.2, 3.1, city_a="Altona", city_b="Mokotów"),   # inne miejscowości
+                       r("C", "DE", "20099", "PL", "00-001", 5, 3),            # odbiór: podobny kod, zrzut identyczny
+                       r("D", "DE", "20095", "PL", "00-002", 5, 3),            # odbiór identyczny, zrzut podobny
+                       r("E", "DE", "30095", "PL", "00-001", 5, 3),            # inny rejon odbioru
+                       r("F", "DE", "20095", "PL", "00-001", 9, 3),            # inna waga
+                       r("G", "DE", "20095", "PL", "00-001", 5, 6),            # inny LDM
+                       r("H", "DE", "20095", "PL", "00-001", 5, 3, d=datetime.date(2026, 11, 5)),   # inna data
+                       r("I", "DE", "21095", "PL", "01-001", 5, 3),            # oba końce tylko "podobne" (inne rejony)
+                       r("J", "DE", "20095", "FR", "00-001", 5, 3)])           # inny kraj zrzutu
+    prio = pd.Series([100, 300, 10, 50, 10, 10, 10, 10, 10, 10], index=df.index)
+    dup = find_duplicates(df, prio)
+    assert dup == {0: "B", 2: "B", 3: "B"}                     # zostaje B (najwyższy priorytet), reszta to duplikaty B
+    assert find_duplicates(df, prio, DupParams(enabled=False)) == {}
+    assert find_duplicates(df, prio, DupParams(tolerance_pct=0.0, weight_abs_t=0.0, ldm_abs=0.0)).get(0) is None   # B != A przy zerowej tolerancji
+    assert find_duplicates(df, prio, DupParams(prefix_len=5)).keys() == {0}                                          # ostry próg: tylko A~B
+    # wyższy priorytet (kwalifikuje się do zestawu) wygrywa nawet z droższą ofertą
+    assert find_duplicates(df.head(2), pd.Series([1e9, 900.0], index=df.index[:2])) == {1: "A"}
+    # GB: porównanie po części przed spacją, kody krótsze niż próg muszą być identyczne
+    assert prefix("GB", "WF5 9TG", 3) == "WF5" and similar_place("GB", "WF5 9TG", "GB", "WF5 1AB", 3)
+    assert not similar_place("GB", "WF5 9TG", "GB", "WF6 9TG", 3) and not similar_place("PL", "00-001", "DE", "00001", 3)
+    assert similar_place("BE", "1000", "BE", "1000", 5) and not similar_place("BE", "1000", "BE", "1001", 5)
+    # szybkość: 700 ofert
+    big = pd.concat([df.assign(id=df.id + str(k)) for k in range(70)], ignore_index=True)
+    t = time.time()
+    find_duplicates(big, pd.Series(0.0, index=big.index))
+    assert time.time() - t < 5
+
+
+def _win(day, h1, h2):
+    from ltl.schedule import to_h
+    import datetime as _dt
+    return (to_h(_dt.datetime(2026, 11, day, h1)), to_h(_dt.datetime(2026, 11, day, h2)))
+
+
+def test_schedule_simulation_rest_waiting_windows_and_tolerance():
+    from ltl.schedule import ScheduleParams, StopSpec, from_h, simulate
+    p = ScheduleParams()
+    L = StopSpec("L", "A", _win(2, 8, 12), 2)
+    U = StopSpec("U", "A", _win(3, 6, 18), 2)
+    r = simulate([13.0], [L, U], p)                                   # 2 h obsługi + 13 h jazdy: odpoczynek dobowy w drodze
+    assert r.feasible and from_h(r.stops[0].arrive_h).hour == 8 and r.stops[1].rest_h == 11.0
+    assert from_h(r.stops[1].arrive_h).strftime("%d %H:%M") == "03 10:00" and abs(r.total_h - 28) < 1e-6
+    # przyjazd przed otwarciem okna = czekanie; za późno = niezgodne z terminami, tolerancja to łagodzi
+    early = simulate([1.0], [StopSpec("S", "S"), StopSpec("L", "A", _win(2, 8, 12), 2)], ScheduleParams(start_at=from_h(_win(2, 6, 7)[0])))
+    assert early.feasible and early.stops[1].wait_h == 1.0            # start 6:00 + 1 h jazdy = 7:00, okno od 8:00
+    assert simulate([5.0], [StopSpec("S", "S"), StopSpec("L", "A", _win(2, 8, 12), 2)],
+                    ScheduleParams(start_at=from_h(_win(2, 8, 9)[0]))).feasible is False   # 8:00 + 5 h = 13:00 > 12:00
+    assert simulate([5.0], [StopSpec("S", "S"), StopSpec("L", "A", _win(2, 8, 12), 2)],
+                    ScheduleParams(start_at=from_h(_win(2, 8, 9)[0]), tolerance_h=1.5)).feasible
+    # limity jazdy: 56 h w tygodniu -> odpoczynek tygodniowy
+    long = simulate([20.0] * 4, [StopSpec("S", "S")] + [StopSpec("W", f"P{i}") for i in range(4)], ScheduleParams(start_at=from_h(_win(2, 6, 7)[0])))
+    assert long.rest_h >= 48 and long.stops[-1].rest_h > 0 or long.rest_h >= 48
+    # start automatyczny: pojazd rusza tak, by zdążyć na początek pierwszego okna (bez czekania)
+    auto = simulate([6.0], [StopSpec("S", "S"), StopSpec("L", "A", _win(5, 8, 12), 2)], p)
+    assert from_h(auto.stops[1].arrive_h).strftime("%d %H:%M") == "05 08:00" and auto.stops[1].wait_h == 0
+    assert from_h(auto.start_h).strftime("%d %H:%M") == "05 02:00"
+
+
+def test_order_windows_from_columns_and_date_only_defaults():
+    import datetime as _dt
+    from ltl.schedule import ScheduleParams, from_h, order_windows, resolve_window, sync_windows
+    p = ScheduleParams()
+    df = pd.DataFrame([{"id": "A", "load_date": _dt.date(2026, 11, 2), "unload_date": _dt.date(2026, 11, 3),
+                        "load_from": pd.Timestamp("2026-11-02 08:00"), "load_to": pd.Timestamp("2026-11-02 15:00"),
+                        "unload_from": pd.NaT, "unload_to": pd.NaT},
+                       {"id": "B", "load_date": _dt.date(2026, 11, 2), "unload_date": None,
+                        "load_from": pd.Timestamp("2026-11-02 00:00:00"), "load_to": pd.Timestamp("2026-11-04 23:59:59"),
+                        "unload_from": pd.NaT, "unload_to": pd.NaT}])
+    w = order_windows(df, p)
+    assert (from_h(w["A"]["L"][0]).hour, from_h(w["A"]["L"][1]).hour) == (8, 15)       # godziny z oferty
+    assert (from_h(w["A"]["U"][0]).hour, from_h(w["A"]["U"][1]).hour) == (6, 18)       # sama data = godziny przeładunków
+    assert from_h(w["B"]["L"][1]).strftime("%d %H") == "04 18" and w["B"]["U"] is None   # zakres dat, brak rozładunku = bez okna
+    assert resolve_window(None, None, None, p) is None
+    # ręczna zmiana daty unieważnia stare godziny z oferty
+    changed = df.copy()
+    changed.loc[0, "load_date"] = _dt.date(2026, 11, 9)
+    assert pd.isna(sync_windows(changed).loc[0, "load_from"])
+
+
+def test_cards_give_time_windows_and_storage_roundtrip(tmp_path):
+    df = parse_sources([CARDS])
+    first = df[df.start_postal == "53021"].iloc[0]                       # "30.10, 13:00" ... "02.11, 08:00"
+    assert str(first.load_from) == "2026-10-30 13:00:00" and str(first.unload_from) == "2026-11-02 08:00:00"
+    two = df[df.start_postal == "57800"].iloc[0]                         # "30.10, 08:00 - 15:00"
+    assert (str(two.load_from), str(two.load_to)) == ("2026-10-30 08:00:00", "2026-10-30 15:00:00")
+    ranged = df[df.start_postal == "38590"].iloc[0]                      # dwie linie dat: 29.10 12:00 -> 02.11 12:00
+    assert (str(ranged.load_from), str(ranged.load_to)) == ("2026-10-29 12:00:00", "2026-11-02 12:00:00")
+    st = Store(tmp_path / "w.db")
+    st.save_orders("okna", df)
+    back = st.load_orders("okna")
+    assert back.load_from.notna().sum() == df.load_from.notna().sum() and back.load_to.iloc[0] == df.load_to.iloc[0]
+
+
+def test_optimizer_orders_stops_by_windows_and_rejects_impossible():
+    import datetime as _dt
+    from ltl.optimizer import TimeCtx
+    from ltl.schedule import ScheduleParams, order_windows
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500)]
+    df = _orders(rows)
+    df["load_date"] = _dt.date(2026, 11, 2)
+    df["unload_date"] = _dt.date(2026, 11, 6)
+    df["load_from"], df["load_to"] = pd.Timestamp("2026-11-02 06:00"), pd.Timestamp("2026-11-02 18:00")
+    df["unload_from"], df["unload_to"] = pd.Timestamp("2026-11-03 06:00"), pd.Timestamp("2026-11-10 18:00")
+    p = ScheduleParams()
+
+    def seqs(d, **kw):
+        v, _ = find_best_combinations(d, CostParams(), OptimizerParams(max_detour_km=800),
+                                      time_ctx=TimeCtx(p, order_windows(d, p)), **kw)
+        return [[(s.order_id, s.kind) for s in x.stops] for x in v]
+
+    assert seqs(df)[0] == [("B", "L"), ("A", "L"), ("A", "U"), ("B", "U")]            # najkrótsza kolejność mieści się w oknach
+    a_first = df.copy()
+    a_first["load_from"] = [pd.Timestamp("2026-11-02 06:00"), pd.Timestamp("2026-11-02 13:00")]
+    a_first["load_to"] = [pd.Timestamp("2026-11-02 08:00"), pd.Timestamp("2026-11-02 18:00")]
+    assert seqs(a_first)[0][:2] == [("A", "L"), ("B", "L")]                            # okna wymuszają A przed B
+    b_first = df.copy()
+    b_first["load_from"] = [pd.Timestamp("2026-11-02 13:00"), pd.Timestamp("2026-11-02 06:00")]
+    b_first["load_to"] = [pd.Timestamp("2026-11-02 18:00"), pd.Timestamp("2026-11-02 08:00")]
+    assert seqs(b_first)[0][:2] == [("B", "L"), ("A", "L")]
+    both_early = df.copy()
+    both_early["load_to"] = pd.Timestamp("2026-11-02 07:00")                          # dwa załadunki 300 km od siebie w godzinę
+    assert seqs(both_early) == []
+    tight = df.copy()
+    tight["unload_to"] = [pd.Timestamp("2026-11-10 18:00"), pd.Timestamp("2026-11-03 18:00")]   # B rozładunek dzień po załadunku (>1000 km)
+    assert seqs(tight) == []
+    # bez okien (wyłączone w ustawieniach) ta sama para jest dozwolona
+    off = TimeCtx(ScheduleParams(enabled=False), order_windows(tight, p))
+    assert find_best_combinations(tight, CostParams(), OptimizerParams(max_detour_km=800), time_ctx=off)[0]
+    # punkt dodatkowy trafia w miejsce, które mieści się w oknach; start pojazdu liczy się do harmonogramu
+    from ltl.optimizer import Stop
+    on_way = Stop("P1", "W", "DE", "50667", "Kolonia", 50.94, 6.96)
+    assert any(k == "W" for _, k in sum(seqs(df, waypoints=(on_way,)), []))
+    far_start = Stop("START", "S", "ES", "28001", "", 40.4, -3.7)
+    assert seqs(df, origin=far_start)                                                 # start automatyczny: pojazd ruszy odpowiednio wcześniej
+    fixed = ScheduleParams(start_at=pd.Timestamp("2026-11-02 06:00").to_pydatetime())  # a przy stałym starcie o 6:00 z Madrytu nie zdąży
+    v, _ = find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=800), origin=far_start,
+                                  time_ctx=TimeCtx(fixed, order_windows(df, fixed)))
+    assert v == []
+
+
+def test_idle_days_waiting_for_windows_cost_money():
+    import datetime as _dt
+    from ltl.optimizer import TimeCtx, Stop
+    from ltl.route_edit import evaluate_route, route_for_variant
+    from ltl.routing import TruckProfile
+    from ltl.schedule import ScheduleParams, order_windows
+    rows = [("A", 52.5, 13.4, 48.9, 2.35, 6.0, 10, 1500), ("B", 52.4, 16.9, 45.7, 4.8, 6.0, 10, 1500)]
+    df = _orders(rows)
+    df["load_date"] = _dt.date(2026, 11, 2)
+    df["unload_date"] = _dt.date(2026, 11, 6)
+    df["load_from"], df["load_to"] = pd.Timestamp("2026-11-02 06:00"), pd.Timestamp("2026-11-02 18:00")
+    df["unload_from"], df["unload_to"] = pd.Timestamp("2026-11-12 06:00"), pd.Timestamp("2026-11-20 18:00")   # okno otwiera się dopiero 12.11
+    for charge in (True, False):
+        p = ScheduleParams(charge_idle_days=charge)
+        ctx = TimeCtx(p, order_windows(df, p))
+        v, _ = find_best_combinations(df, CostParams(), OptimizerParams(max_detour_km=800), time_ctx=ctx)
+        r = route_for_variant(v[0], [], TruckProfile(), "none", "", "", 65.0)
+        ev = evaluate_route(v[0], r, CostParams(), ctx)
+        assert ev["schedule"].wait_h > 24                                   # pojazd czeka na otwarcie okna rozładunku
+        if charge:
+            assert ev["idle_days"] >= 1 and ev["idle_cost"] == ev["idle_days"] * 300.0
+            charged, idle_cost = ev["profit"], ev["idle_cost"]
+        else:
+            assert ev["idle_cost"] == 0
+            free = ev["profit"]
+    assert charged < free and abs((free - charged) - idle_cost) < 1e-6              # różnica to dokładnie koszt dni czekania
+
+
+# ----------------------------------------------------------------- workspace
+def _wo(i, ldm=4.0, w=5.0, price=500.0, sp="62-800", ep="75001", lat=52.0, lon=17.0):
+    return {"id": i, "client": "K", "start_country": "pl", "start_postal": sp, "start_city": "A",
+            "end_country": "fr", "end_postal": ep, "end_city": "B", "start_lat": lat, "start_lon": lon,
+            "end_lat": 48.85, "end_lon": 2.35, "ldm": ldm, "weight_t": w, "price_eur": price,
+            "load_date": "2026-12-01", "unload_date": "2026-12-03"}
+
+
+def test_workspace_plan_edit_and_validate():
+    from ltl import workspace as ws
+    p = ws.new_plan("t")
+    assert ws.add_orders(p, [_wo("A"), _wo("B"), _wo("A")]) == ["A", "B"]       # duplikat numeru pominięty
+    assert [(s["kind"], s["order_id"]) for s in p["stops"]] == [("L", "A"), ("U", "A"), ("L", "B"), ("U", "B")]
+    assert ws.validate(p) == []
+    ws.reorder(p, [0, 2, 1, 3])                                                  # L A, L B, U A, U B
+    assert ws.validate(p) == [] and ws.peaks(p) == (8.0, 10.0)
+    ws.reorder(p, [2, 0, 1, 3])                                                  # U A przed L A
+    assert any("rozładunek jest przed załadunkiem" in x for x in ws.validate(p))
+    p2 = ws.new_plan()
+    ws.add_orders(p2, [_wo("X", ldm=9.0), _wo("Y", ldm=9.0)])
+    ws.reorder(p2, [0, 2, 1, 3])
+    assert any("Przeładowanie" in x for x in ws.validate(p2, max_ldm=13.6))
+    assert not any("Przeładowanie" in x for x in ws.validate(p2, max_ldm=20))
+
+
+def test_workspace_waypoints_and_removal():
+    from ltl import workspace as ws
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A"), _wo("B")])
+    w1 = ws.add_waypoint(p, "de", "10115", "Berlin", 52.5, 13.4, "magazyn", position=2)
+    w2 = ws.add_waypoint(p, "pl", "00-001", "", 52.2, 21.0)
+    assert (w1, w2) == ("P1", "P2") and p["stops"][2]["order_id"] == "P1"
+    ws.remove_stop(p, 2)                                                         # punkt dodatkowy znika sam
+    assert [s["order_id"] for s in p["stops"] if s["kind"] == "W"] == ["P2"] and len(p["orders"]) == 2
+    ws.remove_stop(p, 0)                                                         # załadunek A = usunięcie zlecenia A
+    assert ws.order_ids(p) == ["B"] and all(s.get("order_id") != "A" for s in p["stops"])
+
+
+def test_workspace_update_orders_geocodes_changes():
+    from ltl import workspace as ws
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A"), _wo("B")])
+    calls = []
+    rows = [dict(p["orders"][0], end_postal="69001"), _wo("C", ep="10115")]
+    res = ws.update_orders(p, rows, geocode=lambda c, pc: (calls.append((c, pc)), (1.0, 2.0))[1])
+    assert res["added"] == ["C"] and res["removed"] == ["B"] and "A" in res["relocated"]
+    assert ("FR", "69001") in calls and ("FR", "10115") in calls
+    assert ws.order_ids(p) == ["A", "C"]
+    assert [(s["kind"], s["order_id"]) for s in p["stops"]] == [("L", "A"), ("U", "A"), ("L", "C"), ("U", "C")]
+
+
+def test_workspace_variant_and_roundtrip():
+    from ltl import workspace as ws
+    from ltl.costs import CostParams
+    from ltl.optimizer import Stop
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A")])
+    v = ws.to_variant(p, Stop("START", "S", "PL", "62-800", "", 52.0, 17.0), CostParams())
+    assert [s.kind for s in v.stops] == ["S", "L", "U"] and v.revenue == 500.0 and v.total_km > 1000
+    assert ws.to_variant(ws.new_plan(), None, CostParams()) is None
+    frame = ws.orders_frame(p)
+    assert frame.loc[0, "id"] == "A" and frame.loc[0, "load_date"].isoformat() == "2026-12-01"
+    back = ws.from_variant(v, frame)
+    assert ws.order_ids(back) == ["A"] and [s["kind"] for s in back["stops"]] == ["L", "U"]
+
+
+def test_store_vehicles_and_plans_with_conflicts(tmp_path):
+    from ltl.storage import NameExists, PlanConflict, Store
+    s = Store(tmp_path / "w.db")
+    v = s.save_vehicle(name="WX 111", start_country="pl", start_postal="62-800", max_ldm=13.6)
+    s.save_vehicle(name="WX 222")
+    with __import__("pytest").raises(NameExists):
+        s.save_vehicle(name="WX 111")
+    assert list(s.vehicles()["name"]) == ["WX 111", "WX 222"]
+    # praca osobista: każdy użytkownik ma własny plan; grupowa: wspólny
+    assert s.save_plan("personal", "ala", v, {"orders": [1]}, 0, "ala") == 1
+    assert s.get_plan("personal", "ola", v) is None and s.get_plan("personal", "ala", v)["version"] == 1
+    assert s.save_plan("group", "", v, {"orders": [1, 2]}, 0, "ala") == 1
+    with __import__("pytest").raises(PlanConflict) as ei:                        # druga osoba nie zna wersji 1
+        s.save_plan("group", "", v, {"orders": []}, 0, "ola")
+    assert ei.value.current["updated_by"] == "ala"
+    assert s.save_plan("group", "", v, {"orders": [1, 2, 3]}, 1, "ola") == 2
+    assert s.plans_overview("group", "")[v]["n_orders"] == 3
+    s.retire_vehicle(v)
+    assert list(s.vehicles()["name"]) == ["WX 222"] and s.get_plan("group", "", v) is not None
+    s.delete_vehicle(v)
+    assert s.get_plan("group", "", v) is None
+
+
+def test_save_vehicles_editor_diff(tmp_path):
+    from ltl.storage import Store
+    from ltl.workspace_ui import VEHICLE_COLUMNS, save_vehicles
+    s = Store(tmp_path / "v.db")
+    a = s.save_vehicle(name="A1", start_country="PL", start_postal="62-800")
+    b = s.save_vehicle(name="B2")
+    before = s.vehicles()
+    shown = before.drop(columns=["active", "id"]).reset_index(drop=True).rename(columns=VEHICLE_COLUMNS)
+    edited = shown.copy()
+    edited.loc[0, VEHICLE_COLUMNS["note"]] = "zmieniony"
+    edited = edited.drop(index=1)                                           # B2 usunięty = wycofany
+    edited.loc[2] = ["C3", "", "firanka", 13.6, 24.0, "DE", "10115", "Berlin"]   # nowy wiersz
+    edited.loc[3] = ["A1", "", "", 13.6, 24.0, "", "", ""]                  # duplikat nazwy
+    msgs = save_vehicles(s, before, edited)
+    assert any("już istnieje" in m for _, m in msgs) and any("nowe 1, zaktualizowane 1, wycofane 1" in m for _, m in msgs)
+    names = list(s.vehicles()["name"])
+    assert names == ["A1", "C3"] and s.vehicles().iloc[0]["note"] == "zmieniony"
+
+
+def test_workspace_stop_edits_and_editor_roundtrip():
+    from ltl import workspace as ws
+    from ltl.workspace_ui import _orders_editor_frame, _rows_from_editor
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A"), _wo("B"), _wo("C")])
+    ws.add_waypoint(p, "de", "10115", "Berlin", 52.5, 13.4, "x")
+    # przestawienie: C na początek (numer 0), usunięcie punktu dodatkowego i zlecenia B
+    nums = [2, 3, 4, 5, 0, 0.5, 6]
+    dels = [False, False, True, False, False, False, True]
+    dropped = ws.apply_stop_edits(p, nums, dels, [None] * 7)
+    assert dropped == {"B"} and ws.order_ids(p) == ["A", "C"]
+    assert [(s["kind"], s["order_id"]) for s in p["stops"]] == [("L", "C"), ("U", "C"), ("L", "A"), ("U", "A")]
+    # tabela zleceń: edycja wartości, nowy wiersz bez numeru, usunięty wiersz
+    df = _orders_editor_frame(p)
+    assert list(df["Nr"]) == ["A", "C"]
+    df.loc[0, "Cena (EUR)"] = 999.0
+    df.loc[2] = [None, "Nowy", "PL", "00-001", "Warszawa", None, "DE", "10115", "Berlin", None, 3.0, 4.0, 700.0, ""]
+    df = df.drop(index=1)                                                        # zlecenie C usunięte
+    rows = _rows_from_editor(p, df)
+    res = ws.update_orders(p, rows, geocode=lambda c, pc: (50.0, 10.0))
+    assert res["added"] == ["M1"] and res["removed"] == ["C"] and ws.order_ids(p) == ["A", "M1"]
+    assert p["orders"][0]["price_eur"] == 999.0 and p["orders"][0]["start_lat"] == 52.0     # istniejące współrzędne zachowane
+    assert p["orders"][1]["start_lat"] == 50.0 and p["orders"][1]["client"] == "Nowy"
+
+
+def test_workspace_live_edit_detection_and_blank_location():
+    from ltl import workspace as ws
+    p = ws.new_plan()
+    ws.add_orders(p, [_wo("A"), _wo("B")])
+    same = [dict(o) for o in p["orders"]]
+    assert not ws.orders_differ(p, same)                                         # brak zmian = brak zapisu
+    assert ws.orders_differ(p, [dict(same[0], price_eur=1.0), same[1]])           # zmiana ceny
+    assert ws.orders_differ(p, same[:1])                                          # usunięty wiersz
+    partial = {"id": "N", "start_country": "PL", "start_postal": "00-001"}        # niepełny nowy wiersz: jeszcze nie liczymy
+    assert not ws.orders_differ(p, same + [partial])
+    full = {**_wo("N"), "start_lat": None, "end_lat": None}
+    assert ws.orders_differ(p, same + [full])
+    # kasowanie kodu czyści współrzędne (stara lokalizacja nie może zostać)
+    res = ws.update_orders(p, [dict(same[0], end_postal=""), same[1]], geocode=lambda c, pc: (1.0, 2.0))
+    assert p["orders"][0]["end_lat"] is None and any("nie ustalono położenia" in x for x in ws.validate(p))
+    # edycje kolejności
+    q = ws.new_plan()
+    ws.add_orders(q, [_wo("A"), _wo("B")])
+    assert not ws.stop_edits_pending(q, [1, 2, 3, 4], [False] * 4, [None] * 4)
+    assert ws.stop_edits_pending(q, [1, 3, 2, 4], [False] * 4, [None] * 4)
+    assert ws.stop_edits_pending(q, [1, 2, 3, 4], [False, False, True, False], [None] * 4)
+
+
+# ------------------------------------------------- dopisywanie ofert i wczytywanie eksportu historii
+def test_history_export_csv_roundtrip(tmp_path):
+    from ltl.ingest import parse_sources_report, read_source
+    from ltl.sample import SAMPLE_TEXT
+    from ltl.storage import Store
+    orders, _ = parse_sources_report([("p", SAMPLE_TEXT)])
+    st_ = Store(tmp_path / "h.db")
+    st_.record_offers(orders)
+    exported = st_.query_history(limit=1000).to_csv(index=False, sep=";").encode("utf-8-sig")   # jak „Pobierz CSV”
+    frame = read_source("historia_ofert.csv", exported)
+    assert not isinstance(frame, str) and len(frame) == len(orders)
+    back, rep = parse_sources_report([("historia_ofert.csv", frame)])
+    assert len(back) == len(orders) and rep[0]["found"] == len(orders)
+    key = ["start_country", "start_postal", "end_country", "end_postal", "ldm", "weight_t"]
+    assert sorted(map(tuple, back[key].astype(str).values)) == sorted(map(tuple, orders[key].astype(str).values))
+    assert (back["vehicles"] == orders["vehicles"]).all() or set(back["vehicles"]) <= set(orders["vehicles"]) | {""}
+    # zwykły plik z nagłówkami po polsku nadal idzie przez parser tekstowy
+    assert isinstance(read_source("o.csv", "Załadunek;Rozładunek;Data;Waga;LDM;Cena\nDE 20095;PL 00-001;2026-12-01;5;4;900\n".encode()), str)
+
+
+def test_append_orders_keeps_edits_dedupes_and_numbers():
+    from ltl.ingest import append_orders, parse_sources_report
+    from ltl.sample import SAMPLE_TEXT
+    old, _ = parse_sources_report([("p", SAMPLE_TEXT)])
+    old = old.copy()
+    old.loc[0, "price_eur"] = 1234.0                              # ręczna poprawka musi zostać
+    n = len(old)
+    combined, st_ = append_orders(old, old.copy())                # te same oferty drugi raz = wszystkie powtórzenia
+    assert len(combined) == n and st_ == {"added": 0, "duplicates": n} and combined.loc[0, "price_eur"] == 1234.0
+    extra = old.iloc[:2].copy()
+    extra["start_postal"] = ["99999", "88888"]                    # naprawdę nowe oferty
+    combined, st_ = append_orders(old, extra)
+    assert len(combined) == n + 2 and st_["added"] == 2
+    assert combined["id"].is_unique and list(combined["id"][:n]) == list(old["id"])
+    assert all(i[0] == old["id"].iloc[0][0] for i in combined["id"][n:])        # kolejne numery tego samego źródła
+    only_new, st2 = append_orders(None, extra)                    # brak starych = po prostu nowe
+    assert len(only_new) == 2 and st2["added"] == 2
+
+
+def test_geo_duplicates_same_map_point():
+    import pandas as pd
+    from ltl.duplicates import DupParams, find_geo_duplicates
+
+    def row(i, sp, slat, slon, ep, elat, elon, ldm=4.0, w=5.0, geo="online", date="2026-12-01", price=500.0):
+        return {"id": i, "start_country": "FR", "start_postal": sp, "end_country": "DE", "end_postal": ep,
+                "start_lat": slat, "start_lon": slon, "end_lat": elat, "end_lon": elon, "weight_t": w, "ldm": ldm,
+                "load_date": date, "start_geo": geo, "end_geo": geo, "price_eur": price}
+    df = pd.DataFrame([
+        row("A", "75001", 48.860, 2.340, "10115", 52.53, 13.38, price=400),
+        row("B", "75002", 48.865, 2.343, "10117", 52.52, 13.39, price=900),      # ten sam punkt (<3 km), inne kody
+        row("C", "69001", 45.76, 4.83, "10115", 52.53, 13.38),                    # inny punkt załadunku
+        row("D", "75003", 48.862, 2.341, "10115", 52.53, 13.38, ldm=9.0),         # inny LDM = inny ładunek
+        row("E", "75004", 48.861, 2.342, "10115", 52.53, 13.38, geo="kraj"),      # nie zlokalizowano - środek kraju
+    ])
+    prio = pd.Series([1.0, 2.0, 1.0, 1.0, 1.0], index=df.index)
+    dup = find_geo_duplicates(df, prio, DupParams(geo_radius_km=3.0))
+    assert dup == {0: "B"}                                                        # zostaje droższa oferta B
+    assert find_geo_duplicates(df, prio, DupParams(geo_radius_km=0.0)) == {}      # wyłączone
+    far = df.copy(); far.loc[1, ["start_lat", "start_lon"]] = [49.5, 2.3]         # >3 km od A
+    assert find_geo_duplicates(far, prio, DupParams(geo_radius_km=3.0)) == {}
+    other_date = df.copy(); other_date.loc[1, "load_date"] = "2026-12-05"
+    assert find_geo_duplicates(other_date, prio, DupParams(geo_radius_km=3.0)) == {}

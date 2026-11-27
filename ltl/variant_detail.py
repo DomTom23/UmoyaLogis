@@ -5,6 +5,7 @@ import pandas as pd
 
 from .optimizer import Variant
 from .routing import RouteResult
+from .schedule import ScheduleResult, from_h
 
 LOAD_ICON, UNLOAD_ICON, START_ICON, WAYPOINT_ICON = "🟢▲", "🔴▼", "🏁", "📍"
 LOAD_COLOR, UNLOAD_COLOR = "#1a9850", "#d73027"
@@ -37,7 +38,15 @@ def place(country, postal, city) -> str:
     return f"{country}-{postal} {city}".strip()
 
 
-def stop_table(variant: Variant, route: RouteResult, orders: pd.DataFrame) -> pd.DataFrame:
+def window_text(w) -> str:
+    if not w:
+        return "—"
+    a, b = from_h(w[0]), from_h(w[1])
+    return f"{a:%d.%m %H:%M} – {b:%H:%M}" if a.date() == b.date() else f"{a:%d.%m %H:%M} – {b:%d.%m %H:%M}"
+
+
+def stop_table(variant: Variant, route: RouteResult, orders: pd.DataFrame,
+               schedule: ScheduleResult | None = None) -> pd.DataFrame:
     """Krok po kroku: co robimy, gdzie, ile jest na naczepie po operacji i ile km/h do następnego przystanku."""
     by_id = orders.set_index("id")
     ldm = wt = 0.0
@@ -75,7 +84,19 @@ def stop_table(variant: Variant, route: RouteResult, orders: pd.DataFrame) -> pd
         if leg:
             cum_km += leg.km
             cum_h += leg.hours
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if schedule is not None and len(schedule.stops) == len(df):
+        st = schedule.stops
+        df.insert(4, "Przyjazd", [f"{from_h(x.arrive_h):%d.%m %H:%M}" for x in st])
+        df.insert(5, "Okno", [window_text(x.window) for x in st])
+        def status(x):
+            parts = [("⚠ spóźnienie " + f"{x.late_h:.1f} h") if x.late_h > 1e-9 else ("czeka " + f"{x.wait_h:.1f} h" if x.wait_h >= 0.05 else "✓")]
+            if x.rest_h:
+                parts.append(f"odpoczynek {x.rest_h:.0f} h w drodze")
+            return " · ".join(parts)
+        df.insert(6, "Status", [status(x) for x in st])
+        df = df.drop(columns=["Data", "Ładunek", "Od startu (km)"])         # z harmonogramem tabela musi się zmieścić na ekranie
+    return df
 
 
 def order_table(variant: Variant, orders: pd.DataFrame, estimated: set | None = None) -> pd.DataFrame:

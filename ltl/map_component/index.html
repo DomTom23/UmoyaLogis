@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <link rel="stylesheet" href="leaflet.css">
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; font-family: system-ui, sans-serif; }
-  #map { position: absolute; inset: 0; background: #e8eef3; }
+  html, body { margin: 0; padding: 0; height: 100%; font-family: Inter, system-ui, -apple-system, 'Segoe UI', sans-serif; }
+  #map { position: absolute; inset: 0; background: #e8eef3; border-radius: 14px; }
   .pin { min-width: 26px; height: 26px; padding: 0 4px; box-sizing: border-box; border-radius: 13px; color: #fff;
          font: 700 12px/22px system-ui; text-align: center; border: 2px solid #fff; white-space: nowrap;
          box-shadow: 0 1px 4px rgba(0,0,0,.5); }
@@ -13,9 +13,11 @@
   .via { width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 3px solid #1f4e9c;
          box-shadow: 0 1px 3px rgba(0,0,0,.5); cursor: grab; }
   .ghost { width: 14px; height: 14px; border-radius: 50%; background: #ffd24d; border: 3px solid #1f4e9c; }
-  .panel { background: rgba(255,255,255,.95); color: #222; padding: 6px 9px; border-radius: 6px; font-size: 12px;
-           box-shadow: 0 1px 5px rgba(0,0,0,.3); line-height: 1.45; max-width: 250px; }
-  .panel button { font: inherit; cursor: pointer; margin-top: 4px; }
+  .panel { background: rgba(255,255,255,.96); color: #0f172a; padding: 9px 12px; border-radius: 14px; font-size: 12px;
+           box-shadow: 0 4px 18px rgba(15,23,42,.18); line-height: 1.5; max-width: 260px; border: 1px solid #e2e8f0; }
+  .panel button { font: inherit; cursor: pointer; margin-top: 6px; margin-right: 4px; padding: 3px 9px; border-radius: 8px;
+                  border: 1px solid #cbd5e1; background: #f8fafc; color: #0f172a; }
+  .panel button:hover { background: #eff6ff; border-color: #2563eb; }
   .panel .row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
   .dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; border: 1px solid #fff; box-shadow: 0 0 2px #0006; }
   .bar { width: 18px; height: 0; display: inline-block; border-top: 4px solid #1f77b4; }
@@ -33,7 +35,7 @@
 (function () {
   const send = (type, data) => window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, data), "*");
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-  let map, layer, lastFit = null, args = null, helpOpen = false, drag = null;
+  let map, layer, lastFit = null, args = null, helpOpen = false, drag = null, pendingFit = null;
 
   function emit(ev) {
     ev.nonce = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
@@ -56,6 +58,11 @@
     L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {maxZoom: 18, attribution: "© OpenStreetMap"}).addTo(map);
     layer = L.layerGroup().addTo(map);
     window.__map = map;                       // wygodne przy debugowaniu w konsoli przeglądarki
+    // mapa w ukrytej zakładce ma zerowy rozmiar: po pokazaniu przeliczamy rozmiar i dopasowujemy widok
+    new ResizeObserver(() => {
+      map.invalidateSize();
+      if (pendingFit && map.getSize().x > 10 && map.getSize().y > 10) { fitNow(pendingFit); }
+    }).observe(document.getElementById("map"));
     const Panel = L.Control.extend({
       options: {position: "topright"},
       onAdd: function () {
@@ -69,6 +76,13 @@
     // przeciąganie przerwane poza mapą (mysz wyszła z ramki / okno straciło fokus) nie może zablokować mapy
     document.documentElement.addEventListener("mouseleave", cancelDrag);
     window.addEventListener("blur", cancelDrag);
+  }
+
+  function fitNow(points) {
+    const sz = map.getSize();
+    if (sz.x < 10 || sz.y < 10) { pendingFit = points; return; }
+    pendingFit = null;
+    map.fitBounds(points, {padding: [30, 30], maxZoom: 11});
   }
 
   function updatePanel() {
@@ -184,7 +198,7 @@
     pins();
     args.stops.forEach((s) => all.push([s.lat, s.lon]));
     if (args.fit_id !== lastFit && all.length) {
-      map.fitBounds(all, {padding: [30, 30], maxZoom: 11});
+      fitNow(all);
       lastFit = args.fit_id;
     }
     updatePanel();
