@@ -3,7 +3,7 @@
 # Wymaga: Docker Desktop uruchomiony, ok. 25 GB wolnego miejsca na dysku C: (tymczasowo, folder MapsDir).
 param(
     [string]$MapsDir = "C:\valhalla_maps",
-    [string[]]$Countries = @("poland","germany","france","belgium","netherlands","luxembourg","italy","austria","czech-republic","switzerland","spain","great-britain"),
+    [string[]]$Countries = @("poland","germany","france","belgium","netherlands","luxembourg","italy","austria","czech-republic","switzerland","spain","great-britain","denmark","slovakia","hungary"),
     [switch]$KeepFiles,
     [switch]$MergeOnly      # mapy sa juz w wolumenie Valhalli: tylko scal w jeden plik i przebuduj kafle
 )
@@ -23,8 +23,12 @@ if (-not $MergeOnly) {
         $file = Join-Path $MapsDir "$c-latest.osm.pbf"
         Step "Mapa: $c"
         $expected = 0
-        $head = curl.exe -s -L -I $url 2>$null | Select-String -Pattern "^Content-Length"
-        if ($head) { $expected = [int64](($head | Select-Object -Last 1).ToString().Split(":")[1].Trim()) }
+        # adres w podfolderze kraju (nowy uklad Geofabrik); gdy go nie ma - stary adres bez podfolderu (z przekierowaniem)
+        foreach ($cand in @($url, "https://download.geofabrik.de/europe/$c-latest.osm.pbf")) {
+            $head = curl.exe -s -L -I $cand 2>$null | Select-String -Pattern "^Content-Length"
+            if ($head) { $size = [int64](($head | Select-Object -Last 1).ToString().Split(":")[1].Trim()) } else { $size = 0 }
+            if ($size -gt 1000000) { $expected = $size; $url = $cand; break }
+        }
         if ($expected -le 0) { Write-Host "Nie udalo sie ustalic rozmiaru $url - pomijam. Sprawdz polaczenie." -ForegroundColor Red; continue }
         Write-Host ("Oczekiwany rozmiar: {0:N0} MB" -f ($expected / 1MB))
         for ($try = 1; $try -le 30; $try++) {

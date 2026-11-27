@@ -141,3 +141,17 @@ Co warto wiedzieć przed startem:
   plik.
 * Czy działa: w aplikacji wyszukaj wariant i sprawdź, czy komunikat pod mapą mówi „Trasa po drogach dla ciężarówek
   (Valhalla…)” bez ostrzeżeń o odcinkach liczonych linią prostą.
+
+### Dodawanie krajów do działającego serwera tras
+
+Domyślna lista to: PL, DE, FR, BE, NL, LU, IT, AT, CZ, CH, ES, GB, DK, SK, HU. Żeby dodać kolejny kraj do już zbudowanego
+serwera (kafle trzeba zbudować od nowa dla całego zbioru, to kilkanaście godzin), użyj skryptu, który buduje w osobnym
+kontenerze i **nie wyłącza routingu** na czas budowy:
+
+```
+.\deploy\add_maps.ps1 -Countries denmark,slovakia,hungary   # pobranie, scalenie z europe.osm.pbf i start budowy
+.\deploy\add_maps.ps1 -Status                                # postęp
+.\deploy\add_maps.ps1 -Finish                                # po „Finished tarring”: podmiana kafli i restart (kilka minut przerwy)
+```
+
+W trakcie budowy potrzeba ok. 150 GB wolnego miejsca na dysku C:. Nazwy krajów to nazwy z Geofabrik (np. `denmark`, `slovakia`, `hungary`).
