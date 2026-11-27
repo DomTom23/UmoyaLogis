@@ -11,7 +11,7 @@ import streamlit as st
 
 from ltl.auth import password_ok
 from ltl.costs import CostParams, profit
-from ltl.duplicates import DupParams, find_duplicates
+from ltl.duplicates import DupParams, find_duplicates, find_geo_duplicates
 from ltl.eligibility import ALL_BODIES, DEFAULT_BODIES, FleetProfile, check_eligibility
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
 from ltl.ingest import UnreadableFile, append_orders, clean_edited, parse_sources_report, read_source
@@ -190,9 +190,15 @@ with st.sidebar:
             prefix_len=int(st.number_input("Podobny kod: wspólne początkowe znaki", 2, 5, 3, 1,
                                            help="Gdy jeden koniec trasy (odbiór lub zrzut) ma identyczny kod, drugi "
                                                 "może mieć podobny: ten sam kraj i tyle samo pierwszych znaków kodu "
-                                                "(np. 3 = 20095 i 20099). Więcej = ostrzej.")))
+                                                "(np. 3 = 20095 i 20099). Więcej = ostrzej.")),
+            geo_radius_km=st.number_input("Ten sam punkt na mapie: promień (km)", 0.0, 25.0, 3.0, 0.5,
+                                          help="Oferty, których załadunek wypada w tym samym punkcie na mapie (w tym "
+                                               "promieniu - nawet przy różnych kodach i nazwach miejscowości) i rozładunek "
+                                               "też, a waga i LDM są podobne, są duplikatem. 0 = wyłącz. Dotyczy tylko "
+                                               "kodów, które udało się zlokalizować."))
         st.caption("Duplikat: ten sam kod odbioru i zrzutu (nazwa miejscowości nie ma znaczenia) albo jeden koniec "
-                   "identyczny, a drugi z podobnym kodem - ale tylko przy tej samej (lub bardzo zbliżonej) wadze i LDM "
+                   "identyczny, a drugi z podobnym kodem, albo załadunek i rozładunek wypadają w tych samych punktach na "
+                   "mapie (promień wyżej) - ale tylko przy tej samej (lub bardzo zbliżonej) wadze i LDM "
                    "oraz niewykluczających się datach załadunku.")
 
     with st.expander("💱 Ceny szacunkowe (oferty bez ceny)"):
@@ -658,6 +664,12 @@ with tab_orders:
     for col in ("start_lat", "start_lon", "end_lat", "end_lon", "start_geo", "end_geo", "geo_precise"):
         orders[col] = located[col].reindex(orders.index)
     orders["geo_precise"] = orders["geo_precise"].fillna(True).astype(bool)
+    # duplikaty wg położenia na mapie (ten sam punkt załadunku i rozładunku, także przy różnych kodach i nazwach)
+    geo_dup = find_geo_duplicates(orders[use], prio, dup_params)
+    if geo_dup:
+        orders["exclusion"] = [(f"{e}, " if e else "") + f"duplikat {geo_dup[i]}" if i in geo_dup else e
+                               for i, e in zip(orders.index, orders["exclusion"])]
+        use = orders["exclusion"] == ""
 
     est = haversine_km(orders.start_lat, orders.start_lon, orders.end_lat, orders.end_lon) * ROAD_FACTOR
     orders["distance_est_km"] = est.round(0)

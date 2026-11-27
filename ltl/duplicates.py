@@ -7,12 +7,20 @@ Dwie oferty to duplikat, gdy jednocześnie:
   miejscowości nie ma znaczenia - i kod zrzutu jest taki sam, ALBO jeden z końców jest taki sam, a drugi ma
   PODOBNY kod pocztowy (ten sam kraj i wspólny początek kodu).
 Z grupy duplikatów zostaje oferta najlepsza: najpierw kwalifikująca się do naszego zestawu, potem z najwyższą ceną.
+
+Drugi etap (po ustaleniu położenia kodów pocztowych, ``find_geo_duplicates``): oferty, których załadunek wypada w tym
+samym punkcie na mapie (w promieniu ``geo_radius_km``, nawet gdy kody lub nazwy miejscowości są różne) i rozładunek też,
+przy podobnej wadze i LDM oraz zgodnych datach. Punkty „na środku kraju” (kod, którego nie udało się zlokalizować) są
+pomijane - inaczej wszystkie takie oferty wyglądałyby na jedno miejsce.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
+
+from .geo import haversine_km
 
 
 @dataclass(frozen=True)
@@ -22,6 +30,7 @@ class DupParams:
     prefix_len: int = 3             # „podobny kod” = ten sam kraj i tyle samo pierwszych znaków kodu
     ldm_abs: float = 0.2            # minimalna dopuszczalna różnica LDM (żeby małe ładunki nie były zbyt ostre)
     weight_abs_t: float = 0.1       # minimalna dopuszczalna różnica wagi w tonach
+    geo_radius_km: float = 3.0      # „ten sam punkt na mapie”: odległość między miejscami załadunku (i rozładunku); 0 = wyłączone
 
 
 def _norm(postal) -> str:
@@ -112,4 +121,46 @@ def find_duplicates(df: pd.DataFrame, priority: pd.Series, p: DupParams = DupPar
                 kept.append(i)
             else:
                 dup[i] = df.loc[hit, "id"]
+    return dup
+
+
+def find_geo_duplicates(df: pd.DataFrame, priority: pd.Series, p: DupParams = DupParams()) -> dict:
+    """Duplikaty wg położenia na mapie: załadunki w promieniu ``geo_radius_km`` i rozładunki też, podobna waga i LDM,
+    zgodne daty. df musi mieć start_lat/lon, end_lat/lon (oraz start_geo/end_geo - pomijamy punkty ze środka kraju).
+    Zwraca {indeks duplikatu: numer oferty, którą zastępuje}; zostaje oferta z najwyższym ``priority``."""
+    if not p.enabled or p.geo_radius_km <= 0 or len(df) < 2:
+        return {}
+    ok = df[["start_lat", "start_lon", "end_lat", "end_lon"]].notna().all(axis=1)
+    for side in ("start_geo", "end_geo"):
+        if side in df.columns:
+            ok &= df[side].astype(str) != "kraj"
+    sub = df[ok]
+    if len(sub) < 2:
+        return {}
+    idx = list(sub.index)
+    sl, so = sub["start_lat"].to_numpy(float), sub["start_lon"].to_numpy(float)
+    el, eo = sub["end_lat"].to_numpy(float), sub["end_lon"].to_numpy(float)
+    near_s = haversine_km(sl[:, None], so[:, None], sl[None, :], so[None, :]) <= p.geo_radius_km
+    near_e = haversine_km(el[:, None], eo[:, None], el[None, :], eo[None, :]) <= p.geo_radius_km
+    cand = np.argwhere(np.triu(near_s & near_e, k=1))
+    related: dict[int, set] = {}
+    for a, b in cand:
+        ra, rb = sub.iloc[a], sub.iloc[b]
+        if _close(ra["weight_t"], rb["weight_t"], p.tolerance_pct, p.weight_abs_t) \
+                and _close(ra["ldm"], rb["ldm"], p.tolerance_pct, p.ldm_abs) \
+                and _dates_compatible(ra.get("load_date"), rb.get("load_date")):
+            related.setdefault(int(a), set()).add(int(b))
+            related.setdefault(int(b), set()).add(int(a))
+    if not related:
+        return {}
+    order = {i: n for n, i in enumerate(df.index)}
+    ranked = sorted(range(len(idx)), key=lambda k: (-float(priority.get(idx[k], 0.0)), order[idx[k]]))
+    kept: list[int] = []
+    dup: dict = {}
+    for k in ranked:
+        hit = next((h for h in kept if h in related.get(k, ())), None)
+        if hit is None:
+            kept.append(k)
+        else:
+            dup[idx[k]] = sub.iloc[hit]["id"]
     return dup

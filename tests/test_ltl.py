@@ -1182,3 +1182,28 @@ def test_append_orders_keeps_edits_dedupes_and_numbers():
     assert all(i[0] == old["id"].iloc[0][0] for i in combined["id"][n:])        # kolejne numery tego samego źródła
     only_new, st2 = append_orders(None, extra)                    # brak starych = po prostu nowe
     assert len(only_new) == 2 and st2["added"] == 2
+
+
+def test_geo_duplicates_same_map_point():
+    import pandas as pd
+    from ltl.duplicates import DupParams, find_geo_duplicates
+
+    def row(i, sp, slat, slon, ep, elat, elon, ldm=4.0, w=5.0, geo="online", date="2026-12-01", price=500.0):
+        return {"id": i, "start_country": "FR", "start_postal": sp, "end_country": "DE", "end_postal": ep,
+                "start_lat": slat, "start_lon": slon, "end_lat": elat, "end_lon": elon, "weight_t": w, "ldm": ldm,
+                "load_date": date, "start_geo": geo, "end_geo": geo, "price_eur": price}
+    df = pd.DataFrame([
+        row("A", "75001", 48.860, 2.340, "10115", 52.53, 13.38, price=400),
+        row("B", "75002", 48.865, 2.343, "10117", 52.52, 13.39, price=900),      # ten sam punkt (<3 km), inne kody
+        row("C", "69001", 45.76, 4.83, "10115", 52.53, 13.38),                    # inny punkt załadunku
+        row("D", "75003", 48.862, 2.341, "10115", 52.53, 13.38, ldm=9.0),         # inny LDM = inny ładunek
+        row("E", "75004", 48.861, 2.342, "10115", 52.53, 13.38, geo="kraj"),      # nie zlokalizowano - środek kraju
+    ])
+    prio = pd.Series([1.0, 2.0, 1.0, 1.0, 1.0], index=df.index)
+    dup = find_geo_duplicates(df, prio, DupParams(geo_radius_km=3.0))
+    assert dup == {0: "B"}                                                        # zostaje droższa oferta B
+    assert find_geo_duplicates(df, prio, DupParams(geo_radius_km=0.0)) == {}      # wyłączone
+    far = df.copy(); far.loc[1, ["start_lat", "start_lon"]] = [49.5, 2.3]         # >3 km od A
+    assert find_geo_duplicates(far, prio, DupParams(geo_radius_km=3.0)) == {}
+    other_date = df.copy(); other_date.loc[1, "load_date"] = "2026-12-05"
+    assert find_geo_duplicates(other_date, prio, DupParams(geo_radius_km=3.0)) == {}
