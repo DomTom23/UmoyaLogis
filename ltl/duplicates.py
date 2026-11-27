@@ -98,29 +98,34 @@ def is_duplicate(a, b, p: DupParams = DupParams()) -> bool:
 
 def find_duplicates(df: pd.DataFrame, priority: pd.Series, p: DupParams = DupParams()) -> dict:
     """Zwraca {indeks duplikatu: numer oferty, którą zastępuje}. `priority`: im wyżej, tym lepsza oferta do zachowania
-    (przy remisie wygrywa wcześniejsza w tabeli). Porównania tylko w obrębie podobnych par kodów (szybko dla setek ofert)."""
+    (przy remisie wygrywa wcześniejsza w tabeli). Porównania tylko w obrębie podobnych par kodów (szybko dla setek ofert).
+    Wiersze są raz zamieniane na słowniki - odczyt `df.loc[i]` w pętli był głównym kosztem."""
     if not p.enabled or df.empty:
         return {}
+    labels = list(df.index)
+    recs = dict(zip(labels, df.to_dict("records")))
     buckets: dict[tuple, list] = {}
-    for idx, r in df.iterrows():
+    for idx in labels:
+        r = recs[idx]
         key = (str(r["start_country"]).upper(), str(r["end_country"]).upper(),
                prefix(r["start_country"], r["start_postal"], p.prefix_len),
                prefix(r["end_country"], r["end_postal"], p.prefix_len))
         buckets.setdefault(key, []).append(idx)
-    order = {idx: n for n, idx in enumerate(df.index)}
+    order = {idx: n for n, idx in enumerate(labels)}
+    prio = priority.to_dict()
     dup: dict = {}
     for members in buckets.values():
         if len(members) < 2:
             continue
-        ranked = sorted(members, key=lambda i: (-float(priority.get(i, 0.0)), order[i]))
+        ranked = sorted(members, key=lambda i: (-float(prio.get(i, 0.0)), order[i]))
         kept: list = []
         for i in ranked:
-            row = df.loc[i]
-            hit = next((k for k in kept if is_duplicate(row, df.loc[k], p)), None)
+            row = recs[i]
+            hit = next((k for k in kept if is_duplicate(row, recs[k], p)), None)
             if hit is None:
                 kept.append(i)
             else:
-                dup[i] = df.loc[hit, "id"]
+                dup[i] = recs[hit]["id"]
     return dup
 
 
@@ -143,18 +148,23 @@ def find_geo_duplicates(df: pd.DataFrame, priority: pd.Series, p: DupParams = Du
     near_s = haversine_km(sl[:, None], so[:, None], sl[None, :], so[None, :]) <= p.geo_radius_km
     near_e = haversine_km(el[:, None], eo[:, None], el[None, :], eo[None, :]) <= p.geo_radius_km
     cand = np.argwhere(np.triu(near_s & near_e, k=1))
+    if len(cand) == 0:
+        return {}
+    weights, ldms = sub["weight_t"].tolist(), sub["ldm"].tolist()
+    dates = sub["load_date"].tolist() if "load_date" in sub.columns else [None] * len(sub)
+    ids = sub["id"].tolist()
     related: dict[int, set] = {}
-    for a, b in cand:
-        ra, rb = sub.iloc[a], sub.iloc[b]
-        if _close(ra["weight_t"], rb["weight_t"], p.tolerance_pct, p.weight_abs_t) \
-                and _close(ra["ldm"], rb["ldm"], p.tolerance_pct, p.ldm_abs) \
-                and _dates_compatible(ra.get("load_date"), rb.get("load_date")):
-            related.setdefault(int(a), set()).add(int(b))
-            related.setdefault(int(b), set()).add(int(a))
+    for a, b in cand.tolist():
+        if _close(weights[a], weights[b], p.tolerance_pct, p.weight_abs_t) \
+                and _close(ldms[a], ldms[b], p.tolerance_pct, p.ldm_abs) \
+                and _dates_compatible(dates[a], dates[b]):
+            related.setdefault(a, set()).add(b)
+            related.setdefault(b, set()).add(a)
     if not related:
         return {}
     order = {i: n for n, i in enumerate(df.index)}
-    ranked = sorted(range(len(idx)), key=lambda k: (-float(priority.get(idx[k], 0.0)), order[idx[k]]))
+    prio = priority.to_dict()
+    ranked = sorted(range(len(idx)), key=lambda k: (-float(prio.get(idx[k], 0.0)), order[idx[k]]))
     kept: list[int] = []
     dup: dict = {}
     for k in ranked:
@@ -162,5 +172,5 @@ def find_geo_duplicates(df: pd.DataFrame, priority: pd.Series, p: DupParams = Du
         if hit is None:
             kept.append(k)
         else:
-            dup[idx[k]] = sub.iloc[hit]["id"]
+            dup[idx[k]] = ids[hit]
     return dup
