@@ -14,7 +14,7 @@ from ltl.costs import CostParams, profit
 from ltl.duplicates import DupParams, find_duplicates
 from ltl.eligibility import ALL_BODIES, DEFAULT_BODIES, FleetProfile, check_eligibility
 from ltl.geo import ROAD_FACTOR, Geocoder, add_coordinates, haversine_km
-from ltl.ingest import UnreadableFile, clean_edited, parse_sources_report, read_uploaded
+from ltl.ingest import UnreadableFile, append_orders, clean_edited, parse_sources_report, read_source
 from ltl.mapview import route_map
 from ltl.optimizer import OptimizerParams, Stop, TimeCtx, find_best_combinations
 from ltl.ownpoints import build_extra_points
@@ -259,6 +259,9 @@ tab_data, tab_orders, tab_start, tab_variants, tab_route, tab_work, tab_vehicles
 # ------------------------------------------------------------ krok 1: dane
 st.session_state.setdefault("uploader_n", 0)
 st.session_state.setdefault("raw_text", "")
+if st.session_state.pop("clear_input_next", False):      # po dopisaniu ofert pole i lista plików są czyszczone
+    st.session_state.raw_text = ""
+    st.session_state.uploader_n += 1
 
 
 def _load_example() -> None:
@@ -266,7 +269,7 @@ def _load_example() -> None:
 
 
 def _clear_all() -> None:
-    for k in ("analysis", "raw_text", "vias", "ranked", "seen_nonce", "loaded_name", "save_name"):
+    for k in ("analysis", "raw_text", "vias", "ranked", "seen_nonce", "loaded_name", "save_name", "current_orders"):
         st.session_state.pop(k, None)
     st.session_state.uploader_n += 1
 
@@ -295,8 +298,16 @@ with tab_data:
         keep_history = st.checkbox("Zapisz oferty w historii", value=True, key="opt_history",
                                    help="Każdy import trafia do historii ofert (bez duplikatów); w historii można "
                                         "szukać po zleceniodawcy i wpisywać ceny zrealizowane.")
-        submitted = st.form_submit_button("🔍 Szukaj doładunków", type="primary", width="stretch",
-                                          on_click=_after_search)
+        sb1, sb2 = st.columns([3, 2])
+        submitted_new = sb1.form_submit_button("🔍 Szukaj doładunków", type="primary", width="stretch",
+                                               on_click=_after_search,
+                                               help="Zastępuje dotychczas wczytane zlecenia tymi z pola i plików.")
+        submitted_add = sb2.form_submit_button("➕ Dopisz do wczytanych i szukaj ponownie", width="stretch",
+                                               on_click=_after_search,
+                                               help="Zostawia zlecenia, które już są (z Twoimi poprawkami), dodaje do nich "
+                                                    "nowe oferty z pola i plików i szuka najlepszych wariantów od nowa "
+                                                    "dla wszystkich razem. Powtórzenia są pomijane.")
+        submitted = submitted_new or submitted_add
     b1, b2, _ = st.columns([1.7, 1.2, 3])
     b1.button("📋 Wczytaj przykład", on_click=_load_example, width="stretch")
     b2.button("🗑️ Wyczyść", on_click=_clear_all, width="stretch")
@@ -342,11 +353,25 @@ with tab_data:
         named, read_errors = [("Wklejony tekst", raw_text)], []
         for f in files:
             try:
-                named.append((f.name, read_uploaded(f.name, f.getvalue())))
+                named.append((f.name, read_source(f.name, f.getvalue())))
             except UnreadableFile as e:
                 read_errors.append(f"Plik „{f.name}”: {e}.")
-        if any(t.strip() for _, t in named):
+        if any((len(t) if isinstance(t, pd.DataFrame) else t.strip()) for _, t in named):
             prev = st.session_state.get("analysis", {}).get("id", 0)
+            current = st.session_state.get("current_orders")
+            if submitted_add and current is not None and not current.empty:
+                # dopisanie: nowe oferty łączymy z bieżącą tabelą (razem z poprawkami), wyszukiwanie liczy się od nowa
+                new_df, new_report = _parse(tuple(named), drop_no_price, pln_per_eur)
+                combined, stat = append_orders(current, new_df)
+                note = (f"Dopisano {stat['added']} nowych zleceń do {len(current)} wcześniejszych"
+                        + (f" (pominięto {stat['duplicates']} powtórzeń)" if stat["duplicates"] else "")
+                        + f". Razem {len(combined)}; najlepsze warianty wyliczono od nowa dla wszystkich.")
+                st.session_state.analysis = {"id": prev + 1, "df": combined, "texts": (), "drop": drop_no_price,
+                                             "online": online, "record": keep_history, "errors": read_errors,
+                                             "note": note}
+                st.session_state.clear_input_next = True
+                st.session_state.pop("ranked", None)
+                st.rerun()
             st.session_state.analysis = {"id": prev + 1, "texts": tuple(named), "drop": drop_no_price, "online": online,
                                          "record": keep_history, "errors": read_errors}
             st.session_state.pop("ranked", None)
@@ -550,6 +575,8 @@ with tab_orders:
          f"{len(parsed)} ofert (źródło: {', '.join(sorted(set(parsed['source'])) or ['—'])}). "
          "Kliknij komórkę, aby poprawić wartość; wiersze można dodawać i usuwać. Zmiany od razu wchodzą do wyników.")
     source_notes(src_report, analysis.get("errors", []))
+    if analysis.get("note"):
+        st.success(analysis["note"])
     if st.session_state.get("work_for") != analysis["id"]:       # nowa analiza: nowy zbiór roboczy
         st.session_state.work = parsed.reset_index(drop=True)
         st.session_state.work_for = analysis["id"]
@@ -624,6 +651,8 @@ with tab_orders:
     )
     st.session_state.last_view = {"ids": view["id"].tolist(), "edited": edited}
     orders = clean_edited(merge_edits(work, view["id"].tolist(), edited))
+    if not orders.empty:
+        st.session_state.current_orders = orders.copy()       # baza do „Dopisz do wczytanych” (z ręcznymi poprawkami)
     if orders.empty:
         st.warning("Brak poprawnych wierszy - potrzebne są kraj i kod pocztowy załadunku oraz rozładunku.")
         _no_data_tabs("Brak poprawnych zleceń - uzupełnij tabelę w zakładce „Zlecenia”.", (tab_start, tab_variants, tab_route))

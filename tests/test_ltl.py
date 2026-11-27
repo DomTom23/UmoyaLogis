@@ -1299,3 +1299,42 @@ def test_workspace_live_edit_detection_and_blank_location():
     assert not ws.stop_edits_pending(q, [1, 2, 3, 4], [False] * 4, [None] * 4)
     assert ws.stop_edits_pending(q, [1, 3, 2, 4], [False] * 4, [None] * 4)
     assert ws.stop_edits_pending(q, [1, 2, 3, 4], [False, False, True, False], [None] * 4)
+
+
+# ------------------------------------------------- dopisywanie ofert i wczytywanie eksportu historii
+def test_history_export_csv_roundtrip(tmp_path):
+    from ltl.ingest import parse_sources_report, read_source
+    from ltl.sample import SAMPLE_TEXT
+    from ltl.storage import Store
+    orders, _ = parse_sources_report([("p", SAMPLE_TEXT)])
+    st_ = Store(tmp_path / "h.db")
+    st_.record_offers(orders)
+    exported = st_.query_history(limit=1000).to_csv(index=False, sep=";").encode("utf-8-sig")   # jak „Pobierz CSV”
+    frame = read_source("historia_ofert.csv", exported)
+    assert not isinstance(frame, str) and len(frame) == len(orders)
+    back, rep = parse_sources_report([("historia_ofert.csv", frame)])
+    assert len(back) == len(orders) and rep[0]["found"] == len(orders)
+    key = ["start_country", "start_postal", "end_country", "end_postal", "ldm", "weight_t"]
+    assert sorted(map(tuple, back[key].astype(str).values)) == sorted(map(tuple, orders[key].astype(str).values))
+    assert (back["vehicles"] == orders["vehicles"]).all() or set(back["vehicles"]) <= set(orders["vehicles"]) | {""}
+    # zwykły plik z nagłówkami po polsku nadal idzie przez parser tekstowy
+    assert isinstance(read_source("o.csv", "Załadunek;Rozładunek;Data;Waga;LDM;Cena\nDE 20095;PL 00-001;2026-12-01;5;4;900\n".encode()), str)
+
+
+def test_append_orders_keeps_edits_dedupes_and_numbers():
+    from ltl.ingest import append_orders, parse_sources_report
+    from ltl.sample import SAMPLE_TEXT
+    old, _ = parse_sources_report([("p", SAMPLE_TEXT)])
+    old = old.copy()
+    old.loc[0, "price_eur"] = 1234.0                              # ręczna poprawka musi zostać
+    n = len(old)
+    combined, st_ = append_orders(old, old.copy())                # te same oferty drugi raz = wszystkie powtórzenia
+    assert len(combined) == n and st_ == {"added": 0, "duplicates": n} and combined.loc[0, "price_eur"] == 1234.0
+    extra = old.iloc[:2].copy()
+    extra["start_postal"] = ["99999", "88888"]                    # naprawdę nowe oferty
+    combined, st_ = append_orders(old, extra)
+    assert len(combined) == n + 2 and st_["added"] == 2
+    assert combined["id"].is_unique and list(combined["id"][:n]) == list(old["id"])
+    assert all(i[0] == old["id"].iloc[0][0] for i in combined["id"][n:])        # kolejne numery tego samego źródła
+    only_new, st2 = append_orders(None, extra)                    # brak starych = po prostu nowe
+    assert len(only_new) == 2 and st2["added"] == 2
