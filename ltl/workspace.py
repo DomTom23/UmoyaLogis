@@ -20,11 +20,12 @@ ORDER_FIELDS = (
     "id", "client", "source", "start_country", "start_postal", "start_city", "end_country", "end_postal", "end_city",
     "start_lat", "start_lon", "end_lat", "end_lon", "load_date", "unload_date",
     "load_from", "load_to", "unload_from", "unload_to", "weight_t", "ldm", "price_eur", "distance_km",
-    "load_type", "description", "note", "dispatcher", "pay_status", "pay_term_days", "extra_pay_eur")
+    "load_type", "description", "note", "dispatcher", "pay_status", "pay_term_days", "extra_pay_eur", "cancelled")
 PAY_STATUSES = ("nieopłacone", "opłacone", "przeterminowane")
 PAY_TERMS = (7, 15, 21, 30, 40, 45, 60)
 TEXT_FIELDS = ("dispatcher", "pay_status", "id", "client", "source", "start_country", "start_postal", "start_city", "end_country", "end_postal",
                "end_city", "load_type", "description", "note")
+BOOL_FIELDS = ("cancelled",)
 DATE_FIELDS = ("load_date", "unload_date")
 STAMP_FIELDS = ("load_from", "load_to", "unload_from", "unload_to")
 NUM_FIELDS = ("pay_term_days", "extra_pay_eur", "weight_t", "ldm", "price_eur", "distance_km", "start_lat", "start_lon", "end_lat", "end_lon")
@@ -63,6 +64,8 @@ def clean_order(row: dict) -> dict:
         v = row.get(f)
         if f in TEXT_FIELDS:
             out[f] = "" if _blank(v) else str(v).strip()
+        elif f in BOOL_FIELDS:
+            out[f] = bool(v) if not _blank(v) else False
         elif f in DATE_FIELDS:
             out[f] = _iso(v)
         elif f in STAMP_FIELDS:
@@ -89,6 +92,11 @@ def normalize_plan(plan: dict) -> dict:
         plan.setdefault(k, default)
     plan["orders"] = [clean_order(o) for o in plan["orders"]]
     return plan
+
+
+def order_revenue(o: dict) -> float:
+    """Przychód zlecenia: fracht, a dla zlecenia anulowanego - tylko dodatkowe wynagrodzenie (odszkodowanie za anulowanie)."""
+    return float(o.get("extra_pay_eur") or 0.0) if o.get("cancelled") else float(o.get("price_eur") or 0.0)
 
 
 def order_ids(plan: dict) -> list[str]:
@@ -384,7 +392,7 @@ def to_variant(plan: dict, start: Stop | None, cost: CostParams) -> Variant | No
     for leg, nxt in zip(legs, stops[1:]):
         loaded += leg if on_board else 0.0
         on_board.add(nxt.order_id) if nxt.kind == "L" else on_board.discard(nxt.order_id)
-    revenue = sum(o["price_eur"] + (o.get("extra_pay_eur") or 0.0) for o in plan["orders"])
+    revenue = sum(order_revenue(o) for o in plan["orders"])
     n_cargo = sum(1 for s in stops if s.kind in ("L", "U"))
     n_wp = sum(1 for s in stops if s.kind == "W")
     c = profit(revenue, km, n_cargo, cost, extra_h=n_wp * cost.waypoint_stop_h)

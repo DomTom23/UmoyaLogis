@@ -32,12 +32,20 @@ if ($Status) {
     $st = ContainerState $BuildName
     if ($st -notin @("running", "exited")) { Write-Host "Brak budowy (kontener $BuildName nie istnieje)."; exit 0 }
     Write-Host "Kontener $BuildName : $st"
+    try {
+        $started = ((cmd /c "docker inspect -f {{.State.StartedAt}} $BuildName 2>&1") -join "").Trim()
+        $t0 = [datetime]::ParseExact($started.Substring(0, 19), "yyyy-MM-ddTHH:mm:ss", [Globalization.CultureInfo]::InvariantCulture)
+        $el = (Get-Date).ToUniversalTime() - $t0
+        Write-Host ("Budowa trwa juz: {0:N1} h (start {1:yyyy-MM-dd HH:mm} UTC)" -f $el.TotalHours, $t0)
+    } catch { }
     $log = BuildLog
     $failed = @($log | Select-String -Pattern "Failed tile")
     $bad = @($log | Select-String -Pattern "Aborted|core dumped|unable to read blob|Killed")
     $tar = @($log | Select-String -Pattern "Finished tarring")
     $bld = @($log | Select-String -Pattern "Building [0-9]+ tiles")
     if ($bld.Count -gt 0) { Write-Host ("Ostatnia budowa: " + $bld[-1].Line.Trim()) }
+    Write-Host "Ostatnie linie logu (etap budowy):"
+    $log | Where-Object { $_ -notmatch "Exceeded max speed|invalid_argument" } | Select-Object -Last 3 | ForEach-Object { Write-Host ("  " + $_) }
     Write-Host ("Failed tile: " + $failed.Count + "   awarie: " + $bad.Count)
     if ($tar.Count -gt 0 -and $failed.Count -eq 0 -and $bad.Count -eq 0) {
         Write-Host ("GOTOWE: " + $tar[-1].Line.Trim()) -ForegroundColor Green

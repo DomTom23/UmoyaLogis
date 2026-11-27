@@ -3,8 +3,9 @@
 Numeracja: trasa ``TR-RRRR/MM-NNNN``, jej zlecenia ``TR-RRRR/MM-NNNN-01``, ``-02``… (kolejność jak w planie).
 Wiersz trasy: Skąd = miejsce rozładunku poprzedniej trasy pojazdu (dla pierwszej: miejsce startu pojazdu), Dokąd = rozładunek
 ostatniego zlecenia, Start = data rozładunku poprzedniej trasy, Koniec = data rozładunku ostatniego zlecenia, reszta to sumy
-i kalkulacje całej trasy. Wiersze zleceń biorą dane ze zleceń; koszty trasy rozkładamy na zlecenia proporcjonalnie do ich km
-(suma marż zleceń = marża trasy).
+i kalkulacje całej trasy. Wiersze zleceń biorą dane ze zleceń. Marża każdego zlecenia jest liczona osobno: jego przychód minus
+koszt jego km po średniej stawce kosztów trasy (koszt razem / km trasy); marża trasy liczy całość (także puste przebiegi).
+Dodatkowe wynagrodzenie liczy się tylko przy zleceniu anulowanym - wtedy zamiast frachtu.
 """
 from __future__ import annotations
 
@@ -15,10 +16,10 @@ from typing import Callable
 import pandas as pd
 
 from .geo import ROAD_FACTOR, haversine_km
-from .workspace import PAY_STATUSES, PAY_TERMS
+from .workspace import PAY_STATUSES, PAY_TERMS, order_revenue
 
 COLUMNS = ["Nr trasy/zlecenia", "Skąd", "Dokąd", "Dni trasy", "Start/Załadunek", "Koniec/Rozładunek", "Zleceniodawca",
-           "Frachty (€)", "Dodatkowe wynagrodzenie (€)", "Łącznie (€)", "Dyspozytor", "Płatność status", "Termin płatności",
+           "Frachty (€)", "Anulowane", "Dodatkowe wynagrodzenie (€)", "Łącznie (€)", "Dyspozytor", "Płatność status", "Termin płatności",
            "Płatność do", "Km", "Stawka €/km", "LDM", "€/LDM", "Waga (t)", "Marża €/km", "Marża łącznie (€)",
            "Koszt razem (€)", "Koszt dzienny (€)", "Paliwo (€)", "Opłaty drogowe (€)", "Prom/tunel (€)"]
 PAID_KINDS = ("Prom", "Pociąg", "Tunel", "Inny")            # rodzaje płatnych odcinków trasy (lista rozwijana)
@@ -109,24 +110,21 @@ def build_sheet(code: str, plan: dict, ev: dict | None, km: float | None, calend
     ``ev`` - wynik ``evaluate_route`` (None, gdy trasy nie dało się policzyć), ``km`` - długość całej trasy,
     ``calendar_days`` - dni trasy z harmonogramu, ``prev_end`` - koniec poprzedniej trasy pojazdu (lub miejsce startu)."""
     orders = plan["orders"]
-    revenue = sum(o["price_eur"] for o in orders)
-    extras = sum(o.get("extra_pay_eur") or 0.0 for o in orders)
+    revenue = sum(o["price_eur"] for o in orders if not o.get("cancelled"))          # frachty zleceń nieanulowanych
+    extras = sum(o.get("extra_pay_eur") or 0.0 for o in orders if o.get("cancelled"))  # dodatkowe: tylko anulowane
     total_rev = revenue + extras
     ldm = sum(o["ldm"] for o in orders)
     weight = sum(o["weight_t"] for o in orders)
     cost_total = ev["total"] if ev else None            # koszty i zysk z ``ev`` zawierają już płatne odcinki z planu
     profit = ev["profit"] if ev else None
     fees = ev["fees"] if ev else (paid_total(plan) or None)
-
-    # rozdział kosztów na zlecenia: proporcjonalnie do km zleceń (gdy brak km - po równo)
+    cost_per_km = cost_total / km if cost_total is not None and km else None
     kms = [_order_km(o) for o in orders]
-    km_sum = sum(k for k in kms if k) or 0.0
-    shares = [(k / km_sum) if (km_sum and k) else (0.0 if km_sum else 1 / max(len(orders), 1)) for k in kms]
 
     order_rows = []
-    for i, (o, k, sh) in enumerate(zip(orders, kms, shares)):
-        line = o["price_eur"] + (o.get("extra_pay_eur") or 0.0)
-        margin = line - cost_total * sh if cost_total is not None else None
+    for i, (o, k) in enumerate(zip(orders, kms)):
+        line = order_revenue(o)
+        margin = line - cost_per_km * k if cost_per_km is not None and k else None
         ld, ud = _d(o.get("load_date")), _d(o.get("unload_date"))
         due = fmt_date(ud + timedelta(days=o["pay_term_days"])) if ud and o.get("pay_term_days") else None
         order_rows.append({
@@ -136,7 +134,8 @@ def build_sheet(code: str, plan: dict, ev: dict | None, km: float | None, calend
             "Dni trasy": (ud - ld).days + 1 if ld and ud and ud >= ld else None,
             "Start/Załadunek": fmt_date(ld), "Koniec/Rozładunek": fmt_date(ud),
             "Zleceniodawca": o["client"] or None,
-            "Frachty (€)": o["price_eur"], "Dodatkowe wynagrodzenie (€)": o.get("extra_pay_eur") or 0.0, "Łącznie (€)": line,
+            "Frachty (€)": o["price_eur"], "Anulowane": bool(o.get("cancelled")),
+            "Dodatkowe wynagrodzenie (€)": o.get("extra_pay_eur") or 0.0, "Łącznie (€)": line,
             "Dyspozytor": o.get("dispatcher") or None, "Płatność status": o.get("pay_status") or PAY_STATUSES[0],
             "Termin płatności": term_label(o.get("pay_term_days")), "Płatność do": due,
             "Km": round(k) if k else None, "Stawka €/km": _ratio(line, k), "LDM": o["ldm"] or None,
@@ -155,7 +154,7 @@ def build_sheet(code: str, plan: dict, ev: dict | None, km: float | None, calend
         "Dni trasy": int(math.ceil(days - 1e-9)) if days else None,
         "Start/Załadunek": fmt_date((prev_end or {}).get("date")), "Koniec/Rozładunek": fmt_date(end_date),
         "Zleceniodawca": None,
-        "Frachty (€)": revenue, "Dodatkowe wynagrodzenie (€)": extras, "Łącznie (€)": total_rev,
+        "Frachty (€)": revenue, "Anulowane": False, "Dodatkowe wynagrodzenie (€)": extras, "Łącznie (€)": total_rev,
         "Dyspozytor": None, "Płatność status": None, "Termin płatności": None, "Płatność do": None,
         "Km": round(km) if km else None, "Stawka €/km": _ratio(total_rev, km), "LDM": ldm or None,
         "€/LDM": _ratio(total_rev, ldm), "Waga (t)": weight or None,
@@ -175,12 +174,15 @@ def sheet_frame(rows: list[dict]) -> pd.DataFrame:
     """Tabela w układzie arkusza: kolumny tekstowe (puste = ""), liczbowe jako liczby (puste = brak wartości)."""
     df = pd.DataFrame(rows, columns=COLUMNS)
     for c in COLUMNS:
-        df[c] = df[c].fillna("").astype(str) if c in TEXT_COLUMNS else pd.to_numeric(df[c], errors="coerce")
+        if c == "Anulowane":
+            df[c] = df[c].fillna(False).astype(bool)
+        else:
+            df[c] = df[c].fillna("").astype(str) if c in TEXT_COLUMNS else pd.to_numeric(df[c], errors="coerce")
     return df
 
 
 # ---------------------------------------------------------------- edycja tabeli zleceń trasy
-EDITABLE = ("Zleceniodawca", "Frachty (€)", "Dodatkowe wynagrodzenie (€)", "Dyspozytor", "Płatność status", "Termin płatności")
+EDITABLE = ("Zleceniodawca", "Frachty (€)", "Anulowane", "Dodatkowe wynagrodzenie (€)", "Dyspozytor", "Płatność status", "Termin płatności")
 
 
 def _txt(x) -> str:
@@ -202,7 +204,7 @@ def apply_sheet_edits(plan: dict, edited: pd.DataFrame) -> bool:
         return False
     for o, rec in zip(plan["orders"], edited.to_dict("records")):
         new = {"client": _txt(rec["Zleceniodawca"]), "price_eur": _money(rec["Frachty (€)"]),
-               "extra_pay_eur": _money(rec["Dodatkowe wynagrodzenie (€)"]), "dispatcher": _txt(rec["Dyspozytor"]),
+               "extra_pay_eur": _money(rec["Dodatkowe wynagrodzenie (€)"]), "cancelled": bool(rec["Anulowane"]), "dispatcher": _txt(rec["Dyspozytor"]),
                "pay_status": _txt(rec["Płatność status"]) if _txt(rec["Płatność status"]) in PAY_STATUSES else o["pay_status"],
                "pay_term_days": term_days(rec["Termin płatności"])}
         for k, v in new.items():

@@ -480,6 +480,8 @@ def _sheet_config(editable: bool) -> dict:
         cfg[label] = st.column_config.NumberColumn(label, format="%.2f", width=85)
     cfg["LDM"] = st.column_config.NumberColumn("LDM", format="%.1f", width=65)
     cfg["Waga (t)"] = st.column_config.NumberColumn("Waga (t)", format="%.1f", width=75)
+    cfg["Anulowane"] = st.column_config.CheckboxColumn("Anulowane", width=85,
+                                                       help="Zlecenie anulowane: liczy się tylko dodatkowe wynagrodzenie, bez frachtu.")
     cfg["Zleceniodawca"] = st.column_config.TextColumn("Zleceniodawca", width=140)
     cfg["Dyspozytor"] = st.column_config.TextColumn("Dyspozytor", width=115)
     cfg["Płatność status"] = st.column_config.SelectboxColumn("Płatność status", options=list(ws.PAY_STATUSES), width=125,
@@ -546,9 +548,10 @@ def _section_table(pc: PlanCtx, e: Eval | None, why: str) -> None:
     probe = copy.deepcopy(plan)
     if rsh.apply_sheet_edits(probe, edited):
         pc.apply(lambda p: rsh.apply_sheet_edits(p, edited), "Zapisano zmiany w zleceniach.")
-    st.caption("Wiersz zlecenia: Km z oferty (albo szacunek z mapy), marża zlecenia = jego przychód minus część kosztów trasy "
-               "proporcjonalna do km (suma marż zleceń = marża trasy). Skąd/Dokąd: kraj i miejscowość odczytana z kodu "
-               "pocztowego. Termin płatności liczy się od daty rozładunku.")
+    st.caption("Wiersz zlecenia: Km z oferty (albo szacunek z mapy). Marża zlecenia jest liczona osobno: jego przychód minus "
+               "koszt jego km po średniej stawce kosztów trasy; marża trasy liczy całość (także puste przebiegi i płatne odcinki). "
+               "Dodatkowe wynagrodzenie liczy się tylko przy zleceniu anulowanym (zaznacz „Anulowane”) - wtedy zamiast frachtu. "
+               "Skąd/Dokąd: kraj i miejscowość odczytana z kodu pocztowego. Termin płatności liczy się od daty rozładunku.")
 
     st.markdown("**Płatne odcinki trasy** (kolumna Prom/tunel)")
     crossings = e.ev["crossings"] if e is not None else []

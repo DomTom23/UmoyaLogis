@@ -1671,7 +1671,10 @@ def test_sheet_rows_sums_and_margins():
     assert route["Frachty (€)"] == 2500 and route["LDM"] == 10 and route["Skąd"] == "PL · Poznań"
     assert route["Dokąd"] == "NL · Londyn" and end["date"].isoformat() == "2026-11-05"
     assert route["Koszt dzienny (€)"] == 240.0 and route["Stawka €/km"] == round(2500 / 1100, 2)
-    assert sum(o["Marża łącznie (€)"] for o in orders) == route["Marża łącznie (€)"] == 1300.0     # koszty rozdzielone bez reszty
+    # marża zlecenia liczona osobno: przychód minus km zlecenia po średniej stawce kosztów trasy (1200 € / 1100 km)
+    assert orders[0]["Marża łącznie (€)"] == round(1500 - 1200 / 1100 * 600, 2)
+    assert orders[1]["Marża łącznie (€)"] == round(1000 - 1200 / 1100 * 400, 2) and route["Marża łącznie (€)"] == 1300.0
+    assert orders[0]["Marża €/km"] == round(orders[0]["Marża łącznie (€)"] / 600, 2)
     assert orders[0]["Płatność do"] == "04.12.2026" and orders[0]["Termin płatności"] == "30 dni"
     assert orders[0]["Skąd"] == "GB · Londyn" and orders[0]["Koszt razem (€)"] is None
     assert not {"Status", "Tagi", "Odcinki", "Pojazd (zestaw)", "Kierowca"} & set(rs.COLUMNS) and "Marża łącznie (€)" in rs.COLUMNS
@@ -1744,3 +1747,27 @@ def test_geocoder_place_name_uses_zippopotam_then_caches(tmp_path, monkeypatch):
     g.save()
     assert geo.Geocoder(online=False, cache_path=tmp_path / "gc.json").place_name("DE", "10115") == "Berlin"
     assert geo.Geocoder(online=False, cache_path=None).place_name("FR", "75001") == ""   # offline bez cache: puste
+
+
+def test_extra_pay_counts_only_for_cancelled_orders():
+    import copy
+    from ltl import route_sheet as rs, workspace as w
+    plan = _sheet_plan()
+    plan["orders"][0]["extra_pay_eur"] = 300.0
+    assert w.order_revenue(plan["orders"][0]) == 1500.0                         # nieanulowane: fracht, dodatkowe ignorowane
+    ev = {"total": 1100.0, "profit": 0.0, "fees": 0.0, "fuel": 0.0, "tolls": 0.0}
+    route, orders, _ = rs.build_sheet("TR-1", plan, ev, 1100, 5, None)
+    assert route["Łącznie (€)"] == 2500 and route["Dodatkowe wynagrodzenie (€)"] == 0 and orders[0]["Łącznie (€)"] == 1500
+    plan["orders"][0]["cancelled"] = True                                        # anulowane: tylko dodatkowe, bez frachtu
+    assert w.order_revenue(plan["orders"][0]) == 300.0
+    route, orders, _ = rs.build_sheet("TR-1", plan, ev, 1100, 5, None)
+    assert route["Frachty (€)"] == 1000 and route["Dodatkowe wynagrodzenie (€)"] == 300 and route["Łącznie (€)"] == 1300
+    assert orders[0]["Anulowane"] is True and orders[0]["Łącznie (€)"] == 300
+    probe = copy.deepcopy(plan)
+    df = rs.sheet_frame(orders)
+    df.loc[0, "Anulowane"] = False
+    assert rs.apply_sheet_edits(probe, df) and probe["orders"][0]["cancelled"] is False
+    for k, o in enumerate(plan["orders"]):
+        o.update(start_lat=51.5, start_lon=-0.1, end_lat=52.0 + k, end_lon=5.0 + k)
+    v = w.to_variant(plan, None, __import__("ltl.costs", fromlist=["CostParams"]).CostParams())
+    assert v.revenue == 1300                                                       # wariant (koszty, zysk) liczy ten sam przychód
