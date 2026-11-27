@@ -1,4 +1,4 @@
-# Optymalizator Tras LTL
+# Symulator Tras LTL
 
 Streamlit + Pandas + Leaflet (własny komponent mapy). Wklejasz dane z Timocom / Trans.eu, aplikacja liczy koszty
 i podpowiada najbardziej zyskowne doładunki (TOP 10).

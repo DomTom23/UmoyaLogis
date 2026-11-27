@@ -1,4 +1,4 @@
-"""Optymalizator Tras LTL - aplikacja Streamlit.  Uruchomienie: streamlit run app.py"""
+"""Symulator Tras LTL - aplikacja Streamlit.  Uruchomienie: streamlit run app.py"""
 from __future__ import annotations
 
 import os
@@ -31,14 +31,14 @@ from ltl.variant_detail import order_table, route_chain_html, stop_table
 from ltl.storage import OUTCOMES, InvalidName, NameExists, Store
 from ltl.workspace_ui import WsContext, render_vehicles_tab, render_workspace_tab, send_variant_ui
 
-st.set_page_config(page_title="Optymalizator Tras LTL", page_icon="🚛", layout="wide")
+st.set_page_config(page_title="Symulator Tras LTL", page_icon="🚛", layout="wide")
 
 inject_css()
 
 # opcjonalne wspólne hasło (serwer biurowy): ustaw APP_PASSWORD w pliku .env
 _APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 if _APP_PASSWORD and not st.session_state.get("authed"):
-    st.title("🚛 Optymalizator Tras LTL")
+    st.title("🚛 Symulator Tras LTL")
     with st.form("login_form"):
         entered = st.text_input("Hasło", type="password")
         if st.form_submit_button("Zaloguj", type="primary"):
@@ -278,7 +278,7 @@ opt = OptimizerParams(max_detour_km=max_detour, top_n=max(n_check, top_n),   # k
                       hard_cap_orders=max_orders, max_load_date_gap_days=int(date_gap) or None)
 
 # ------------------------------------------------------------------ nagłówek
-HERO_TITLE = "🚛 Optymalizator tras LTL"
+HERO_TITLE = "🚛 Symulator tras LTL"
 HERO_SUB = "Wklej oferty z giełdy, a aplikacja znajdzie najbardziej opłacalne doładunki: naczepa 13,6 LDM / 24 t, terminy i trasy po drogach."
 hero_slot = st.empty()          # nagłówek ze wskaźnikami; dopisujemy je na końcu skryptu, gdy znane są wyniki
 with hero_slot:

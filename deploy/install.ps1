@@ -1,5 +1,5 @@
 <#
- Instalacja / aktualizacja Optymalizatora Tras LTL na serwerze Windows 11 (Docker Desktop).
+ Instalacja / aktualizacja Symulatora Tras LTL na serwerze Windows 11 (Docker Desktop).
  Uruchom w PowerShellu JAKO ADMINISTRATOR:
      Set-ExecutionPolicy -Scope Process Bypass -Force
      .\deploy\install.ps1                      # pierwsza instalacja z klonowaniem repozytorium
