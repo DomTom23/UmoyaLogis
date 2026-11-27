@@ -122,6 +122,29 @@ class Store:
                     active INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS routes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope TEXT NOT NULL CHECK (scope IN ('personal', 'group')),
+                    owner TEXT NOT NULL DEFAULT '',
+                    vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+                    code TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    active_variant_id INTEGER,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS variants (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    route_id INTEGER NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL DEFAULT 1,
+                    label TEXT NOT NULL DEFAULT '',
+                    data TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
                 CREATE TABLE IF NOT EXISTS settings_formats (
                     name TEXT PRIMARY KEY,
                     data TEXT NOT NULL,
@@ -147,6 +170,35 @@ class Store:
                 for col in new_cols:
                     if col not in have:
                         c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+
+        self._migrate_plans_to_routes()
+
+    def _migrate_plans_to_routes(self) -> None:
+        """Jednorazowo: dotychczasowe plany pojazdów (po jednym na pojazd i tryb pracy) stają się trasą z jednym wariantem."""
+        with self._conn() as c:
+            if c.execute("SELECT 1 FROM meta WHERE key='plans_migrated'").fetchone():
+                return
+            now = datetime.now().isoformat(timespec="seconds")
+            for scope, owner, vid, data, version, upd, by in c.execute(
+                    "SELECT scope, owner, vehicle_id, data, version, updated_at, updated_by FROM plans ORDER BY id").fetchall():
+                code = self._next_route_code(c, upd[:7])
+                seq = c.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM routes WHERE scope=? AND owner=? AND vehicle_id=?",
+                                (scope, owner, vid)).fetchone()[0]
+                rid = c.execute("INSERT INTO routes (scope, owner, vehicle_id, code, seq, created_at, updated_at) "
+                                "VALUES (?,?,?,?,?,?,?)", (scope, owner, vid, code, seq, upd, upd)).lastrowid
+                vrid = c.execute("INSERT INTO variants (route_id, seq, label, data, version, updated_at, updated_by) "
+                                 "VALUES (?,?,?,?,?,?,?)", (rid, 1, "Wariant 1", data, version, upd, by)).lastrowid
+                c.execute("UPDATE routes SET active_variant_id=? WHERE id=?", (vrid, rid))
+            c.execute("INSERT INTO meta (key, value) VALUES ('plans_migrated', ?)", (now,))
+
+    @staticmethod
+    def _next_route_code(c, month: str | None = None) -> str:
+        """Numer trasy TR-RRRR/MM-NNNN: kolejny numer w danym miesiącu, wspólny dla wszystkich pojazdów."""
+        month = (month or datetime.now().strftime("%Y-%m"))[:7]
+        prefix = f"TR-{month.replace('-', '/')}-"
+        last = c.execute("SELECT MAX(code) FROM routes WHERE code LIKE ?", (prefix + "%",)).fetchone()[0]
+        n = int(last.rsplit("-", 1)[1]) + 1 if last else 1
+        return f"{prefix}{n:04d}"
 
     @contextmanager
     def _conn(self):
@@ -398,6 +450,8 @@ class Store:
         """Trwale usuwa pojazd razem z jego planami (osobistymi i grupowymi)."""
         with self._conn() as c:
             c.execute("DELETE FROM plans WHERE vehicle_id=?", (int(vehicle_id),))
+            c.execute("DELETE FROM variants WHERE route_id IN (SELECT id FROM routes WHERE vehicle_id=?)", (int(vehicle_id),))
+            c.execute("DELETE FROM routes WHERE vehicle_id=?", (int(vehicle_id),))
             c.execute("DELETE FROM vehicles WHERE id=?", (int(vehicle_id),))
 
     # ------------------------------------------------------------ plany (workspace)
@@ -478,3 +532,142 @@ class Store:
     def delete_format(self, name: str) -> None:
         with self._conn() as c:
             c.execute("DELETE FROM settings_formats WHERE name=?", (name,))
+
+    # ------------------------------------------------------------ trasy i warianty (workspace)
+    def list_routes(self, scope: str, owner: str, vehicle_id: int) -> list[dict]:
+        owner = owner if scope == "personal" else ""
+        with self._conn() as c:
+            rows = c.execute("SELECT id, code, seq, active_variant_id, note, created_at FROM routes "
+                             "WHERE scope=? AND owner=? AND vehicle_id=? ORDER BY seq, id", (scope, owner, int(vehicle_id))).fetchall()
+        return [{"id": r[0], "code": r[1], "seq": r[2], "active_variant_id": r[3], "note": r[4], "created_at": r[5]} for r in rows]
+
+    def create_route(self, scope: str, owner: str, vehicle_id: int, data: dict | None = None, by: str = "") -> tuple[int, int]:
+        """Nowa trasa pojazdu z pierwszym wariantem. -> (id trasy, id wariantu)."""
+        owner = owner if scope == "personal" else ""
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = json.dumps(data if data is not None else {"name": "", "note": "", "orders": [], "stops": [], "vias": []},
+                             ensure_ascii=False, default=str)
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            code = self._next_route_code(c)
+            seq = c.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM routes WHERE scope=? AND owner=? AND vehicle_id=?",
+                            (scope, owner, int(vehicle_id))).fetchone()[0]
+            rid = c.execute("INSERT INTO routes (scope, owner, vehicle_id, code, seq, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                            (scope, owner, int(vehicle_id), code, seq, now, now)).lastrowid
+            vid = c.execute("INSERT INTO variants (route_id, seq, label, data, version, updated_at, updated_by) "
+                            "VALUES (?,?,?,?,?,?,?)", (rid, 1, "Wariant 1", payload, 1, now, by)).lastrowid
+            c.execute("UPDATE routes SET active_variant_id=? WHERE id=?", (vid, rid))
+        return rid, vid
+
+    def delete_route(self, route_id: int) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM variants WHERE route_id=?", (int(route_id),))
+            c.execute("DELETE FROM routes WHERE id=?", (int(route_id),))
+
+    def move_route(self, route_id: int, delta: int) -> None:
+        """Przesuwa trasę w kolejności pojazdu (delta -1 = wcześniej, +1 = później)."""
+        with self._conn() as c:
+            row = c.execute("SELECT scope, owner, vehicle_id FROM routes WHERE id=?", (int(route_id),)).fetchone()
+            if not row:
+                return
+            ids = [r[0] for r in c.execute("SELECT id FROM routes WHERE scope=? AND owner=? AND vehicle_id=? ORDER BY seq, id", row)]
+            i = ids.index(int(route_id))
+            j = i + delta
+            if 0 <= j < len(ids):
+                ids[i], ids[j] = ids[j], ids[i]
+                for n, rid in enumerate(ids, start=1):
+                    c.execute("UPDATE routes SET seq=? WHERE id=?", (n, rid))
+
+    def set_active_variant(self, route_id: int, variant_id: int) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE routes SET active_variant_id=?, updated_at=? WHERE id=?",
+                      (int(variant_id), datetime.now().isoformat(timespec="seconds"), int(route_id)))
+
+    def list_variants(self, route_id: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT id, seq, label, data, version, updated_at, updated_by FROM variants "
+                             "WHERE route_id=? ORDER BY seq, id", (int(route_id),)).fetchall()
+        out = []
+        for vid, seq, label, data, ver, upd, by in rows:
+            try:
+                n = len(json.loads(data).get("orders", []))
+            except ValueError:
+                n = 0
+            out.append({"id": vid, "seq": seq, "label": label, "n_orders": n, "version": ver, "updated_at": upd, "updated_by": by})
+        return out
+
+    def get_variant(self, variant_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT id, route_id, label, data, version, updated_at, updated_by FROM variants WHERE id=?",
+                            (int(variant_id),)).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "route_id": row[1], "label": row[2], "data": json.loads(row[3]), "version": row[4],
+                "updated_at": row[5], "updated_by": row[6]}
+
+    def add_variant(self, route_id: int, data: dict | None = None, label: str = "", by: str = "") -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = json.dumps(data if data is not None else {"name": "", "note": "", "orders": [], "stops": [], "vias": []},
+                             ensure_ascii=False, default=str)
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            seq = c.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM variants WHERE route_id=?", (int(route_id),)).fetchone()[0]
+            vid = c.execute("INSERT INTO variants (route_id, seq, label, data, version, updated_at, updated_by) "
+                            "VALUES (?,?,?,?,?,?,?)", (int(route_id), seq, label or f"Wariant {seq}", payload, 1, now, by)).lastrowid
+            c.execute("UPDATE routes SET active_variant_id=COALESCE(active_variant_id, ?), updated_at=? WHERE id=?",
+                      (vid, now, int(route_id)))
+        return vid
+
+    def save_variant(self, variant_id: int, data: dict, expected_version: int, by: str = "") -> int:
+        """Zapis wariantu z kontrolą wersji (jak ``save_plan``). Zwraca nową wersję albo rzuca PlanConflict."""
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = json.dumps(data, ensure_ascii=False, default=str)
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT id, route_id, label, data, version, updated_at, updated_by FROM variants WHERE id=?",
+                            (int(variant_id),)).fetchone()
+            if row is None:
+                raise PlanConflict(None)
+            if row[4] != expected_version:
+                raise PlanConflict({"id": row[0], "route_id": row[1], "label": row[2], "data": json.loads(row[3]),
+                                    "version": row[4], "updated_at": row[5], "updated_by": row[6]})
+            c.execute("UPDATE variants SET data=?, version=version+1, updated_at=?, updated_by=? WHERE id=?",
+                      (payload, now, by, int(variant_id)))
+            c.execute("UPDATE routes SET updated_at=? WHERE id=?", (now, row[1]))
+            return row[4] + 1
+
+    def rename_variant(self, variant_id: int, label: str) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE variants SET label=? WHERE id=?", (" ".join(label.split())[:60], int(variant_id)))
+
+    def delete_variant(self, variant_id: int) -> bool:
+        """Usuwa wariant; ostatniego wariantu trasy nie usuwamy (zwraca False). Aktywny zastępuje pierwszy z pozostałych."""
+        with self._conn() as c:
+            row = c.execute("SELECT route_id FROM variants WHERE id=?", (int(variant_id),)).fetchone()
+            if not row:
+                return False
+            others = [r[0] for r in c.execute("SELECT id FROM variants WHERE route_id=? AND id<>? ORDER BY seq, id", (row[0], int(variant_id)))]
+            if not others:
+                return False
+            c.execute("DELETE FROM variants WHERE id=?", (int(variant_id),))
+            c.execute("UPDATE routes SET active_variant_id=? WHERE id=? AND (active_variant_id IS NULL OR active_variant_id=?)",
+                      (others[0], row[0], int(variant_id)))
+        return True
+
+    def routes_overview(self, scope: str, owner: str) -> dict[int, dict]:
+        """{pojazd: {"n_routes", "n_orders" (w aktywnych wariantach), "updated_at", "updated_by"}} - do listy pojazdów."""
+        owner = owner if scope == "personal" else ""
+        out: dict[int, dict] = {}
+        with self._conn() as c:
+            for vid, rid, active in c.execute("SELECT vehicle_id, id, active_variant_id FROM routes WHERE scope=? AND owner=?", (scope, owner)).fetchall():
+                o = out.setdefault(vid, {"n_routes": 0, "n_orders": 0, "updated_at": "", "updated_by": ""})
+                o["n_routes"] += 1
+                row = c.execute("SELECT data, updated_at, updated_by FROM variants WHERE id=?", (active,)).fetchone() if active else None
+                if row:
+                    try:
+                        o["n_orders"] += len(json.loads(row[0]).get("orders", []))
+                    except ValueError:
+                        pass
+                    if row[1] > o["updated_at"]:
+                        o["updated_at"], o["updated_by"] = row[1], row[2]
+        return out
