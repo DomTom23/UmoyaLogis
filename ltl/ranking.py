@@ -8,9 +8,10 @@ from typing import Callable, Optional
 import pandas as pd
 
 from .costs import CostParams
-from .optimizer import Variant
+from .optimizer import TimeCtx, Variant
 from .route_edit import evaluate_route
 from .routing import RouteResult
+from .schedule import from_h
 from .variant_detail import arrow
 
 
@@ -33,7 +34,8 @@ class Ranked:
 
 def rank_by_real_routes(variants: list[Variant], cost: CostParams, route_fn: Callable[[Variant], RouteResult],
                         top_n: int, workers: int = 4,
-                        progress: Optional[Callable[[int, int], None]] = None) -> Optional[list[Ranked]]:
+                        progress: Optional[Callable[[int, int], None]] = None,
+                        sched: Optional[TimeCtx] = None) -> Optional[list[Ranked]]:
     """Wyznacza trasy po drogach dla wszystkich kandydatów i sortuje po rzeczywistym zysku.
 
     Zwraca None, gdy routing jest niedostępny (pierwszy wariant bez żadnego odcinka z silnika tras) -
@@ -44,7 +46,7 @@ def rank_by_real_routes(variants: list[Variant], cost: CostParams, route_fn: Cal
     first = route_fn(variants[0])
     if not first.has_real:
         return None
-    done = [Ranked(variants[0], first, evaluate_route(variants[0], first, cost))]
+    done = [Ranked(variants[0], first, evaluate_route(variants[0], first, cost, sched))]
     if progress:
         progress(1, len(variants))
     if len(variants) > 1:
@@ -53,11 +55,25 @@ def rank_by_real_routes(variants: list[Variant], cost: CostParams, route_fn: Cal
             for n, fut in enumerate(as_completed(futures), start=2):
                 v = futures[fut]
                 r = fut.result()
-                done.append(Ranked(v, r, evaluate_route(v, r, cost)))
+                done.append(Ranked(v, r, evaluate_route(v, r, cost, sched)))
                 if progress:
                     progress(n, len(variants))
     done.sort(key=lambda x: -x.ev["profit"])
+    if sched is not None and sched.params.enabled:
+        # warianty, które po prawdziwych trasach nie mieszczą się w oknach czasowych, odpadają; gdy odpadną wszystkie,
+        # zostawiamy najlepsze (z ostrzeżeniem w tabeli), żeby użytkownik zobaczył, co poszło nie tak
+        feasible = [x for x in done if x.ev["schedule"].feasible]
+        if feasible:
+            done = feasible
     return done[:top_n]
+
+
+def schedule_text(sch) -> str:
+    if sch is None:
+        return "—"
+    if not sch.feasible:
+        return f"⚠ spóźnienie {sch.max_late_h:.1f} h"
+    return "✓ w terminach"
 
 
 def crossing_text(crossings) -> str:
@@ -84,6 +100,8 @@ def ranked_to_frame(ranked: list[Ranked], clients: dict | None = None, estimated
             "Dystans (km)": round(ev["total_km"], 0),
             "Cena/km (EUR)": round(ev["revenue"] / ev["total_km"], 2) if ev["total_km"] else 0.0,
             "Czas (dni)": round(ev["days"], 1),
+            "Harmonogram": schedule_text(ev.get("schedule")),
+            "Zakończenie": from_h(ev["schedule"].end_h).strftime("%d.%m %H:%M") if ev.get("schedule") else "—",
             "Km puste": round(ev["empty_km"], 0),
             "Zapełnienie (LDM)": round(v.peak_ldm, 1),
             "Ładunek (t)": round(v.peak_weight_t, 1),

@@ -1,4 +1,4 @@
-# Optymalizator Tras LTL
+# Symulator Tras LTL
 
 Streamlit + Pandas + Leaflet (własny komponent mapy). Wklejasz dane z Timocom / Trans.eu, aplikacja liczy koszty
 i podpowiada najbardziej zyskowne doładunki (TOP 10).
@@ -104,5 +104,76 @@ wczytuje i usuwa się w kroku 1 („Zapisane tabele zleceń”), rankingi ogląd
 * „Dopasowanie ofert do zestawu” (panel boczny): tylko oferty dopuszczające naczepę, nadwozia zestawu, ADR, winda,
   FTL. Powód wykluczenia każdej oferty widać w szczegółach pod tabelą zleceń. Położenie kodów pocztowych jest ustalane
   tylko dla ofert, które wejdą do wyszukiwania (równolegle, z paskiem postępu).
+* **Okna czasowe i harmonogram** (panel boczny „Terminy i czas pracy”, krok 3 „Data i godzina wyjazdu”): parser kart
+  Trans.eu czyta okna załadunku i rozładunku (godziny, zakresy „od - do”, dwie linie dat); oferta z samą datą ma okno w
+  godzinach przeładunków z ustawień (domyślnie 6-18). Optymalizator dobiera KOLEJNOŚĆ punktów tak, żeby wariant mieścił
+  się w oknach przy zadanej prędkości, dniu pracy 9 h (jazda + obsługa), limicie 56 h jazdy w tygodniu i odpoczynkach
+  (dobowy 11 h, tygodniowy 45 h); warianty, które się nie mieszczą (także po prawdziwych trasach), odpadają. Przyjazd przed
+  otwarciem okna = czekanie; dni kalendarzowe ponad dni pracy wchodzą do kosztów (można wyłączyć). Wyjazd: automatyczny
+  (pojazd rusza tak, by zdążyć na początek pierwszego okna) albo z podanej daty i godziny. Tabela „krok po kroku” pokazuje
+  przyjazd, okno, status (czeka / spóźnienie / odpoczynek), a ranking kolumny „Harmonogram” i „Zakończenie”. Okna można
+  poprawić w tabeli zleceń (przełącznik „Pokaż szczegóły ofert”). Tolerancja spóźnienia i wyłączenie okien: w ustawieniach.
+* **Duplikaty ofert** (panel boczny „Duplikaty ofert”): dwie oferty to duplikat, gdy mają taką samą (lub bardzo zbliżoną,
+  domyślnie ±5%) wagę i LDM, niewykluczające się daty załadunku oraz: ten sam kod pocztowy odbioru i zrzutu (nazwa
+  miejscowości nie ma znaczenia) ALBO jeden koniec identyczny, a drugi z podobnym kodem (ten sam kraj, wspólne 3 pierwsze
+  znaki; w GB część przed spacją). Z grupy zostaje oferta pasująca do zestawu i najlepiej płatna, pozostałe mają w
+  tabeli powód „duplikat Tn” i nie wchodzą do wariantów.
 * Ten sam ładunek ofertowany kilka razy (np. z różnymi stawkami) nigdy nie trafia do jednego wariantu dwa razy.
 * Stratne warianty (zysk ≤ 0) są ukrywane.
+
+## Interfejs (zakładki etapów)
+
+Aplikacja jest podzielona na pięć zakładek: **1 · Dane**, **2 · Zlecenia**, **3 · Start i punkty**, **4 · Warianty**, **5 · Trasa**.
+Po „Szukaj doładunków” widok sam przechodzi do zakładki Zlecenia, a przyciski „Dalej →” prowadzą do kolejnych etapów.
+Wygląd (kolory, czcionka Inter) ustawia `.streamlit/config.toml` oraz `ltl/ui.py`. Wymaga Streamlit ≥ 1.67.
+
+## Workspace i pojazdy
+
+Zakładki **🧰 Workspace** i **🚛 Pojazdy** (po pięciu etapach wyszukiwania) służą do ręcznego układania i poprawiania tras.
+
+* **Pojazdy** - lista pojazdów firmy (nazwa/numer, nadwozie, maks. LDM i ładowność, miejsce startu). Wspólna dla wszystkich.
+* **Auta → trasy → warianty → tabela.** W Workspace wybierasz auto, potem jego trasę (numer `TR-RRRR/MM-NNNN`, kolejność
+  jazdy zmieniasz strzałkami), potem wariant trasy (kopię wariantu robi „Nowy wariant”; ⭐ = wariant aktywny). Dla wariantu
+  sekcja **📊 Tabela** pokazuje układ z arkusza firmy: wiersz trasy (sumy i kalkulacje całej trasy: frachty, km, stawka €/km,
+  LDM, €/LDM, marża €/km i łączna, koszt razem i dzienny, paliwo, opłaty drogowe, prom/tunel) oraz wiersze jej zleceń
+  (`...-01`, `...-02`). Skąd/Dokąd to kraj + miejscowość odczytana z kodu pocztowego. W tabeli edytujesz zleceniodawcę, fracht,
+  dodatkowe wynagrodzenie, dyspozytora, **status płatności** (nieopłacone / opłacone / przeterminowane) i **termin płatności**
+  (7, 15, 21, 30, 40, 45, 60 dni - liczony od daty rozładunku). **Płatne odcinki** (prom, pociąg, tunel, inny - lista rozwijana
+  z kosztem) zwiększają koszty trasy. Marża zlecenia = jego przychód minus część kosztów trasy proporcjonalna do km.
+  **📚 Cały pojazd** pokazuje wszystkie trasy auta po kolei (aktywne warianty; koniec jednej trasy = początek następnej).
+* Pozostałe sekcje: trasa na mapie z kosztami, edycja danych zleceń, kolejność punktów, dodawanie zleceń z wyszukiwania i
+  punktów dodatkowych, ustawienia wariantu (nazwa, data wyjazdu), kopiowanie do drugiego trybu pracy.
+* **Praca osobista** - własne trasy, widoczne po imieniu wpisanym w polu „Twoje imię” (imię jest zapamiętywane w
+  adresie strony `?u=...`; to nie jest logowanie, tylko rozdzielenie danych). **Praca grupowa** - wspólne trasy,
+  które może edytować każdy pracownik; widać, kto zmienił wariant ostatnio.
+* Zmiany zapisują się od razu i **natychmiast przeliczają trasę, koszty, harmonogram i zysk**. Wszystko trafia do bazy
+  (SQLite: `vehicles`, `routes`, `variants`; kopia zapasowa obejmuje je razem z resztą). Dotychczasowe plany pojazdów
+  zamieniają się automatycznie w trasy z jednym wariantem. Gdy dwie osoby edytują ten sam wariant, druga dostaje
+  ostrzeżenie i najnowszą wersję zamiast po cichu nadpisanych danych.
+* Wariant z zakładki „5 · Trasa” wyślesz do workspace jako nową trasę auta albo nowy wariant istniejącej trasy.
+
+## Ustalanie położenia kodów pocztowych
+
+Kod pocztowy → współrzędne: pamięć podręczna na dysku → zippopotam.us (kilka wariantów zapisu kodu: np. NL `4611AA` i `4611`,
+PL `62800` i `62-800`, CZ/SK ze spacją, GB/IE pierwszy człon) → Nominatim (kod, potem kod + miejscowość) → przybliżenie z podobnych
+znanych kodów (`prefiks`) → środek kraju. Chwilowe błędy sieci tylko na minutę wstrzymują usługę (nie wyłączają jej na stałe).
+Kody bez dokładnej lokalizacji są wypisane w zakładce „2 · Zlecenia” (z możliwością ponowienia próby i ręcznego podania
+współrzędnych, zapamiętywanych na stałe), a w zakładce „1 · Dane” jest narzędzie „Sprawdź kod pocztowy” pokazujące krok po kroku,
+co zwróciła która usługa.
+
+## Wydajność
+
+Przeładowanie strony (kliknięcie, zmiana zakładki) trwa ułamek sekundy także przy kilkuset ofertach: kosztowne etapy
+(ceny, kwalifikacja, duplikaty, historia ofert) są buforowane do zmiany danych lub ustawień, scalanie poprawek z tabeli i
+wykrywanie duplikatów działa na całych kolumnach, a optymalizator (`ltl/optimizer.py`) używa szybszych struktur i odsiewa
+pary zleceń, które i tak nie zmieszczą się w limicie objazdu. Pamięć podręczna tras jest ograniczona (LRU), a równoległe
+zapytania o ten sam odcinek są łączone. Stare wersje funkcji są zachowane w `tests/ref_*.py`; testy sprawdzają, że nowe
+dają identyczne wyniki.
+
+## Formaty ustawień
+
+Wszystkie ustawienia z panelu bocznego (koszty, szukanie, terminy, dopasowanie do zestawu, duplikaty, ceny szacunkowe, trasy,
+parametry zestawu) oraz opcje z zakładek „Dane” i „Start” zapisują się **same przy każdej zmianie** w wybranym **formacie**
+(lista „Format ustawień” na górze panelu). Każdy użytkownik może mieć własny format (np. „Andrzej”, „Ania”): „Nowy / usuń format”
+tworzy go z bieżących ustawień, wybór z listy wczytuje jego dane. Format zapamiętuje adres strony (`?f=Ania`). Formaty są w bazie
+(tabela `settings_formats`) i wchodzą do kopii zapasowej; hasła i klucze API nie są zapisywane.
