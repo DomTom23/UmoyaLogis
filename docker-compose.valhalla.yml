@@ -27,6 +27,9 @@ services:
         https://download.geofabrik.de/europe/switzerland/switzerland-latest.osm.pbf
         https://download.geofabrik.de/europe/spain/spain-latest.osm.pbf
         https://download.geofabrik.de/europe/great-britain/great-britain-latest.osm.pbf
+        https://download.geofabrik.de/europe/denmark/denmark-latest.osm.pbf
+        https://download.geofabrik.de/europe/slovakia/slovakia-latest.osm.pbf
+        https://download.geofabrik.de/europe/hungary/hungary-latest.osm.pbf
       use_tiles_ignore_pbf: "True"
       build_elevation: "False"
       build_admins: "True"
