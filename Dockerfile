@@ -1,6 +1,9 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    STREAMLIT_SERVER_FILE_WATCHER_TYPE=none \
+    STREAMLIT_SERVER_RUN_ON_SAVE=false \
     PIP_NO_CACHE_DIR=1 \
     LTL_DB_PATH=/data/umoyalogis.db \
     LTL_GEOCACHE_PATH=/data/geocache.json

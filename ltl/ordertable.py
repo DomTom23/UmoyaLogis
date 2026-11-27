@@ -49,24 +49,40 @@ def merge_edits(work: pd.DataFrame, view_ids: list[str], edited: pd.DataFrame) -
     """Nanosi na pełną tabelę `work` zmiany wykonane w widoku (wiersze o numerach `view_ids`).
 
     Wiersze z numerem w `edited` aktualizują `work`, wiersze widoku, których już nie ma, są usuwane,
-    a wiersze bez numeru (dodane w edytorze) dostają nowy numer M<n>."""
+    a wiersze bez numeru (dodane w edytorze) dostają nowy numer M<n>.
+    (Operacje na całych kolumnach naraz - wcześniejsza wersja scalała wiersz po wierszu i przy kilkuset zleceniach
+    zajmowała większość czasu każdego przeładowania strony.)"""
     work = work.copy().set_index("id", drop=False)
     edited = edited.reset_index(drop=True)
     has_id = edited["id"].notna() & (edited["id"].astype(str) != "")
     kept = set(edited.loc[has_id, "id"])
     work = work.drop(index=[i for i in view_ids if i not in kept and i in work.index])
-    for _, row in edited[has_id].iterrows():
-        if row["id"] in work.index:
-            work.loc[row["id"], edited.columns] = row.values
-        else:
-            work.loc[row["id"]] = row.reindex(work.columns)
-    taken, n = set(work.index), 0
-    for _, row in edited[~has_id].iterrows():
-        while f"M{n}" in taken:
-            n += 1
-        new_id = f"M{n}"
-        taken.add(new_id)
-        row = row.reindex(work.columns)
-        row["id"] = new_id
-        work.loc[new_id] = row
+    with_id = edited[has_id]
+    if len(with_id):
+        last = with_id.drop_duplicates("id", keep="last").set_index("id", drop=False)     # przy powtórzonym numerze wygrywa ostatni
+        order = list(dict.fromkeys(with_id["id"]))                                          # kolejność pierwszego wystąpienia
+        existing = [i for i in order if i in work.index]
+        if existing:
+            for c in (c for c in edited.columns if c in work.columns):          # kolumna po kolumnie (nie wiersz po wierszu)
+                vals = last.loc[existing, c]
+                try:
+                    work.loc[existing, c] = vals
+                except (TypeError, ValueError):                                 # inny typ w edytorze: rozszerz kolumnę
+                    work[c] = work[c].astype(object)
+                    work.loc[existing, c] = vals
+        fresh = [i for i in order if i not in work.index]
+        if fresh:
+            work = pd.concat([work, last.loc[fresh].reindex(columns=work.columns)])
+    no_id = edited[~has_id]
+    if len(no_id):
+        taken, n, new_ids = set(work.index), 0, []
+        for _ in range(len(no_id)):
+            while f"M{n}" in taken:
+                n += 1
+            new_ids.append(f"M{n}")
+            taken.add(f"M{n}")
+        add = no_id.reindex(columns=work.columns).copy()
+        add["id"] = new_ids
+        add.index = new_ids
+        work = pd.concat([work, add])
     return work.reset_index(drop=True)

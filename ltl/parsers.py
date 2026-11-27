@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, time as dtime
 from typing import Optional
 
 import pandas as pd
@@ -36,9 +36,11 @@ _SPACED_5 = {"SE", "CZ", "SK", "GR"}   # "123 45"
 COLUMNS = [
     "id", "source", "start_country", "start_postal", "start_city",
     "end_country", "end_postal", "end_city", "load_date", "unload_date",
+    "load_from", "load_to", "unload_from", "unload_to",
     "weight_t", "ldm", "distance_km", "price_eur", "client", "load_type", "vehicles", "body", "extras",
     "description", "status", "defaults_used",
 ]
+WINDOW_COLUMNS = ("load_from", "load_to", "unload_from", "unload_to")
 TEXT_COLUMNS = ("source", "start_city", "end_city", "defaults_used", "client", "load_type", "vehicles", "body",
                 "extras", "description")
 
@@ -106,6 +108,12 @@ class RawOrder:
     extras: str = ""
     description: str = ""
     ldm_from_dims: bool = False             # LDM oszacowane z wymiarów podanych w opisie
+    load_slots: list = field(default_factory=list)     # linie z datą/godziną przy załadunku (tryb karty)
+    unload_slots: list = field(default_factory=list)   # i przy rozładunku
+    load_from: Optional[datetime] = None    # okno załadunku (data i godzina); 00:00:00 / 23:59:59 = tylko data
+    load_to: Optional[datetime] = None
+    unload_from: Optional[datetime] = None
+    unload_to: Optional[datetime] = None
     published: Optional[date] = None        # data publikacji oferty (tryb karty)
     card: bool = False
 
@@ -416,6 +424,40 @@ def _fix_year(d: Optional[date], ref: date) -> Optional[date]:
     return d
 
 
+_TIME_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)")
+
+
+def _slot(line: str) -> Optional[tuple]:
+    """Linia z datą i opcjonalnie godzinami: '30.10, 08:00 - 15:00' -> (data, godz. od, godz. do)."""
+    d = find_dates(line)
+    if not d:
+        return None
+    times = [dtime(int(h), int(m)) for h, m in _TIME_RE.findall(line) if int(h) < 24 and int(m) < 60]
+    return d[0], (times[0] if times else None), (times[1] if len(times) > 1 else None)
+
+
+def _slots_to_window(slots: list, ref: Optional[date]) -> tuple:
+    """Linie dat przy jednym miejscu -> okno (od, do).
+    Jedna linia z zakresem godzin = to samo okno w tym dniu; z jedną godziną = od tej godziny do końca dnia;
+    sama data = cały dzień; dwie linie = od pierwszej do drugiej."""
+    if not slots:
+        return None, None
+    fix = (lambda d: _fix_year(d, ref)) if ref else (lambda d: d)
+    d1, a1, b1 = slots[0]
+    d1 = fix(d1)
+    if len(slots) == 1:
+        d2, a2, b2 = d1, a1, b1
+        start = datetime.combine(d1, a1) if a1 else datetime.combine(d1, dtime(0, 0, 0))
+        end = datetime.combine(d1, b1) if b1 else datetime.combine(d1, dtime(23, 59, 59))
+        return start, end
+    d2, a2, b2 = slots[-1]
+    d2 = fix(d2)
+    start = datetime.combine(d1, a1) if a1 else datetime.combine(d1, dtime(0, 0, 0))
+    last = b2 or a2
+    end = datetime.combine(d2, last) if last else datetime.combine(d2, dtime(23, 59, 59))
+    return start, max(end, start)
+
+
 def _parse_card_params(o: RawOrder, line: str) -> bool:
     toks = [t.strip() for t in re.split(r",\s+", line) if t.strip()]
     low = [t.lower() for t in toks]
@@ -493,6 +535,12 @@ def _finish_card(o: RawOrder) -> None:
     o.extras = ", ".join(extras)
     if o.published:
         o.load_date, o.unload_date = _fix_year(o.load_date, o.published), _fix_year(o.unload_date, o.published)
+    o.load_from, o.load_to = _slots_to_window(o.load_slots, o.published)
+    o.unload_from, o.unload_to = _slots_to_window(o.unload_slots, o.published)
+    if o.load_from and o.load_date is None:
+        o.load_date = o.load_from.date()
+    if o.unload_from and o.unload_date is None:
+        o.unload_date = o.unload_from.date()
 
 
 def _parse_cards(text: str) -> list[RawOrder]:
@@ -524,6 +572,10 @@ def _parse_cards(text: str) -> list[RawOrder]:
         if stage == "start":
             if loc:
                 cur.end, stage = loc, "end"
+            elif _DATE_LINE_RE.match(line) and (sl := _slot(line)):
+                cur.load_slots.append(sl)
+                if cur.load_date is None:
+                    cur.load_date = sl[0]
             elif cur.load_date is None and (d := find_dates(line)):
                 cur.load_date = d[0]
             continue
@@ -538,6 +590,8 @@ def _parse_cards(text: str) -> list[RawOrder]:
         if not (weight_seen or params_seen) and _DATE_LINE_RE.match(line) and (d := find_dates(line)):
             if cur.unload_date is None:
                 cur.unload_date = d[0]
+            if (sl := _slot(line)):
+                cur.unload_slots.append(sl)
             continue
         if not price_seen and (pm := _PRICE_LINE_RE.match(line)) and (params_seen or weight_seen):
             price_seen = True
@@ -691,6 +745,7 @@ def to_dataframe(
             "start_country": o.start[0], "start_postal": o.start[1], "start_city": o.start[2],
             "end_country": o.end[0], "end_postal": o.end[1], "end_city": o.end[2],
             "load_date": o.load_date, "unload_date": o.unload_date,
+            "load_from": o.load_from, "load_to": o.load_to, "unload_from": o.unload_from, "unload_to": o.unload_to,
             "weight_t": round(weight, 2), "ldm": round(ldm, 2),
             "distance_km": o.distance_km,
             "price_eur": price,
@@ -700,7 +755,10 @@ def to_dataframe(
             "status": "Za duże dla naczepy" if too_big else ("OK" if price is not None else "Do negocjacji"),
             "defaults_used": ", ".join(used),
         })
-    return pd.DataFrame(rows, columns=COLUMNS)
+    df = pd.DataFrame(rows, columns=COLUMNS)
+    for c in WINDOW_COLUMNS:
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+    return df
 
 
 def parse_orders(text: str, source: str = "Auto", **kwargs) -> pd.DataFrame:

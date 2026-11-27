@@ -14,8 +14,10 @@ from __future__ import annotations
 import json
 import os
 import threading
+from collections import OrderedDict
 import urllib.error
 import urllib.request
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from .geo import ROAD_FACTOR, haversine_km
@@ -135,7 +137,7 @@ def _post(url: str, payload: dict, headers: dict | None = None, timeout: float =
         headers={"Content-Type": "application/json", "User-Agent": "UmoyaLogis-LTL/1.0", **(headers or {})},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _REQUESTS, urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:200]
@@ -178,9 +180,46 @@ def _merge(a: Leg, b: Leg) -> Leg:
                maneuvers=a.maneuvers + b.maneuvers, via_switzerland=a.via_switzerland or b.via_switzerland)
 
 
-_LEG_CACHE: dict = {}
+class LRUCache:
+    """Słownik z ograniczoną liczbą wpisów (najdawniej używane wypadają) i własną blokadą - pamięć podręczna tras nie
+    może rosnąć bez końca w serwerze działającym tygodniami (każda trasa to tysiące punktów)."""
+
+    def __init__(self, maxsize: int):
+        self.maxsize = maxsize
+        self._d: OrderedDict = OrderedDict()
+        self._lock = threading.RLock()
+
+    def get(self, key, default=None):
+        with self._lock:
+            if key not in self._d:
+                return default
+            self._d.move_to_end(key)
+            return self._d[key]
+
+    def __setitem__(self, key, value) -> None:
+        with self._lock:
+            self._d[key] = value
+            self._d.move_to_end(key)
+            while len(self._d) > self.maxsize:
+                self._d.popitem(last=False)
+
+    def __contains__(self, key) -> bool:
+        with self._lock:
+            return key in self._d
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._d.clear()
+
+
+_LEG_CACHE = LRUCache(4000)
 _NO_EXCLUDE: set = set()      # serwery, które odrzuciły opcję exclude_polygons
 _LOCK = threading.Lock()
+LEG_WORKERS = 4                                  # tyle odcinków jednej trasy liczymy naraz
+_REQUESTS = threading.BoundedSemaphore(8)        # łącznie nie więcej niż 8 zapytań do serwera tras jednocześnie
 
 
 def _parse_valhalla_leg(leg: dict) -> Leg:
@@ -282,15 +321,35 @@ def _avoid_switzerland(group: list[dict], leg: Leg, route_fn) -> Leg:
     return leg
 
 
+_INFLIGHT: dict = {}
+
+
 def _cached(key, fn):
+    """Pamięć podręczna odcinków. Gdy kilka wątków prosi naraz o ten sam odcinek (np. kandydaci wariantów mają wspólny
+    fragment trasy), liczy go jeden, a reszta czeka na jego wynik - zamiast wysyłać to samo zapytanie wielokrotnie."""
     with _LOCK:
         hit = _LEG_CACHE.get(key)
-    if hit is not None:
-        return hit
-    val = fn()
-    with _LOCK:
-        _LEG_CACHE[key] = val
-    return val
+        if hit is not None:
+            return hit
+        fut = _INFLIGHT.get(key)
+        owner = fut is None
+        if owner:
+            fut = _INFLIGHT[key] = Future()
+    if not owner:
+        return fut.result()
+    try:
+        val = fn()
+    except BaseException as e:
+        fut.set_exception(e)
+        raise
+    else:
+        with _LOCK:
+            _LEG_CACHE[key] = val
+        fut.set_result(val)
+        return val
+    finally:
+        with _LOCK:
+            _INFLIGHT.pop(key, None)
 
 
 def _leg_key(kind, base, truck, opts, group):
@@ -300,23 +359,39 @@ def _leg_key(kind, base, truck, opts, group):
 def route_valhalla(points: list[dict], truck: TruckProfile, base_url: str = VALHALLA_URL,
                    avg_speed_kmh: float = 65.0, opts: RouteOptions = RouteOptions()) -> RouteResult:
     """points: [{'lat', 'lon', 'type': 'break'|'through'}]. Każdy odcinek liczony osobno
-    (limit serwera dotyczy jednego zapytania); odcinek, którego nie da się wyznaczyć, jest linią prostą."""
-    legs, failed, errors = [], [], []
-    for i, group in enumerate(_groups(points)):
+    (limit serwera dotyczy jednego zapytania); odcinek, którego nie da się wyznaczyć, jest linią prostą.
+    Odcinki, których nie ma jeszcze w pamięci podręcznej, są wyznaczane równolegle."""
+    groups = _groups(points)
+
+    def leg_for(group):
+        def build(group=group):
+            if _same_place(group):
+                return _zero_leg(group)
+            avoid = opts.avoid_switzerland and not _endpoints_in_ch(group)
+            leg = _valhalla_leg(group, truck, base_url, avoid)
+            if avoid and shape_in_switzerland(leg.shape):
+                leg = _avoid_switzerland(group, leg, lambda g: _valhalla_leg(g, truck, base_url, True))
+            return leg
         try:
-            def build(group=group):
-                if _same_place(group):
-                    return _zero_leg(group)
-                avoid = opts.avoid_switzerland and not _endpoints_in_ch(group)
-                leg = _valhalla_leg(group, truck, base_url, avoid)
-                if avoid and shape_in_switzerland(leg.shape):
-                    leg = _avoid_switzerland(group, leg, lambda g: _valhalla_leg(g, truck, base_url, True))
-                return leg
-            legs.append(_cached(_leg_key("valhalla", base_url, truck, opts, group), build))
+            return _cached(_leg_key("valhalla", base_url, truck, opts, group), build)
         except RoutingHTTPError as e:
+            return e                               # zamienimy na linię prostą (jak dotąd); inne błędy lecą wyżej
+
+    with _LOCK:
+        todo = [g for g in groups if _leg_key("valhalla", base_url, truck, opts, g) not in _LEG_CACHE]
+    if len(todo) > 1:
+        with ThreadPoolExecutor(max_workers=min(LEG_WORKERS, len(todo))) as pool:
+            results = list(pool.map(leg_for, groups))
+    else:
+        results = [leg_for(g) for g in groups]
+    legs, failed, errors = [], [], []
+    for i, (group, res) in enumerate(zip(groups, results)):
+        if isinstance(res, RoutingHTTPError):
             legs.append(_straight_leg(group, avg_speed_kmh))
             failed.append(i)
-            errors.append(f"odcinek {i + 1}: {e}")
+            errors.append(f"odcinek {i + 1}: {res}")
+        else:
+            legs.append(res)
     if len(failed) == len(legs):
         return RouteResult(legs=legs, provider="linia prosta ×1,3 (brak routingu)", is_real=False,
                            error="; ".join(errors), straight_legs=failed)

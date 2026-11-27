@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .parsers import COLUMNS, TEXT_COLUMNS
+from .parsers import COLUMNS, TEXT_COLUMNS, WINDOW_COLUMNS
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "umoyalogis.db"
 KINDS = ("orders", "ranking")
@@ -32,6 +33,14 @@ class NameExists(Exception):
 
 class InvalidName(ValueError):
     pass
+
+
+class PlanConflict(Exception):
+    """Plan zmienił ktoś inny w międzyczasie (wersja w bazie jest nowsza niż ta, którą edytowano)."""
+
+    def __init__(self, current: dict | None):
+        super().__init__("plan został zmieniony przez inną osobę")
+        self.current = current
 
 
 def db_path() -> Path:
@@ -71,6 +80,7 @@ class Store:
                     start_country TEXT, start_postal TEXT, start_city TEXT,
                     end_country TEXT, end_postal TEXT, end_city TEXT,
                     load_date TEXT, unload_date TEXT,
+                    load_from TEXT, load_to TEXT, unload_from TEXT, unload_to TEXT,
                     weight_t REAL, ldm REAL, distance_km REAL, price_eur REAL,
                     client TEXT, load_type TEXT, vehicles TEXT, body TEXT, extras TEXT, description TEXT,
                     status TEXT, defaults_used TEXT,
@@ -99,9 +109,39 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_history_client ON offer_history(client);
                 CREATE INDEX IF NOT EXISTS idx_history_seen ON offer_history(first_seen_at);
+                CREATE TABLE IF NOT EXISTS vehicles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    note TEXT NOT NULL DEFAULT '',
+                    body TEXT NOT NULL DEFAULT '',
+                    max_ldm REAL NOT NULL DEFAULT 13.6,
+                    max_weight_t REAL NOT NULL DEFAULT 24,
+                    start_country TEXT NOT NULL DEFAULT '',
+                    start_postal TEXT NOT NULL DEFAULT '',
+                    start_city TEXT NOT NULL DEFAULT '',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS settings_formats (
+                    name TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope TEXT NOT NULL CHECK (scope IN ('personal', 'group')),
+                    owner TEXT NOT NULL DEFAULT '',
+                    vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE CASCADE,
+                    data TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    UNIQUE (scope, owner, vehicle_id)
+                );
             """)
             # migracja baz utworzonych we wcześniejszych wersjach (nowe kolumny dopisujemy na końcu)
-            for table, new_cols in (("saved_orders", ("client", "load_type", "vehicles", "body", "extras", "description")),
+            for table, new_cols in (("saved_orders", ("client", "load_type", "vehicles", "body", "extras", "description",
+                                       *WINDOW_COLUMNS)),
                                     ("offer_history", ("load_type", "vehicles", "body", "extras", "description"))):
                 have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
                 for col in new_cols:
@@ -117,6 +157,18 @@ class Store:
                 yield conn
         finally:
             conn.close()
+
+    def version_token(self) -> tuple:
+        """Tani znacznik „czy baza się zmieniła” (czas i rozmiar pliku bazy oraz dziennika WAL) - do buforowania
+        odczytów, które inaczej wykonywałyby się przy każdym przeładowaniu strony."""
+        out = []
+        for suffix in ("", "-wal"):
+            try:
+                st_ = os.stat(f"{self.path}{suffix}")
+                out.append((st_.st_mtime_ns, st_.st_size))
+            except OSError:
+                out.append((0, 0))
+        return tuple(out)
 
     # ------------------------------------------------------------ zapis
     def _upsert_header(self, c, kind: str, name: str, n_rows: int, note: str, overwrite: bool) -> int:
@@ -143,6 +195,8 @@ class Store:
                     v = r[col]
                     if col in DATE_COLS:
                         v = None if pd.isna(v) else pd.Timestamp(v).date().isoformat()
+                    elif col in WINDOW_COLUMNS:
+                        v = None if pd.isna(v) else pd.Timestamp(v).isoformat(timespec="seconds")
                     elif col in NUM_COLS:
                         v = None if pd.isna(v) else float(v)
                     else:
@@ -183,6 +237,8 @@ class Store:
         for col in DATE_COLS:
             df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
             df[col] = df[col].where(df[col].notna(), None)
+        for col in WINDOW_COLUMNS:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
         for col in NUM_COLS:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         for col in (*TEXT_COLUMNS, "status"):
@@ -299,3 +355,126 @@ class Store:
     def delete_history(self, ids: list[int]) -> int:
         with self._conn() as c:
             return sum(c.execute("DELETE FROM offer_history WHERE id=?", (int(i),)).rowcount for i in ids)
+
+    # ------------------------------------------------------------ pojazdy
+    VEHICLE_COLS = ("name", "note", "body", "max_ldm", "max_weight_t", "start_country", "start_postal", "start_city")
+
+    def vehicles(self, active_only: bool = True) -> pd.DataFrame:
+        with self._conn() as c:
+            q = "SELECT id, name, note, body, max_ldm, max_weight_t, start_country, start_postal, start_city, active " \
+                "FROM vehicles" + (" WHERE active=1" if active_only else "") + " ORDER BY name COLLATE NOCASE"
+            return pd.read_sql_query(q, c)
+
+    def save_vehicle(self, vehicle_id: int | None = None, **fields) -> int:
+        """Dodaje pojazd (vehicle_id=None) albo aktualizuje istniejący. Nazwa jest unikalna."""
+        data = {k: fields[k] for k in self.VEHICLE_COLS if k in fields}
+        if "name" in data:
+            data["name"] = clean_name(data["name"]).strip()
+        for k in ("start_country", "start_postal"):
+            if k in data:
+                data[k] = (data[k] or "").strip().upper() if k == "start_country" else (data[k] or "").strip()
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            with self._conn() as c:
+                if vehicle_id is None:
+                    if "name" not in data:
+                        raise InvalidName("Podaj nazwę pojazdu.")
+                    cols = list(data) + ["updated_at"]
+                    cur = c.execute(f"INSERT INTO vehicles ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                                    [*data.values(), now])
+                    return cur.lastrowid
+                sets = ", ".join(f"{k}=?" for k in data) + (", " if data else "") + "updated_at=?, active=1"
+                c.execute(f"UPDATE vehicles SET {sets} WHERE id=?", [*data.values(), now, int(vehicle_id)])
+                return int(vehicle_id)
+        except sqlite3.IntegrityError as e:
+            raise NameExists(data.get("name", "")) from e
+
+    def retire_vehicle(self, vehicle_id: int) -> None:
+        """Wycofanie z listy (plany zostają w bazie)."""
+        with self._conn() as c:
+            c.execute("UPDATE vehicles SET active=0 WHERE id=?", (int(vehicle_id),))
+
+    def delete_vehicle(self, vehicle_id: int) -> None:
+        """Trwale usuwa pojazd razem z jego planami (osobistymi i grupowymi)."""
+        with self._conn() as c:
+            c.execute("DELETE FROM plans WHERE vehicle_id=?", (int(vehicle_id),))
+            c.execute("DELETE FROM vehicles WHERE id=?", (int(vehicle_id),))
+
+    # ------------------------------------------------------------ plany (workspace)
+    @staticmethod
+    def _plan_row(row) -> dict:
+        return {"id": row[0], "data": json.loads(row[1]), "version": row[2], "updated_at": row[3], "updated_by": row[4]}
+
+    def get_plan(self, scope: str, owner: str, vehicle_id: int) -> dict | None:
+        owner = owner if scope == "personal" else ""
+        with self._conn() as c:
+            row = c.execute("SELECT id, data, version, updated_at, updated_by FROM plans "
+                            "WHERE scope=? AND owner=? AND vehicle_id=?", (scope, owner, int(vehicle_id))).fetchone()
+        return self._plan_row(row) if row else None
+
+    def save_plan(self, scope: str, owner: str, vehicle_id: int, data: dict, expected_version: int, by: str = "") -> int:
+        """Zapisuje plan z kontrolą wersji (expected_version=0 dla nowego). Zwraca nową wersję;
+        gdy w bazie jest już inna wersja - rzuca PlanConflict z bieżącym stanem."""
+        owner = owner if scope == "personal" else ""
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = json.dumps(data, ensure_ascii=False, default=str)
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")           # blokada zapisu na czas porównania i zapisu wersji
+            row = c.execute("SELECT id, data, version, updated_at, updated_by FROM plans "
+                            "WHERE scope=? AND owner=? AND vehicle_id=?", (scope, owner, int(vehicle_id))).fetchone()
+            if row is None:
+                if expected_version:
+                    raise PlanConflict(None)
+                c.execute("INSERT INTO plans (scope, owner, vehicle_id, data, version, updated_at, updated_by) "
+                          "VALUES (?,?,?,?,1,?,?)", (scope, owner, int(vehicle_id), payload, now, by))
+                return 1
+            if row[2] != expected_version:
+                raise PlanConflict(self._plan_row(row))
+            c.execute("UPDATE plans SET data=?, version=version+1, updated_at=?, updated_by=? WHERE id=?",
+                      (payload, now, by, row[0]))
+            return row[2] + 1
+
+    def delete_plan(self, scope: str, owner: str, vehicle_id: int) -> None:
+        owner = owner if scope == "personal" else ""
+        with self._conn() as c:
+            c.execute("DELETE FROM plans WHERE scope=? AND owner=? AND vehicle_id=?", (scope, owner, int(vehicle_id)))
+
+    def plans_overview(self, scope: str, owner: str) -> dict[int, dict]:
+        """{vehicle_id: {"n_orders", "updated_at", "updated_by"}} - do oznaczania pojazdów, które mają już plan."""
+        owner = owner if scope == "personal" else ""
+        out = {}
+        with self._conn() as c:
+            for vid, data, at, by in c.execute("SELECT vehicle_id, data, updated_at, updated_by FROM plans "
+                                               "WHERE scope=? AND owner=?", (scope, owner)):
+                try:
+                    n = len(json.loads(data).get("orders", []))
+                except ValueError:
+                    n = 0
+                out[vid] = {"n_orders": n, "updated_at": at, "updated_by": by}
+        return out
+
+    # ------------------------------------------------------------ formaty ustawień
+    def list_formats(self) -> list[str]:
+        with self._conn() as c:
+            return [r[0] for r in c.execute("SELECT name FROM settings_formats ORDER BY name COLLATE NOCASE")]
+
+    def get_format(self, name: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT data FROM settings_formats WHERE name=?", (name,)).fetchone()
+        try:
+            return json.loads(row[0]) if row else None
+        except ValueError:
+            return None
+
+    def save_format(self, name: str, data: dict) -> str:
+        name = clean_name(name)
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._conn() as c:
+            c.execute("INSERT INTO settings_formats (name, data, updated_at) VALUES (?,?,?) "
+                      "ON CONFLICT(name) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+                      (name, json.dumps(data, ensure_ascii=False, default=str), now))
+        return name
+
+    def delete_format(self, name: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM settings_formats WHERE name=?", (name,))

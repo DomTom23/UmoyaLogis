@@ -1,1 +1,1 @@
-"""Optymalizator Tras LTL - moduły: parsers, geo, costs, optimizer."""
+"""Symulator Tras LTL - moduły: parsers, geo, costs, optimizer."""

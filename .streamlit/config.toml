@@ -1,6 +1,23 @@
 [theme]
-primaryColor = "#1f6feb"
-font = "sans serif"
+base = "light"
+primaryColor = "#2563eb"
+backgroundColor = "#f4f6fb"
+secondaryBackgroundColor = "#e9eef7"
+textColor = "#0f172a"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+baseRadius = "0.75rem"
+buttonRadius = "0.75rem"
+borderColor = "#dbe2ee"
+dataframeBorderColor = "#dbe2ee"
+showWidgetBorder = true
+linkColor = "#2563eb"
+
+[theme.sidebar]
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f1f5fb"
+
+[client]
+toolbarMode = "minimal"
 
 [browser]
 gatherUsageStats = false
