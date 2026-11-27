@@ -26,6 +26,7 @@ from ltl.schedule import ScheduleParams, from_h, order_windows
 from ltl.route_edit import apply_edit, evaluate_route, route_for_variant
 from ltl.routing import VALHALLA_URL, LRUCache, RouteOptions, RouteResult, TruckProfile
 from ltl.sample import SAMPLE_TEXT
+from ltl.settings import DEFAULT_FORMAT, PROVIDERS, RULES_KEY, SETTING_KEYS, sanitize, snapshot
 from ltl.ui import ALL_TABS, STAGES, STAGE_KEY, cards, empty_state, go_to, hero, inject_css, kpis, next_button, step
 from ltl.variant_detail import order_table, route_chain_html, stop_table
 from ltl.storage import OUTCOMES, InvalidName, NameExists, Store
@@ -129,61 +130,145 @@ def get_route(v, vias) -> RouteResult:
     return res
 
 
+# ------------------------------------------------- formaty ustawień (np. „Andrzej”, „Ania”)
+def _rules_initial_frame() -> pd.DataFrame:
+    recs = st.session_state.get("s_rules_init")
+    cols = list(rules_to_frame(DEFAULT_RULES).columns)
+    return pd.DataFrame(recs, columns=cols) if recs else rules_to_frame(DEFAULT_RULES)
+
+
+def _apply_format(name: str) -> None:
+    """Wczytuje ustawienia formatu do kontrolek (musi działać przed ich narysowaniem: na starcie sesji albo w callbacku)."""
+    data = sanitize(_store().get_format(name), DEFAULT_BODIES, ALL_BODIES)
+    for k in SETTING_KEYS:
+        st.session_state[k] = data[k]
+    st.session_state["s_rules_init"] = data.get(RULES_KEY)
+    st.session_state["s_rules_cur"] = data.get(RULES_KEY)
+    st.session_state["fmt_nonce"] = st.session_state.get("fmt_nonce", 0) + 1       # edytor reguł pokazuje wczytane dane
+    st.session_state["fmt_snapshot"] = None                                         # punkt odniesienia dla autozapisu
+
+
+def _on_format_change() -> None:
+    _apply_format(st.session_state["fmt_active"])
+    st.query_params["f"] = st.session_state["fmt_active"]
+
+
+def _create_format() -> None:
+    name = " ".join(str(st.session_state.get("fmt_new_name", "")).split())
+    if not name:
+        st.session_state["fmt_msg"] = ("warning", "Podaj nazwę nowego formatu.")
+        return
+    if name == DEFAULT_FORMAT or name in _store().list_formats():
+        st.session_state["fmt_msg"] = ("warning", f"Format „{name}” już istnieje - wybierz go z listy.")
+        return
+    _store().save_format(name, snapshot(st.session_state, st.session_state.get("s_rules_cur")))
+    st.session_state["fmt_active"] = name
+    st.session_state["fmt_snapshot"] = None
+    st.session_state["fmt_new_name"] = ""
+    st.query_params["f"] = name
+    st.session_state["fmt_msg"] = ("success", f"Utworzono format „{name}” z bieżących ustawień.")
+
+
+def _delete_format() -> None:
+    name = st.session_state["fmt_active"]
+    if name != DEFAULT_FORMAT:
+        _store().delete_format(name)
+        st.session_state["fmt_active"] = DEFAULT_FORMAT
+        st.query_params["f"] = DEFAULT_FORMAT
+        _apply_format(DEFAULT_FORMAT)
+        st.session_state["fmt_msg"] = ("success", f"Usunięto format „{name}”.")
+    st.session_state["fmt_confirm_delete"] = False
+
+
+def _autosave_settings() -> None:
+    """Każda zmiana ustawienia zapisuje się w aktywnym formacie (przy kolejnym wejściu wracają same)."""
+    cur = snapshot(st.session_state, st.session_state.get("s_rules_cur"))
+    base = st.session_state.get("fmt_snapshot")
+    if base is None:
+        st.session_state["fmt_snapshot"] = cur
+    elif cur != base:
+        _store().save_format(st.session_state["fmt_active"], cur)
+        st.session_state["fmt_snapshot"] = cur
+
+
+_format_names = [DEFAULT_FORMAT] + [n for n in _store().list_formats() if n != DEFAULT_FORMAT]
+if "fmt_active" not in st.session_state:                  # nowa sesja: format z adresu strony (?f=...) albo domyślny
+    _want = st.query_params.get("f", DEFAULT_FORMAT)
+    st.session_state["fmt_active"] = _want if _want in _format_names else DEFAULT_FORMAT
+    _apply_format(st.session_state["fmt_active"])
+elif st.session_state["fmt_active"] not in _format_names:   # format usunięty w innej sesji
+    st.session_state["fmt_active"] = DEFAULT_FORMAT
+    _apply_format(DEFAULT_FORMAT)
+
 # ---------------------------------------------------------------- ustawienia
 with st.sidebar:
     st.title("⚙️ Ustawienia")
-    st.caption("Zmiany działają od razu - nie trzeba ponownie wczytywać danych.")
+    st.selectbox("Format ustawień", _format_names, key="fmt_active", on_change=_on_format_change,
+                 help="Każdy użytkownik może mieć własny format (np. „Andrzej”, „Ania”): wszystkie ustawienia poniżej "
+                      "zapisują się w nim same przy każdej zmianie i wracają po ponownym wejściu. Wybór formatu zapamiętuje "
+                      "adres strony (?f=...) - zapisz stronę w zakładkach przeglądarki.")
+    with st.expander("➕ Nowy / usuń format"):
+        st.text_input("Nazwa nowego formatu", key="fmt_new_name", placeholder="np. Ania")
+        st.button("Utwórz z bieżących ustawień", on_click=_create_format, width="stretch", key="fmt_create")
+        if st.session_state["fmt_active"] != DEFAULT_FORMAT:
+            st.checkbox("Potwierdzam usunięcie wybranego formatu", key="fmt_confirm_delete")
+            st.button("🗑️ Usuń wybrany format", on_click=_delete_format, width="stretch",
+                      disabled=not st.session_state.get("fmt_confirm_delete"), key="fmt_delete")
+    if "fmt_msg" in st.session_state:
+        level, msg = st.session_state.pop("fmt_msg")
+        getattr(st, level)(msg)
+    st.caption("Zmiany działają od razu i zapisują się w wybranym formacie.")
 
     with st.expander("💶 Koszty", expanded=True):
-        fuel_price = st.number_input("Cena paliwa (EUR/l)", 0.5, 4.0, 1.70, 0.01)
-        consumption = st.number_input("Spalanie (l/100 km)", 10.0, 60.0, 27.0, 0.5)
-        toll = st.number_input("Średnie myto (EUR/km)", 0.0, 1.0, 0.20, 0.01)
-        day_cost = st.number_input("Koszt dnia pracy (EUR)", 0.0, 1000.0, 300.0, 10.0,
+        fuel_price = st.number_input("Cena paliwa (EUR/l)", 0.5, 4.0, step=0.01, key="s_fuel")
+        consumption = st.number_input("Spalanie (l/100 km)", 10.0, 60.0, step=0.5, key="s_cons")
+        toll = st.number_input("Średnie myto (EUR/km)", 0.0, 1.0, step=0.01, key="s_toll")
+        day_cost = st.number_input("Koszt dnia pracy (EUR)", 0.0, 1000.0, step=10.0, key="s_day",
                                    help="Auto + kierowca za jeden dzień pracy.")
-        speed = st.number_input("Średnia prędkość (km/h)", 40.0, 90.0, 65.0, 1.0,
+        speed = st.number_input("Średnia prędkość (km/h)", 40.0, 90.0, step=1.0, key="s_speed",
                                 help="Służy do szacowania czasu przejazdu i liczby dni pracy (limit 9 h jazdy dziennie).")
-        pln_per_eur = st.number_input("Kurs PLN za 1 EUR", 3.0, 6.0, 4.25, 0.05,
+        pln_per_eur = st.number_input("Kurs PLN za 1 EUR", 3.0, 6.0, step=0.05, key="s_pln",
                                       help="Do przeliczania cen podanych w PLN. Zmiana wczytuje oferty od nowa "
                                            "(poprawki ręczne w tabeli zostają tylko do czasu zmiany kursu).")
-        waypoint_h = st.number_input("Postój w punkcie dodatkowym (h)", 0.0, 24.0, 0.0, 0.5,
+        waypoint_h = st.number_input("Postój w punkcie dodatkowym (h)", 0.0, 24.0, step=0.5, key="s_wph",
                                      help="Czas pracy doliczany za każdy obowiązkowy punkt dodatkowy na trasie.")
-        handling_h = st.number_input("Czas na załadunek / rozładunek (h)", 0.0, 8.0, 2.0, 0.5,
+        handling_h = st.number_input("Czas na załadunek / rozładunek (h)", 0.0, 8.0, step=0.5, key="s_hand",
                                      help="Liczony dla każdego załadunku i każdego rozładunku; wlicza się do czasu "
                                           "pracy i liczby dni (koszt dnia pracy).")
-        channel_fee = st.number_input("Przeprawa przez La Manche (EUR)", 0.0, 2000.0, 0.0, 10.0,
+        channel_fee = st.number_input("Przeprawa przez La Manche (EUR)", 0.0, 2000.0, step=10.0, key="s_chan",
                                       help="Eurotunel lub prom, za jedną przeprawę. Wpisz własną stawkę - "
                                            "0 oznacza, że opłata nie jest doliczana (trasa i tak jest oznaczona).")
-        tunnel_fee = st.number_input("Płatny tunel alpejski (EUR)", 0.0, 1000.0, 0.0, 10.0,
+        tunnel_fee = st.number_input("Płatny tunel alpejski (EUR)", 0.0, 1000.0, step=10.0, key="s_tun",
                                      help="Za jeden tunel (Mont Blanc, Fréjus, Tauern…). 0 = nie doliczaj.")
 
     with st.expander("🔎 Szukanie doładunków", expanded=True):
-        max_detour = st.slider("Maks. odchylenie trasy (km)", 0, 1000, 300, 10,
+        max_detour = st.slider("Maks. odchylenie trasy (km)", 0, 1000, step=10, key="s_detour",
                                help="O ile km trasa połączonych zleceń może być dłuższa od najdłuższego z nich.")
-        date_gap = st.number_input("Maks. różnica dat załadunku (dni)", 0, 14, 3,
+        date_gap = st.number_input("Maks. różnica dat załadunku (dni)", 0, 14, key="s_gap",
                                    help="0 = bez limitu.")
-        max_orders = st.slider("Maks. zleceń w wariancie", 2, 12, 6,
+        max_orders = st.slider("Maks. zleceń w wariancie", 2, 12, key="s_maxord",
                                help="Górny limit liczby zleceń na jednej naczepie (poza limitem 13,6 LDM / 24 t).")
-        top_n = st.slider("Ile wariantów pokazać", 3, 20, 10)
-        n_check = st.slider("Ile kandydatów sprawdzić na drogach", 10, 40, 20,
+        top_n = st.slider("Ile wariantów pokazać", 3, 20, key="s_topn")
+        n_check = st.slider("Ile kandydatów sprawdzić na drogach", 10, 40, key="s_ncheck",
                             help="Najlepsze warianty wg szacunku są liczone po rzeczywistych trasach, a ranking "
                                  "układany od nowa. Więcej = dokładniej, ale dłużej (publiczny serwer tras).")
 
     with st.expander("🕒 Terminy i czas pracy"):
-        use_windows = st.checkbox("Uwzględniaj okna czasowe ofert", True,
+        use_windows = st.checkbox("Uwzględniaj okna czasowe ofert", key="s_win",
                                   help="Wariant musi mieścić się w oknach załadunku i rozładunku z ofert (przy zadanej "
                                        "prędkości, dniu pracy 9 h i odpoczynkach). Kolejność punktów jest dobierana tak, "
                                        "żeby zdążyć. Po wyłączeniu harmonogram jest tylko pokazywany.")
         w1, w2 = st.columns(2)
-        open_h = w1.number_input("Przeładunki od (godz.)", 0, 23, 6, 1,
+        open_h = w1.number_input("Przeładunki od (godz.)", 0, 23, step=1, key="s_open",
                                  help="Gdy oferta podaje tylko datę, przyjmujemy, że przeładunek jest możliwy w tych godzinach.")
-        close_h = w2.number_input("do (godz.)", 1, 24, 18, 1)
-        tol_h = st.number_input("Tolerancja spóźnienia (h)", 0.0, 24.0, 0.0, 0.5,
+        close_h = w2.number_input("do (godz.)", 1, 24, step=1, key="s_close")
+        tol_h = st.number_input("Tolerancja spóźnienia (h)", 0.0, 24.0, step=0.5, key="s_tol",
                                 help="O tyle godzin wolno się spóźnić na koniec okna (kierowca dzwoni do klienta).")
         r1, r2 = st.columns(2)
-        daily_rest = r1.number_input("Odpoczynek dobowy (h)", 0.0, 24.0, 11.0, 0.5)
-        weekly_rest = r2.number_input("Odpoczynek tyg. (h)", 0.0, 96.0, 45.0, 1.0,
+        daily_rest = r1.number_input("Odpoczynek dobowy (h)", 0.0, 24.0, step=0.5, key="s_drest")
+        weekly_rest = r2.number_input("Odpoczynek tyg. (h)", 0.0, 96.0, step=1.0, key="s_wrest",
                                       help="Po 56 h jazdy w tygodniu.")
-        charge_idle = st.checkbox("Doliczaj dni czekania do kosztów", True,
+        charge_idle = st.checkbox("Doliczaj dni czekania do kosztów", key="s_idle",
                                   help="Gdy pojazd czeka na otwarcie okna (np. noc i dzień), dni kalendarzowe ponad dni pracy "
                                        "wchodzą do kosztów (koszt dnia pracy). Bez tego czekanie jest „za darmo”.")
         st.caption("Dzień pracy (9 h jazdy i obsługi) i limit 56 h jazdy w tygodniu są stałe; prędkość i czas "
@@ -192,34 +277,34 @@ with st.sidebar:
     with st.expander("🚚 Dopasowanie ofert do zestawu"):
         st.caption("Oferty niespełniające warunków nie trafiają do wariantów (powód widać w tabeli).")
         fleet = FleetProfile(
-            semi_trailer_only=st.checkbox("Tylko oferty dopuszczające naczepę", True,
+            semi_trailer_only=st.checkbox("Tylko oferty dopuszczające naczepę", key="s_semi",
                                           help="Oferty tylko dla busa lub „solo” (bez „z naczepą”) odpadają."),
-            accepted_bodies=tuple(st.multiselect("Nadwozia naszego zestawu", list(ALL_BODIES), list(DEFAULT_BODIES),
+            accepted_bodies=tuple(st.multiselect("Nadwozia naszego zestawu", list(ALL_BODIES), key="s_bodies",
                                                  help="Oferta musi dopuszczać któreś z nich (brak informacji = pasuje).")),
-            adr=st.checkbox("Mamy uprawnienia ADR", False),
-            tail_lift=st.checkbox("Mamy windę załadowczą", False),
-            exclude_cabotage=st.checkbox("Wyklucz kabotaż (odbiór i dowóz w tym samym kraju)", True,
+            adr=st.checkbox("Mamy uprawnienia ADR", key="s_adr"),
+            tail_lift=st.checkbox("Mamy windę załadowczą", key="s_lift"),
+            exclude_cabotage=st.checkbox("Wyklucz kabotaż (odbiór i dowóz w tym samym kraju)", key="s_cab",
                                          help="Oferty, w których załadunek i rozładunek są w jednym kraju "
                                               "(np. DE → DE), nie trafiają do wariantów."),
-            allow_ftl=st.checkbox("Łącz też oferty FTL", True,
+            allow_ftl=st.checkbox("Łącz też oferty FTL", key="s_ftl",
                                   help="FTL zwykle oznacza cały pojazd dla jednego zleceniodawcy. "
                                        "Odznacz, aby do doładunków brać tylko oferty LTL."),
         )
 
     with st.expander("🧬 Duplikaty ofert"):
         dup_params = DupParams(
-            enabled=st.checkbox("Wykrywaj duplikaty", True,
+            enabled=st.checkbox("Wykrywaj duplikaty", key="s_dup",
                                 help="To samo zlecenie wystawione kilka razy (np. przez różnych spedytorów, z inną "
                                      "nazwą miejscowości) nie wchodzi do wariantów wielokrotnie. Zostaje oferta "
                                      "pasująca do zestawu i z najwyższą ceną; reszta ma w tabeli powód „duplikat”."),
-            tolerance_pct=st.number_input("Tolerancja wagi i LDM (%)", 0.0, 50.0, 5.0, 1.0,
+            tolerance_pct=st.number_input("Tolerancja wagi i LDM (%)", 0.0, 50.0, step=1.0, key="s_dtol",
                                           help="Duplikat tylko wtedy, gdy waga i LDM są identyczne albo różnią się "
                                                "o mniej niż tyle procent."),
-            prefix_len=int(st.number_input("Podobny kod: wspólne początkowe znaki", 2, 5, 3, 1,
+            prefix_len=int(st.number_input("Podobny kod: wspólne początkowe znaki", 2, 5, step=1, key="s_dpre",
                                            help="Gdy jeden koniec trasy (odbiór lub zrzut) ma identyczny kod, drugi "
                                                 "może mieć podobny: ten sam kraj i tyle samo pierwszych znaków kodu "
                                                 "(np. 3 = 20095 i 20099). Więcej = ostrzej.")),
-            geo_radius_km=st.number_input("Ten sam punkt na mapie: promień (km)", 0.0, 25.0, 3.0, 0.5,
+            geo_radius_km=st.number_input("Ten sam punkt na mapie: promień (km)", 0.0, 25.0, step=0.5, key="s_dgeo",
                                           help="Oferty, których załadunek wypada w tym samym punkcie na mapie (w tym "
                                                "promieniu - nawet przy różnych kodach i nazwach miejscowości) i rozładunek "
                                                "też, a waga i LDM są podobne, są duplikatem. 0 = wyłącz. Dotyczy tylko "
@@ -230,14 +315,15 @@ with st.sidebar:
                    "oraz niewykluczających się datach załadunku.")
 
     with st.expander("💱 Ceny szacunkowe (oferty bez ceny)"):
-        use_est = st.checkbox("Używaj cen szacunkowych", value=True,
+        use_est = st.checkbox("Używaj cen szacunkowych", key="s_est",
                               help="Oferta bez ceny dostaje cenę = stawka × LDM wg reguły dla kraju załadunku "
                                    "lub rozładunku. Trafia do wariantów tylko, gdy ta cena osiąga minimum.")
         st.caption("Stawka EUR/LDM i minimalny przychód dla kraju załadunku („z kraju”) lub rozładunku "
                    "(„do kraju”) albo któregokolwiek z nich („z lub do kraju”); w polu Kraj można podać kilka kodów po przecinku. "
                    "Gdy pasuje kilka reguł, obowiązuje najwyższa stawka. Oferty krajowe (kabotaż) są pomijane.")
         rules_df = st.data_editor(
-            rules_to_frame(DEFAULT_RULES), key="rules_editor", num_rows="dynamic", hide_index=True, width="stretch",
+            _rules_initial_frame(), key=f"rules_editor_{st.session_state.get('fmt_nonce', 0)}", num_rows="dynamic",
+            hide_index=True, width="stretch",
             column_config={
                 "Aktywna": st.column_config.CheckboxColumn("Akt.", width="small"),
                 "Kierunek": st.column_config.SelectboxColumn("Kierunek", options=list(DIRECTION_LABELS.values())),
@@ -246,13 +332,13 @@ with st.sidebar:
                 "Min. przychód (EUR)": st.column_config.NumberColumn("Min. (EUR)", min_value=0.0, format="%.0f"),
             })
         price_rules = frame_to_rules(rules_df)
+        st.session_state["s_rules_cur"] = rules_df.to_dict("records")       # bieżące reguły (do zapisu w formacie)
 
     with st.expander("🛣️ Trasy po drogach"):
-        avoid_ch = st.checkbox("Omijaj Szwajcarię", value=True,
+        avoid_ch = st.checkbox("Omijaj Szwajcarię", key="s_avoidch",
                                help="Trasa nie przejedzie przez Szwajcarię; jeśli serwer jej nie wyłącza, "
                                     "aplikacja szuka objazdu (przez Francję / Włochy / Austrię / Niemcy).")
-        provider_label = st.selectbox("Silnik tras", [
-            "Valhalla - ciężarówka (bez klucza)", "OpenRouteService - HGV (klucz API)", "Brak (linie proste)"])
+        provider_label = st.selectbox("Silnik tras", PROVIDERS, key="s_provider")
         provider = {"V": "valhalla", "O": "ors"}.get(provider_label[0], "none")
         valhalla_url = st.text_input("Adres serwera Valhalla", os.environ.get("VALHALLA_URL", VALHALLA_URL),
                                      help="Publiczny serwer ma limit 1500 km na zapytanie; własny nie.") \
@@ -261,13 +347,15 @@ with st.sidebar:
             if provider == "ors" else ""
         st.caption("Parametry zestawu (drogi z ograniczeniami):")
         truck = TruckProfile(
-            gross_weight_t=st.number_input("DMC zestawu (t)", 3.5, 60.0, 40.0, 0.5),
-            axle_load_t=st.number_input("Nacisk osi (t)", 3.0, 13.0, 11.5, 0.5),
-            height_m=st.number_input("Wysokość (m)", 2.0, 4.5, 4.0, 0.05),
-            width_m=st.number_input("Szerokość (m)", 2.0, 2.6, 2.55, 0.05),
-            length_m=st.number_input("Długość (m)", 6.0, 18.75, 16.5, 0.05),
-            hazmat=st.checkbox("ADR / materiały niebezpieczne", False),
+            gross_weight_t=st.number_input("DMC zestawu (t)", 3.5, 60.0, step=0.5, key="s_gvw"),
+            axle_load_t=st.number_input("Nacisk osi (t)", 3.0, 13.0, step=0.5, key="s_axle"),
+            height_m=st.number_input("Wysokość (m)", 2.0, 4.5, step=0.05, key="s_h"),
+            width_m=st.number_input("Szerokość (m)", 2.0, 2.6, step=0.05, key="s_w"),
+            length_m=st.number_input("Długość (m)", 6.0, 18.75, step=0.05, key="s_len"),
+            hazmat=st.checkbox("ADR / materiały niebezpieczne", key="s_hz"),
         )
+
+_autosave_settings()
 
 cost = CostParams(day_cost_eur=day_cost, avg_speed_kmh=speed, fuel_l_per_100km=consumption,
                   fuel_price_eur=fuel_price, toll_eur_per_km=toll,
@@ -325,10 +413,10 @@ with tab_data:
                                     accept_multiple_files=True, key=f"files_{st.session_state.uploader_n}",
                                     help="Wklejony tekst i pliki są łączone; każde źródło może mieć inny format.")
         o1, o2 = st.columns(2)
-        online = o1.checkbox("Ustal położenie kodów pocztowych przez internet", value=True, key="opt_online",
+        online = o1.checkbox("Ustal położenie kodów pocztowych przez internet", key="opt_online",
                              help="zippopotam.us i Nominatim. Bez tego używane są środki krajów (mało dokładne).")
-        drop_no_price = o2.checkbox("Pomiń oferty bez ceny", value=False, key="opt_drop")
-        keep_history = st.checkbox("Zapisz oferty w historii", value=True, key="opt_history",
+        drop_no_price = o2.checkbox("Pomiń oferty bez ceny", key="opt_drop")
+        keep_history = st.checkbox("Zapisz oferty w historii", key="opt_history",
                                    help="Każdy import trafia do historii ofert (bez duplikatów); w historii można "
                                         "szukać po zleceniodawcy i wpisywać ceny zrealizowane.")
         sb1, sb2 = st.columns([3, 2])
@@ -861,7 +949,7 @@ with tab_start:
          "załadunek to puste kilometry w kosztach i zysku. Zostaw kod pusty, aby liczyć od pierwszego załadunku. "
          "Ten krok jest opcjonalny.")
     o1, o2, o3 = st.columns([1, 2, 4])
-    o_country = o1.text_input("Kraj", key="origin_country", value="PL", max_chars=2,
+    o_country = o1.text_input("Kraj", key="origin_country", max_chars=2,
                               help="Dwuliterowy kod kraju, np. PL, DE, FR.").strip().upper()
     o_postal = o2.text_input("Kod pocztowy startu", key="origin_postal", placeholder="np. 62-800",
                              help="Kod pocztowy miejsca, w którym pojazd jest wolny.").strip()

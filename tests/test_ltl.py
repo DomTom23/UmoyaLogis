@@ -1622,3 +1622,27 @@ def test_route_cache_is_bounded_and_dedupes_parallel_requests():
     [t.join() for t in ts]
     assert out == ["leg"] * 6 and len(calls) == 1            # sześć wątków, jedno zapytanie
     routing._LEG_CACHE.clear()
+
+
+# ------------------------------------------------------------ formaty ustawień
+def test_settings_sanitize_snapshot_and_store(tmp_path):
+    from ltl import settings as cfg
+    from ltl.storage import Store
+    d = cfg.sanitize({"s_fuel": 99.0, "s_cons": "abc", "s_gap": 2.6, "s_win": "tak", "s_provider": "Nieznany",
+                      "s_bodies": ["firanka", "kosmiczny"], "bzdura": 1, "origin_country": "DE",
+                      cfg.RULES_KEY: [{"Kraj": "CH"}]}, ("firanka",), ("firanka", "mega"))
+    assert d["s_fuel"] == 4.0                                   # poza zakresem -> przycięte
+    assert d["s_cons"] == 27.0 and d["s_win"] is True           # błędny typ -> domyślne
+    assert d["s_gap"] == 3 and isinstance(d["s_gap"], int)       # liczby całkowite zostają całkowite
+    assert d["s_provider"] == cfg.PROVIDERS[0] and d["s_bodies"] == ["firanka"] and "bzdura" not in d
+    assert d["origin_country"] == "DE" and d[cfg.RULES_KEY] == [{"Kraj": "CH"}]
+    snap = cfg.snapshot({"s_fuel": 1.8, "inne": 5}, [{"a": 1}])
+    assert snap == {"s_fuel": 1.8, cfg.RULES_KEY: [{"a": 1}]}   # tylko znane klucze
+    st_ = Store(tmp_path / "f.db")
+    assert st_.list_formats() == [] and st_.get_format("Ania") is None
+    st_.save_format("Ania", snap)
+    st_.save_format("andrzej", {"s_fuel": 2.0})
+    st_.save_format("Ania", {"s_fuel": 1.9})                    # nadpisanie tej samej nazwy
+    assert st_.list_formats() == ["andrzej", "Ania"] and st_.get_format("Ania") == {"s_fuel": 1.9}
+    st_.delete_format("Ania")
+    assert st_.list_formats() == ["andrzej"]

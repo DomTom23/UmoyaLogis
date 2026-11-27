@@ -122,6 +122,11 @@ class Store:
                     active INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS settings_formats (
+                    name TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS plans (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     scope TEXT NOT NULL CHECK (scope IN ('personal', 'group')),
@@ -447,3 +452,29 @@ class Store:
                     n = 0
                 out[vid] = {"n_orders": n, "updated_at": at, "updated_by": by}
         return out
+
+    # ------------------------------------------------------------ formaty ustawień
+    def list_formats(self) -> list[str]:
+        with self._conn() as c:
+            return [r[0] for r in c.execute("SELECT name FROM settings_formats ORDER BY name COLLATE NOCASE")]
+
+    def get_format(self, name: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT data FROM settings_formats WHERE name=?", (name,)).fetchone()
+        try:
+            return json.loads(row[0]) if row else None
+        except ValueError:
+            return None
+
+    def save_format(self, name: str, data: dict) -> str:
+        name = clean_name(name)
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._conn() as c:
+            c.execute("INSERT INTO settings_formats (name, data, updated_at) VALUES (?,?,?) "
+                      "ON CONFLICT(name) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+                      (name, json.dumps(data, ensure_ascii=False, default=str), now))
+        return name
+
+    def delete_format(self, name: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM settings_formats WHERE name=?", (name,))

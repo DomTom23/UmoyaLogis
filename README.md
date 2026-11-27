@@ -161,3 +161,11 @@ wykrywanie duplikatów działa na całych kolumnach, a optymalizator (`ltl/optim
 pary zleceń, które i tak nie zmieszczą się w limicie objazdu. Pamięć podręczna tras jest ograniczona (LRU), a równoległe
 zapytania o ten sam odcinek są łączone. Stare wersje funkcji są zachowane w `tests/ref_*.py`; testy sprawdzają, że nowe
 dają identyczne wyniki.
+
+## Formaty ustawień
+
+Wszystkie ustawienia z panelu bocznego (koszty, szukanie, terminy, dopasowanie do zestawu, duplikaty, ceny szacunkowe, trasy,
+parametry zestawu) oraz opcje z zakładek „Dane” i „Start” zapisują się **same przy każdej zmianie** w wybranym **formacie**
+(lista „Format ustawień” na górze panelu). Każdy użytkownik może mieć własny format (np. „Andrzej”, „Ania”): „Nowy / usuń format”
+tworzy go z bieżących ustawień, wybór z listy wczytuje jego dane. Format zapamiętuje adres strony (`?f=Ania`). Formaty są w bazie
+(tabela `settings_formats`) i wchodzą do kopii zapasowej; hasła i klucze API nie są zapisywane.
