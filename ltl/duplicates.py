@@ -10,7 +10,7 @@ Z grupy duplikatów zostaje oferta najlepsza: najpierw kwalifikująca się do na
 
 Drugi etap (po ustaleniu położenia kodów pocztowych, ``find_geo_duplicates``): oferty, których załadunek wypada w tym
 samym punkcie na mapie (w promieniu ``geo_radius_km``, nawet gdy kody lub nazwy miejscowości są różne) i rozładunek też,
-przy podobnej wadze i LDM oraz zgodnych datach. Punkty „na środku kraju” (kod, którego nie udało się zlokalizować) są
+przy podobnej wadze i LDM oraz zgodnych datach. Punkty „na środku kraju” i przybliżone z podobnych kodów (kod, którego nie udało się zlokalizować) są
 pomijane - inaczej wszystkie takie oferty wyglądałyby na jedno miejsce.
 """
 from __future__ import annotations
@@ -133,7 +133,7 @@ def find_geo_duplicates(df: pd.DataFrame, priority: pd.Series, p: DupParams = Du
     ok = df[["start_lat", "start_lon", "end_lat", "end_lon"]].notna().all(axis=1)
     for side in ("start_geo", "end_geo"):
         if side in df.columns:
-            ok &= df[side].astype(str) != "kraj"
+            ok &= ~df[side].astype(str).isin(["kraj", "prefiks"])
     sub = df[ok]
     if len(sub) < 2:
         return {}

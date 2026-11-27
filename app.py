@@ -317,6 +317,30 @@ with tab_data:
     b1, b2, _ = st.columns([1.7, 1.2, 3])
     b1.button("📋 Wczytaj przykład", on_click=_load_example, width="stretch")
     b2.button("🗑️ Wyczyść", on_click=_clear_all, width="stretch")
+    with st.expander("🔎 Sprawdź kod pocztowy (diagnostyka położenia)"):
+        st.caption("Wpisz kraj i kod - zobaczysz, jak aplikacja go odczytuje, które warianty zapisu sprawdza i skąd bierze "
+                   "położenie. Przydatne, gdy kod jest na pewno dobry, a oferta dostaje „środek kraju”.")
+        with st.form("code_check_form", border=False):
+            k1, k2, k3, k4 = st.columns([1, 2, 2, 1.3])
+            chk_c = k1.text_input("Kraj", "PL", max_chars=2, key="chk_country")
+            chk_p = k2.text_input("Kod pocztowy", key="chk_postal", placeholder="np. 62-800, 4611AA, NN11 4")
+            chk_t = k3.text_input("Miejscowość (opcjonalnie)", key="chk_city")
+            k4.write("")
+            chk_go = k4.form_submit_button("🔎 Sprawdź", width="stretch")
+        if chk_go and chk_p.strip():
+            from ltl.geo import postal_candidates
+            g = _geocoder(st.session_state.get("opt_online", True))
+            steps: list[str] = []
+            lat, lon, src = g.locate(chk_c.strip().upper(), chk_p.strip(), chk_t.strip(), trace=steps)
+            label = {"online": "znaleziono online", "cache": "z pamięci podręcznej", "prefiks": "PRZYBLIŻONE z podobnych kodów",
+                     "kraj": "NIE ZNALEZIONO - środek kraju"}[src]
+            (st.success if src in ("online", "cache") else st.warning)(f"{chk_c.upper()} {chk_p}: {lat:.4f}, {lon:.4f} - {label}.")
+            st.write("Warianty kodu: " + ", ".join(f"`{x}`" for x in postal_candidates(chk_c.strip().upper(), chk_p.strip())))
+            for step_txt in steps:
+                st.write("• " + step_txt)
+            if src in ("prefiks", "kraj"):
+                st.caption("Możesz podać współrzędne ręcznie po wczytaniu ofert (zakładka „Zlecenia”, „Kody bez dokładnej "
+                           "lokalizacji”) - zapamiętamy je na stałe.")
 
 def _load_saved(name: str) -> None:
     try:
@@ -553,6 +577,53 @@ def _stop_early() -> None:
     st.stop()
 
 
+def _unlocated_codes(bad: pd.DataFrame, geocoder: Geocoder) -> None:
+    """Które kody pocztowe nie zostały ustalone dokładnie: lista, ponowna próba i ręczne podanie współrzędnych."""
+    found: dict[tuple, dict] = {}
+    for side in ("start", "end"):
+        for r in bad.itertuples():
+            src = getattr(r, f"{side}_geo")
+            if src in ("kraj", "prefiks"):
+                d = found.setdefault((getattr(r, f"{side}_country"), getattr(r, f"{side}_postal")),
+                                     {"src": src, "ids": [], "city": getattr(r, f"{side}_city") or ""})
+                d["ids"].append(r.id)
+    n_center = sum(1 for d in found.values() if d["src"] == "kraj")
+    def pl(n: int, one: str, few: str, many: str) -> str:
+        return one if n == 1 else few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
+
+    st.warning(f"{len(found)} {pl(len(found), 'kod pocztowy', 'kody pocztowe', 'kodów pocztowych')} nie udało się ustalić "
+               f"dokładnie (dotyczy {len(bad)} {pl(len(bad), 'oferty', 'ofert', 'ofert')}): {n_center} dostało środek kraju, "
+               "reszta przybliżenie z podobnych kodów. Odległości i trasy tych ofert są przybliżone. Poniżej zobaczysz, "
+               "które to kody - możesz ponowić próbę albo podać współrzędne ręcznie.")
+    with st.expander(f"📍 Kody bez dokładnej lokalizacji ({len(found)})", expanded=len(found) <= 12):
+        tbl = pd.DataFrame([{"Kraj": c, "Kod": p, "Miejscowość": d["city"], "Zlecenia": ", ".join(dict.fromkeys(d["ids"])),
+                             "Użyto": "środek kraju" if d["src"] == "kraj" else "przybliżone z podobnych kodów"}
+                            for (c, p), d in found.items()])
+        st.dataframe(tbl, hide_index=True, width="stretch")
+        c1, c2 = st.columns([1, 3])
+        if c1.button("🔁 Spróbuj ustalić ponownie", key="geo_retry",
+                     help="Zdejmuje wstrzymanie usług (po chwilowych błędach sieci) i pyta o te kody od nowa."):
+            geocoder.reset_failures()
+            st.rerun()
+        c2.caption("Jeśli kod jest na pewno poprawny, a usługi go nie znają, wpisz współrzędne (np. z mapy Google: "
+                   "prawy klik na miejscu → pierwsza linia z liczbami). Zapamiętujemy je na stałe.")
+        man = st.data_editor(
+            pd.DataFrame({"Kraj": [c for c, _ in found], "Kod": [p for _, p in found],
+                          "Szerokość": [None] * len(found), "Długość": [None] * len(found)}),
+            key="geo_manual", hide_index=True, width="stretch", num_rows="fixed", disabled=["Kraj", "Kod"],
+            column_config={"Szerokość": st.column_config.NumberColumn("Szerokość (lat)", min_value=-90.0, max_value=90.0, format="%.5f"),
+                           "Długość": st.column_config.NumberColumn("Długość (lon)", min_value=-180.0, max_value=180.0, format="%.5f")})
+        if st.button("💾 Zapisz podane współrzędne", key="geo_manual_save"):
+            n = 0
+            for r in man.itertuples():
+                if pd.notna(r.Szerokość) and pd.notna(r.Długość):
+                    geocoder.set_manual(r.Kraj, r.Kod, r.Szerokość, r.Długość)
+                    n += 1
+            if n:
+                st.rerun()
+            st.info("Wpisz szerokość i długość w tabeli, aby zapisać współrzędne.")
+
+
 if not analysis:
     with tab_data:
         with st.expander("ℹ️ Jak to działa", expanded=True):
@@ -700,8 +771,8 @@ with tab_orders:
     # 2) położenie tylko dla ofert, które wejdą do wyszukiwania (duże wklejki mają setki kodów)
     geocoder = _geocoder(analysis["online"])
     subset = orders[use]
-    pairs = [(c, p) for c, p in zip(subset["start_country"], subset["start_postal"])] + \
-            [(c, p) for c, p in zip(subset["end_country"], subset["end_postal"])]
+    pairs = [(c, p, t) for c, p, t in zip(subset["start_country"], subset["start_postal"], subset["start_city"])] + \
+            [(c, p, t) for c, p, t in zip(subset["end_country"], subset["end_postal"], subset["end_city"])]
     if pairs:
         bar = st.progress(0.0, text="Ustalanie położenia kodów pocztowych…")
         geo_stats = geocoder.prefetch(
@@ -742,9 +813,7 @@ with tab_orders:
     if len(est_rows):
         st.info(f"{len(est_rows)} ofert bez ceny dostało cenę szacunkową wg reguł (panel boczny, „Ceny szacunkowe”).")
     if n_use and not orders.loc[use, "geo_precise"].all():
-        n_bad = int((~orders.loc[use, "geo_precise"]).sum())
-        st.warning(f"{n_bad} ofert ma kod pocztowy, którego nie udało się zlokalizować - użyto środka kraju, więc "
-                   "odległości i trasy są mocno przybliżone. Sprawdź połączenie z internetem lub kody pocztowe.")
+        _unlocated_codes(orders[use & ~orders["geo_precise"]], geocoder)
     with st.expander("Szczegóły: kwalifikacja ofert, ceny szacunkowe, dystans i zysk pojedynczych zleceń"):
         st.dataframe(
             orders[["id", "client", "start_postal", "end_postal", "price_eur", "price_used_eur", "price_kind",
@@ -786,9 +855,10 @@ with tab_start:
             geocoder.save()
             origin = Stop(order_id="START", kind="S", country=o_country, postal=o_postal, city="",
                           lat=float(o_lat), lon=float(o_lon))
-            if o_src == "kraj":
-                o3.warning(f"Nie udało się zlokalizować kodu {o_country} {o_postal} - użyto środka kraju, "
-                           "więc dojazd jest bardzo przybliżony. Sprawdź kod lub połączenie z internetem.")
+            if o_src in ("kraj", "prefiks"):
+                o3.warning(f"Nie udało się dokładnie zlokalizować kodu {o_country} {o_postal} - użyto "
+                           f"{'środka kraju' if o_src == 'kraj' else 'przybliżenia z podobnych kodów'}, więc dojazd jest "
+                           "przybliżony. Sprawdź kod lub połączenie z internetem (zakładka „Dane”: „Sprawdź kod pocztowy”).")
             else:
                 o3.success(f"Start: {o_country} {o_postal} ({o_lat:.2f}, {o_lon:.2f}).")
     s1, s2, s3 = st.columns([3, 2, 2])

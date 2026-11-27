@@ -143,3 +143,12 @@ Zakładki **🧰 Workspace** i **🚛 Pojazdy** (po pięciu etapach wyszukiwania
   Gdy dwie osoby edytują ten sam plan grupowy, druga dostaje ostrzeżenie i najnowszą wersję zamiast po cichu nadpisanych danych.
 * Wariant z zakładki „5 · Trasa” wyślesz do workspace przyciskiem „Wyślij do workspace”; plan można skopiować między
   pracą osobistą a grupową (sekcja „Plan”).
+
+## Ustalanie położenia kodów pocztowych
+
+Kod pocztowy → współrzędne: pamięć podręczna na dysku → zippopotam.us (kilka wariantów zapisu kodu: np. NL `4611AA` i `4611`,
+PL `62800` i `62-800`, CZ/SK ze spacją, GB/IE pierwszy człon) → Nominatim (kod, potem kod + miejscowość) → przybliżenie z podobnych
+znanych kodów (`prefiks`) → środek kraju. Chwilowe błędy sieci tylko na minutę wstrzymują usługę (nie wyłączają jej na stałe).
+Kody bez dokładnej lokalizacji są wypisane w zakładce „2 · Zlecenia” (z możliwością ponowienia próby i ręcznego podania
+współrzędnych, zapamiętywanych na stałe), a w zakładce „1 · Dane” jest narzędzie „Sprawdź kod pocztowy” pokazujące krok po kroku,
+co zwróciła która usługa.

@@ -1363,3 +1363,112 @@ def test_geo_duplicates_same_map_point():
     assert find_geo_duplicates(far, prio, DupParams(geo_radius_km=3.0)) == {}
     other_date = df.copy(); other_date.loc[1, "load_date"] = "2026-12-05"
     assert find_geo_duplicates(other_date, prio, DupParams(geo_radius_km=3.0)) == {}
+
+
+# ------------------------------------------------------------ geokodowanie kodów pocztowych (odporność)
+def test_postal_candidates_cover_country_formats():
+    from ltl.geo import postal_candidates as pc
+    assert pc("NL", "4611 AA") == ["4611AA", "4611"] and pc("NL", "4611") == ["4611"]
+    assert pc("PL", "62800")[0] == "62-800" and "62800" in pc("PL", "62800") and pc("PL", " 62 800")[0] == "62-800"
+    assert pc("CZ", "11000")[0] == "110 00" and "11000" in pc("CZ", "11000")
+    assert pc("GB", "NN11 4") == ["NN11"] and pc("GB", "SW1A 1AA") == ["SW1A"] and pc("GB", "G1 1") == ["G1"]
+    assert pc("FR", "FR-75001") == ["75001"] and pc("LU", "L-1234") == ["1234"] and pc("IE", "D02 X285") == ["D02"]
+    assert pc("PT", "4000-001") == ["4000-001", "4000"]
+
+
+class _Resp:
+    def __init__(self, body):
+        self.b = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, *a):
+        return self.b
+
+
+def _fake_net(monkeypatch, zip_known=None, mode=None, log=None):
+    import json
+    import urllib.error
+    import urllib.request
+    zip_known = zip_known or {}
+    mode = mode if mode is not None else {"zip": "ok", "nom": "ok"}
+
+    def fake(req, timeout=None):
+        url = req if isinstance(req, str) else req.full_url
+        (log if log is not None else []).append(url)
+        if "zippopotam" in url:
+            if mode["zip"] == "down":
+                raise urllib.error.URLError("timed out")
+            code = urllib.request.unquote(url.rsplit("/", 1)[1])
+            if code in zip_known:
+                lat, lon = zip_known[code]
+                return _Resp(json.dumps({"places": [{"latitude": str(lat), "longitude": str(lon)}]}).encode())
+            raise urllib.error.HTTPError(url, 404, "nf", {}, None)
+        if mode["nom"] == "down":
+            raise urllib.error.URLError("down")
+        return _Resp(b"[]")
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    return mode
+
+
+def test_geocoder_tries_code_variants(monkeypatch):
+    from ltl.geo import Geocoder
+    _fake_net(monkeypatch, zip_known={"4611": (51.49, 4.29), "110 00": (50.08, 14.43)})
+    g = Geocoder(online=True, cache_path=None)
+    assert g.locate("NL", "4611AA")[2] == "online"          # zippopotam zna tylko 4 cyfry
+    assert g.locate("CZ", "11000")[2] == "online"           # wersja ze spacją
+    assert g.locate("NL", "4611 AA")[2] == "cache"          # inny zapis tego samego kodu = ten sam wpis
+
+
+def test_geocoder_network_errors_are_not_permanent(monkeypatch):
+    from ltl.geo import Geocoder
+    mode = _fake_net(monkeypatch, zip_known={"75001": (48.86, 2.34)})
+    g = Geocoder(online=True, cache_path=None)
+    g.locate("FR", "99999")                                  # jedna awaria sieci nie wyłącza usługi
+    mode["zip"] = "down"
+    g.locate("FR", "88888")
+    assert g.online and g._service_ok("zippopotam")
+    mode["zip"] = "ok"
+    assert g.locate("FR", "75001")[2] == "online"
+    mode["zip"] = "down"                                     # seria błędów wstrzymuje usługę, ale tylko na chwilę
+    for c in ("11111", "22222", "33333"):
+        g.locate("FR", c)
+    assert not g._service_ok("zippopotam")
+    g.reset_failures()
+    assert g._service_ok("zippopotam")
+
+
+def test_geocoder_prefix_guess_miss_cache_manual_and_legacy(monkeypatch):
+    from ltl.geo import Geocoder
+    log = []
+    _fake_net(monkeypatch, zip_known={}, log=log)
+    g = Geocoder(online=True, cache_path=None)
+    g._cache["FR|75001"] = [48.86, 2.34]
+    g._cache["FR|75008"] = [48.87, 2.31]
+    lat, lon, src = g.locate("FR", "75099")                  # nieznany, ale podobny do znanych (75…)
+    assert src == "prefiks" and 48.8 < lat < 48.9
+    assert g.locate("FR", "99999")[2] == "kraj"              # nic podobnego = środek kraju
+    n = len(log)
+    g.locate("FR", "99999")
+    assert len(log) == n                                     # nieznany kod pamiętany: bez ponownego pytania sieci
+    g.set_manual("FR", "99999", 45.0, 3.0)
+    assert g.locate("FR", "99999")[:3] == (45.0, 3.0, "cache")
+    g._cache["CZ|11000"] = [50.0, 14.0]                      # klucz ze starej wersji (kod bez spacji)
+    assert g.locate("CZ", "110 00")[2] == "cache"
+    off = Geocoder(online=False, cache_path=None)
+    assert off.locate("DE", "20095")[2] == "kraj" and not off.nominatim_ok
+
+
+def test_geocoder_nominatim_city_fallback(monkeypatch):
+    from ltl.geo import Geocoder
+    g = Geocoder(online=True, cache_path=None)
+    monkeypatch.setattr(g, "_fetch", lambda c, code: None)
+    monkeypatch.setattr(g, "_fetch_nominatim", lambda c, p: None)
+    monkeypatch.setattr(g, "_fetch_nominatim_city", lambda c, p, city: (52.0, 21.0) if city == "Warszawa" else None)
+    assert g.locate("PL", "00-001", "Warszawa")[2] == "online"
+    assert g.locate("PL", "00-002", "")[2] == "prefiks"       # bez miasta, ale podobny do znanego kodu
+    assert g.locate("DE", "20095", "")[2] == "kraj"
