@@ -654,6 +654,14 @@ def _ws_geocode(country: str, postal: str) -> tuple:
     return float(lat), float(lon)
 
 
+def _ws_place(country: str, postal: str) -> str:
+    """Nazwa miejscowości odczytana z kodu pocztowego (do kolumn Skąd/Dokąd w tabeli tras)."""
+    g = _geocoder(st.session_state.get("opt_online", True))
+    name = g.place_name(country, postal)
+    g.save()
+    return name
+
+
 def _ws_sched(start_at) -> ScheduleParams:
     return ScheduleParams(
         enabled=use_windows, speed_kmh=cost.avg_speed_kmh, max_work_h_day=cost.max_drive_h_day,
@@ -675,7 +683,7 @@ def _ws_route(v, vias) -> RouteResult:
 
 
 def _ws_ctx(pool=None, est=frozenset()) -> WsContext:
-    return WsContext(store=_store(), geocode=_ws_geocode, cost=cost, make_sched=_ws_sched, get_route=_ws_route,
+    return WsContext(store=_store(), geocode=_ws_geocode, cost=cost, make_sched=_ws_sched, get_route=_ws_route, place=_ws_place,
                      pool=pool, est_ids=frozenset(est))
 
 
@@ -1216,7 +1224,7 @@ with tab_route:
     v_clients = ", ".join(dict.fromkeys(c for i in v.order_ids if (c := client_map.get(i))))
     if v_clients:
         st.caption(f"Zleceniodawcy: {v_clients}")
-    with st.expander("🧰 Wyślij ten wariant do workspace (plan pojazdu do dalszej edycji)"):
+    with st.expander("🧰 Wyślij ten wariant do workspace (trasa auta do dalszej edycji)"):
         send_variant_ui(_ws_ctx(orders_opt, est_ids), v, orders_opt, key=str(abs(hash(vkey)) % 10 ** 8))
     with st.spinner("Wyznaczanie trasy po drogach…"):
         route = get_route(v, vias)

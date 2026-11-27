@@ -132,17 +132,25 @@ Wygląd (kolory, czcionka Inter) ustawia `.streamlit/config.toml` oraz `ltl/ui.p
 Zakładki **🧰 Workspace** i **🚛 Pojazdy** (po pięciu etapach wyszukiwania) służą do ręcznego układania i poprawiania tras.
 
 * **Pojazdy** - lista pojazdów firmy (nazwa/numer, nadwozie, maks. LDM i ładowność, miejsce startu). Wspólna dla wszystkich.
-* **Workspace** - dla wybranego pojazdu jest osobny **plan**: zlecenia (z możliwością poprawiania danych), kolejność
-  załadunków i rozładunków, punkty dodatkowe, punkty pośrednie na mapie, data wyjazdu. Plan liczy się po drogach
-  (koszty, harmonogram z oknami czasowymi, kontrola limitu LDM/t i kolejności załadunek → rozładunek).
-* **Praca osobista** - własne plany, widoczne po imieniu wpisanym w polu „Twoje imię” (imię jest zapamiętywane w
-  adresie strony `?u=...`; to nie jest logowanie, tylko rozdzielenie planów). **Praca grupowa** - wspólne plany,
-  które może edytować każdy pracownik; przy planie widać, kto zmienił go ostatnio.
-* Zmiany w tabelach zleceń i kolejności punktów zapisują się od razu i **natychmiast przeliczają trasę, koszty, harmonogram i zysk**
-  (pasek kosztów jest widoczny w każdej sekcji). Wszystko trafia do bazy (SQLite, tabele `vehicles` i `plans`; kopia zapasowa obejmuje je razem z resztą).
-  Gdy dwie osoby edytują ten sam plan grupowy, druga dostaje ostrzeżenie i najnowszą wersję zamiast po cichu nadpisanych danych.
-* Wariant z zakładki „5 · Trasa” wyślesz do workspace przyciskiem „Wyślij do workspace”; plan można skopiować między
-  pracą osobistą a grupową (sekcja „Plan”).
+* **Auta → trasy → warianty → tabela.** W Workspace wybierasz auto, potem jego trasę (numer `TR-RRRR/MM-NNNN`, kolejność
+  jazdy zmieniasz strzałkami), potem wariant trasy (kopię wariantu robi „Nowy wariant”; ⭐ = wariant aktywny). Dla wariantu
+  sekcja **📊 Tabela** pokazuje układ z arkusza firmy: wiersz trasy (sumy i kalkulacje całej trasy: frachty, km, stawka €/km,
+  LDM, €/LDM, marża €/km i łączna, koszt razem i dzienny, paliwo, opłaty drogowe, prom/tunel) oraz wiersze jej zleceń
+  (`...-01`, `...-02`). Skąd/Dokąd to kraj + miejscowość odczytana z kodu pocztowego. W tabeli edytujesz zleceniodawcę, fracht,
+  dodatkowe wynagrodzenie, dyspozytora, **status płatności** (nieopłacone / opłacone / przeterminowane) i **termin płatności**
+  (7, 15, 21, 30, 40, 45, 60 dni - liczony od daty rozładunku). **Płatne odcinki** (prom, pociąg, tunel, inny - lista rozwijana
+  z kosztem) zwiększają koszty trasy. Marża zlecenia = jego przychód minus część kosztów trasy proporcjonalna do km.
+  **📚 Cały pojazd** pokazuje wszystkie trasy auta po kolei (aktywne warianty; koniec jednej trasy = początek następnej).
+* Pozostałe sekcje: trasa na mapie z kosztami, edycja danych zleceń, kolejność punktów, dodawanie zleceń z wyszukiwania i
+  punktów dodatkowych, ustawienia wariantu (nazwa, data wyjazdu), kopiowanie do drugiego trybu pracy.
+* **Praca osobista** - własne trasy, widoczne po imieniu wpisanym w polu „Twoje imię” (imię jest zapamiętywane w
+  adresie strony `?u=...`; to nie jest logowanie, tylko rozdzielenie danych). **Praca grupowa** - wspólne trasy,
+  które może edytować każdy pracownik; widać, kto zmienił wariant ostatnio.
+* Zmiany zapisują się od razu i **natychmiast przeliczają trasę, koszty, harmonogram i zysk**. Wszystko trafia do bazy
+  (SQLite: `vehicles`, `routes`, `variants`; kopia zapasowa obejmuje je razem z resztą). Dotychczasowe plany pojazdów
+  zamieniają się automatycznie w trasy z jednym wariantem. Gdy dwie osoby edytują ten sam wariant, druga dostaje
+  ostrzeżenie i najnowszą wersję zamiast po cichu nadpisanych danych.
+* Wariant z zakładki „5 · Trasa” wyślesz do workspace jako nową trasę auta albo nowy wariant istniejącej trasy.
 
 ## Ustalanie położenia kodów pocztowych
 

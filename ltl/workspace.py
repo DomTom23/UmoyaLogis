@@ -20,17 +20,19 @@ ORDER_FIELDS = (
     "id", "client", "source", "start_country", "start_postal", "start_city", "end_country", "end_postal", "end_city",
     "start_lat", "start_lon", "end_lat", "end_lon", "load_date", "unload_date",
     "load_from", "load_to", "unload_from", "unload_to", "weight_t", "ldm", "price_eur", "distance_km",
-    "load_type", "description", "note")
-TEXT_FIELDS = ("id", "client", "source", "start_country", "start_postal", "start_city", "end_country", "end_postal",
+    "load_type", "description", "note", "dispatcher", "pay_status", "pay_term_days", "extra_pay_eur")
+PAY_STATUSES = ("nieopłacone", "opłacone", "przeterminowane")
+PAY_TERMS = (7, 15, 21, 30, 40, 45, 60)
+TEXT_FIELDS = ("dispatcher", "pay_status", "id", "client", "source", "start_country", "start_postal", "start_city", "end_country", "end_postal",
                "end_city", "load_type", "description", "note")
 DATE_FIELDS = ("load_date", "unload_date")
 STAMP_FIELDS = ("load_from", "load_to", "unload_from", "unload_to")
-NUM_FIELDS = ("weight_t", "ldm", "price_eur", "distance_km", "start_lat", "start_lon", "end_lat", "end_lon")
+NUM_FIELDS = ("pay_term_days", "extra_pay_eur", "weight_t", "ldm", "price_eur", "distance_km", "start_lat", "start_lon", "end_lat", "end_lon")
 LOCATION_FIELDS = ("start_country", "start_postal", "end_country", "end_postal")
 
 
 def new_plan(name: str = "") -> dict:
-    return {"name": name, "note": "", "orders": [], "stops": [], "vias": []}
+    return {"name": name, "note": "", "orders": [], "stops": [], "vias": [], "paid_sections": []}
 
 
 def _blank(x) -> bool:
@@ -72,7 +74,21 @@ def clean_order(row: dict) -> dict:
     out["ldm"] = out["ldm"] or 0.0
     out["weight_t"] = out["weight_t"] or 0.0
     out["price_eur"] = out["price_eur"] or 0.0
+    out["extra_pay_eur"] = out["extra_pay_eur"] or 0.0
+    if out["pay_status"] not in PAY_STATUSES:
+        out["pay_status"] = PAY_STATUSES[0]
+    if out["pay_term_days"] is not None:
+        out["pay_term_days"] = int(out["pay_term_days"])
     return out
+
+
+def normalize_plan(plan: dict) -> dict:
+    """Uzupełnia plan zapisany w starszej wersji (brakujące pola zleceń i planu) - bez zmiany jego treści."""
+    for k, default in (("name", ""), ("note", ""), ("orders", []), ("stops", []), ("vias", []), ("start_at", None),
+                       ("paid_sections", [])):
+        plan.setdefault(k, default)
+    plan["orders"] = [clean_order(o) for o in plan["orders"]]
+    return plan
 
 
 def order_ids(plan: dict) -> list[str]:
@@ -173,7 +189,7 @@ def orders_differ(plan: dict, rows: list[dict]) -> bool:
         new[o["id"]] = o
     if list(new) != list(old):
         return True
-    return any(new[i][f] != old[i][f] for i in new for f in EDITABLE_ORDER_FIELDS)
+    return any(new[i][f] != old[i].get(f) for i in new for f in EDITABLE_ORDER_FIELDS)
 
 
 def stop_edits_pending(plan: dict, numbers: list, deletes: list, notes: list | None = None) -> bool:
@@ -368,7 +384,7 @@ def to_variant(plan: dict, start: Stop | None, cost: CostParams) -> Variant | No
     for leg, nxt in zip(legs, stops[1:]):
         loaded += leg if on_board else 0.0
         on_board.add(nxt.order_id) if nxt.kind == "L" else on_board.discard(nxt.order_id)
-    revenue = sum(o["price_eur"] for o in plan["orders"])
+    revenue = sum(o["price_eur"] + (o.get("extra_pay_eur") or 0.0) for o in plan["orders"])
     n_cargo = sum(1 for s in stops if s.kind in ("L", "U"))
     n_wp = sum(1 for s in stops if s.kind == "W")
     c = profit(revenue, km, n_cargo, cost, extra_h=n_wp * cost.waypoint_stop_h)

@@ -130,6 +130,8 @@ class Geocoder:
         self.timeout = timeout
         self.cache_path = Path(cache_path) if cache_path else None
         self._cache: dict[str, list] = {}
+        self._names: dict[str, str] = {}              # "KRAJ|kod" -> nazwa miejscowości (osobny plik, obok współrzędnych)
+        self._names_dirty = False
         self._dirty = False
         self._miss: dict[str, float] = {}
         self._health: dict[str, list] = {"zippopotam": [0, 0.0, False], "nominatim": [0, 0.0, False]}   # [porażki, wstrzymana do, po wstrzymaniu]
@@ -140,6 +142,15 @@ class Geocoder:
                 self._cache = json.loads(self.cache_path.read_text())
             except (OSError, ValueError):
                 self._cache = {}
+        npath = self._names_path()
+        if npath and npath.exists():
+            try:
+                self._names = json.loads(npath.read_text())
+            except (OSError, ValueError):
+                self._names = {}
+
+    def _names_path(self) -> Optional[Path]:
+        return self.cache_path.with_name(self.cache_path.stem + "_names.json") if self.cache_path else None
 
     # ---- zdrowie usług
     def _service_ok(self, name: str) -> bool:
@@ -326,6 +337,86 @@ class Geocoder:
         note("użyto środka kraju")
         return lat, lon, "kraj"
 
+    # ---- nazwy miejscowości z kodów pocztowych
+    def _fetch_place(self, country: str, code: str) -> Optional[str]:
+        """Nazwa miejscowości dla kodu z zippopotam.us (None = nie znamy albo usługa niedostępna)."""
+        url = f"https://api.zippopotam.us/{country.lower()}/{urllib.parse.quote(code)}"
+        try:
+            with urllib.request.urlopen(url, timeout=self.timeout) as resp:
+                name = str(json.load(resp)["places"][0]["place name"]).strip()
+            self._good("zippopotam")
+            return name or None
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 400):
+                self._good("zippopotam")
+            else:
+                self._failed("zippopotam", hard=e.code in (429, 502, 503, 504))
+        except (KeyError, IndexError, ValueError):
+            self._good("zippopotam")
+        except (urllib.error.URLError, OSError):
+            self._failed("zippopotam")
+        return None
+
+    def _reverse_place(self, lat: float, lon: float) -> Optional[str]:
+        """Miejscowość dla współrzędnych (Nominatim reverse) - zapasowe źródło, gdy zippopotam nie zna kodu."""
+        with self._nom_lock:
+            wait = 1.1 - (time.monotonic() - self._last_nominatim)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_nominatim = time.monotonic()
+        q = urllib.parse.urlencode({"format": "jsonv2", "lat": lat, "lon": lon, "zoom": 10, "accept-language": "pl,en"})
+        req = urllib.request.Request(f"https://nominatim.openstreetmap.org/reverse?{q}",
+                                     headers={"User-Agent": "UmoyaLogis-LTL/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 10.0)) as resp:
+                addr = json.load(resp).get("address", {})
+            self._good("nominatim")
+            for k in ("city", "town", "village", "municipality", "county"):
+                if addr.get(k):
+                    return str(addr[k])
+        except urllib.error.HTTPError as e:
+            self._failed("nominatim", hard=e.code in (403, 429, 502, 503, 504))
+        except (ValueError, KeyError):
+            self._good("nominatim")
+        except (urllib.error.URLError, OSError):
+            self._failed("nominatim")
+        return None
+
+    def place_cached(self, country: str, postal: str) -> str:
+        """Nazwa miejscowości z cache (bez zapytań do internetu); pusty tekst, gdy jeszcze nieznana."""
+        country = str(country or "").strip().upper()
+        keys = [self._key(country, postal)] + [f"{country}|{c}" for c in postal_candidates(country, postal)]
+        return next((self._names[k] for k in keys if k in self._names), "")
+
+    def place_name(self, country: str, postal: str) -> str:
+        """Miejscowość odczytana z kodu pocztowego (cache -> zippopotam.us -> Nominatim reverse). Puste, gdy nie ustalono."""
+        country = str(country or "").strip().upper()
+        postal = str(postal or "").strip()
+        if not country or not postal:
+            return ""
+        name = self.place_cached(country, postal)
+        if name or not self.online:
+            return name
+        key = self._key(country, postal)
+        if time.monotonic() - self._miss.get("N" + key, -1e9) < self.MISS_TTL_S:
+            return ""
+        if self._service_ok("zippopotam"):
+            for code in postal_candidates(country, postal)[:3]:
+                name = self._fetch_place(country, code)
+                if name:
+                    break
+        if not name and self._service_ok("nominatim") and self.nominatim_budget > 0:
+            cached = self._cache_get(country, postal)
+            if cached is not None:
+                self.nominatim_budget -= 1
+                name = self._reverse_place(cached[0], cached[1]) or ""
+        if name:
+            self._names[key] = name
+            self._names_dirty = True
+            return name
+        self._miss["N" + key] = time.monotonic()
+        return ""
+
     def reset_failures(self) -> None:
         """Zdejmuje wstrzymanie usług i zapomina, które kody były „nieznane” - następne wyszukiwanie pyta od nowa."""
         with self._lock:
@@ -417,6 +508,14 @@ class Geocoder:
         return stats
 
     def save(self) -> None:
+        npath = self._names_path()
+        if npath and self._names_dirty:
+            try:
+                npath.parent.mkdir(parents=True, exist_ok=True)
+                npath.write_text(json.dumps(self._names, ensure_ascii=False))
+                self._names_dirty = False
+            except OSError:
+                pass
         if self.cache_path and self._dirty:
             try:
                 self.cache_path.parent.mkdir(parents=True, exist_ok=True)

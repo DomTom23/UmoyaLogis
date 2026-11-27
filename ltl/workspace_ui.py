@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime
 from typing import Callable
@@ -18,10 +19,12 @@ from .schedule import ScheduleParams, from_h, order_windows
 from .storage import InvalidName, NameExists, PlanConflict, Store
 from .ui import cards, empty_state, go_to, step
 from .variant_detail import order_table, route_chain_html, stop_table
+from . import route_sheet as rsh
 from . import workspace as ws
 
 MODES = {"👤 Praca osobista": "personal", "👥 Praca grupowa": "group"}
-SECTIONS = ["🗺️ Trasa i koszty", "🧾 Zlecenia", "🧭 Kolejność punktów", "➕ Dodaj", "⚙️ Plan"]
+SECTIONS = ["📊 Tabela", "🗺️ Trasa i koszty", "🧾 Zlecenia", "🧭 Kolejność punktów", "➕ Dodaj", "⚙️ Plan", "📚 Cały pojazd"]
+S_TABLE, S_ROUTE, S_ORDERS, S_STOPS, S_ADD, S_PLAN, S_FLEET = SECTIONS
 WORK_TAB_INDEX = 5              # miejsce zakładki „Workspace” w ui.ALL_TABS
 
 
@@ -34,6 +37,7 @@ class WsContext:
     get_route: Callable[[object, list], RouteResult]
     pool: pd.DataFrame | None = None                # zlecenia z bieżącego wyszukiwania (do dodawania do planu)
     est_ids: frozenset = frozenset()
+    place: Callable[[str, str], str] = lambda country, postal: ""      # (kraj, kod) -> nazwa miejscowości
 
 
 # ------------------------------------------------------------------ tożsamość i stan
@@ -83,30 +87,34 @@ def _fmt_time(iso: str) -> str:
 
 # ------------------------------------------------------------------ zapis planu
 class PlanCtx:
-    """Plan otwarty w workspace: dane, wersja z bazy, kto i co edytuje."""
+    """Wariant trasy otwarty w workspace: dane planu, wersja z bazy, kto i co edytuje."""
 
-    def __init__(self, ctx: WsContext, scope: str, owner: str, user: str, vehicle: dict, row: dict | None):
+    def __init__(self, ctx: WsContext, scope: str, owner: str, user: str, vehicle: dict, route: dict,
+                 routes: list[dict], row: dict):
         self.ctx, self.scope, self.owner, self.user, self.vehicle = ctx, scope, owner, user, vehicle
-        self.row = row
-        self.plan = copy.deepcopy(row["data"]) if row else ws.new_plan()
-        for k, default in (("name", ""), ("note", ""), ("orders", []), ("stops", []), ("vias", []), ("start_at", None)):
-            self.plan.setdefault(k, default)
-        self.version = row["version"] if row else 0
-        self.basekey = f"ws_base_{scope}_{owner}_{vehicle['id']}"
+        self.route, self.routes, self.row = route, routes, row
+        self.vid = row["id"]
+        self.kid = f"{scope}_{self.vid}"                    # unikalny dla wariantu - do kluczy kontrolek
+        self.plan = ws.normalize_plan(copy.deepcopy(row["data"]))
+        self.version = row["version"]
+        self.basekey = f"ws_base_{self.kid}"
         base = st.session_state.get(self.basekey)
         self.stale = base is not None and base != self.version      # ktoś zapisał zmiany, od kiedy ekran został narysowany
         # Licznik odświeżeń tabel edycji: zmienia się po każdym zapisie i gdy plan zmienił ktoś inny (tabele pokazują
         # wtedy świeże dane). Klucze formularzy są stałe - inaczej wysłanie nieaktualnego formularza przepadałoby po cichu.
-        self.nonce_key = f"ws_nonce_{scope}_{owner}_{vehicle['id']}"
+        self.nonce_key = f"ws_nonce_{self.kid}"
         self.nonce = st.session_state.get(self.nonce_key, 0) + (1 if self.stale else 0)
         st.session_state[self.nonce_key] = self.nonce
 
     def _conflict(self, current: dict | None) -> None:
-        who = (current or {}).get("updated_by") or "inna osoba"
-        when = _fmt_time((current or {}).get("updated_at", ""))
-        _flash("warning", f"Plan został w międzyczasie zmieniony ({who}, {when}). Wczytano najnowszą wersję - ponów swoją zmianę.")
-        st.session_state[self.basekey] = (current or {}).get("version", 0)
-        st.session_state[self.nonce_key] = self.nonce + 1
+        if current is None:
+            _flash("warning", "Ten wariant został w międzyczasie usunięty przez inną osobę.")
+        else:
+            who = current.get("updated_by") or "inna osoba"
+            _flash("warning", f"Wariant został w międzyczasie zmieniony ({who}, {_fmt_time(current.get('updated_at', ''))}). "
+                              "Wczytano najnowszą wersję - ponów swoją zmianę.")
+            st.session_state[self.basekey] = current.get("version", 0)
+            st.session_state[self.nonce_key] = self.nonce + 1
         st.rerun()
 
     def apply(self, mutate: Callable[[dict], object], message: str = "") -> None:
@@ -115,7 +123,7 @@ class PlanCtx:
             self._conflict(self.row)
         mutate(self.plan)
         try:
-            self.version = self.ctx.store.save_plan(self.scope, self.owner, self.vehicle["id"], self.plan, self.version, self.user)
+            self.version = self.ctx.store.save_variant(self.vid, self.plan, self.version, self.user)
         except PlanConflict as e:
             self._conflict(e.current)
         st.session_state[self.basekey] = self.version
@@ -219,20 +227,48 @@ def save_vehicles(store: Store, before: pd.DataFrame, edited: pd.DataFrame) -> l
 # ------------------------------------------------------------------ zakładka „Workspace”
 def _vehicle_label(v, overview: dict) -> str:
     info = overview.get(v.id)
-    mark = f" · ✅ plan: {info['n_orders']} zlec." if info and info["n_orders"] else (" · 📝 pusty plan" if info else "")
-    return f"{v.name}{mark}"
+    if not info:
+        return v.name
+    return f"{v.name} · tras: {info['n_routes']} · zlec.: {info['n_orders']}"
+
+
+def _route_label(r: dict, variants: list[dict]) -> str:
+    active = next((x for x in variants if x["id"] == r["active_variant_id"]), variants[0] if variants else None)
+    n = f"{active['n_orders']} zlec." if active else "pusta"
+    return f"{r['code']} · {len(variants)} war. · {n}"
+
+
+def _new_route(ctx: WsContext, scope: str, owner: str, vid: int, user: str) -> None:
+    rid, var = ctx.store.create_route(scope, owner, vid, by=user)
+    st.session_state[f"ws_route_{scope}_{owner}_{vid}"] = rid
+    st.session_state[f"ws_variant_{rid}"] = var
+    st.session_state["ws_section"] = S_ADD
+    _flash("success", "Utworzono nową trasę. Dodaj do niej zlecenia.")
+
+
+def _new_variant(ctx: WsContext, rid: int, user: str) -> None:
+    cur = ctx.store.get_variant(st.session_state.get(f"ws_variant_{rid}", 0))
+    data = copy.deepcopy(cur["data"]) if cur else None
+    var = ctx.store.add_variant(rid, data, by=user)
+    st.session_state[f"ws_variant_{rid}"] = var
+    _flash("success", "Dodano wariant (kopia poprzedniego). Zmieniaj go swobodnie - oryginał zostaje bez zmian.")
+
+
+def _activate_variant(ctx: WsContext, rid: int) -> None:
+    ctx.store.set_active_variant(rid, st.session_state.get(f"ws_variant_{rid}", 0))
+    _flash("success", "Ten wariant jest teraz aktywny (liczy się w arkuszu całego pojazdu).")
 
 
 def render_workspace_tab(ctx: WsContext) -> None:
     init_identity()
-    step("Workspace", "Plany tras dla pojazdów",
-         "Sprawdzaj warianty, poprawiaj ich dane i układaj z ofert nowe trasy. Każda zmiana zapisuje się od razu. "
-         "Praca osobista jest widoczna tylko dla Ciebie (po imieniu), praca grupowa - dla całej firmy.")
+    step("Workspace", "Auta → trasy → warianty",
+         "Wybierz auto, jego trasę i wariant - dla każdego wariantu powstaje tabela tras i zleceń z kosztami i marżą. "
+         "Każda zmiana zapisuje się od razu. Praca osobista jest widoczna tylko dla Ciebie (po imieniu), grupowa - dla całej firmy.")
     _show_flash()
     c1, c2 = st.columns([3, 2])
     st.session_state.setdefault("ws_mode", list(MODES)[0])
     mode_label = c1.segmented_control("Tryb pracy", list(MODES), key="ws_mode",
-                                      help="Osobista: własne plany, których nie widzą inni. Grupowa: wspólne plany, "
+                                      help="Osobista: własne trasy, których nie widzą inni. Grupowa: wspólne trasy, "
                                            "które może edytować każdy pracownik.") or list(MODES)[0]
     scope = MODES[mode_label]
     c2.text_input("Twoje imię lub inicjały", key="ws_user_input", on_change=_sync_user_param,
@@ -248,40 +284,105 @@ def render_workspace_tab(ctx: WsContext) -> None:
         empty_state("🚛", "Najpierw dodaj pojazdy w zakładce „🚛 Pojazdy”.")
         return
     owner = owner_key(user) if scope == "personal" else ""
-    overview = ctx.store.plans_overview(scope, owner)
+    overview = ctx.store.routes_overview(scope, owner)
     labels = {v.id: _vehicle_label(v, overview) for v in vehicles.itertuples()}
     ids = list(labels)
     if st.session_state.get("ws_vehicle") not in ids:
         st.session_state["ws_vehicle"] = ids[0]
-    vid = st.selectbox("Pojazd", ids, key="ws_vehicle", format_func=labels.get,
-                       help="Dla każdego pojazdu jest osobny plan w danym trybie pracy.")
+    vid = st.selectbox("Auto", ids, key="ws_vehicle", format_func=labels.get,
+                       help="Dla każdego auta jest osobna lista tras w danym trybie pracy.")
     vehicle = vehicles[vehicles["id"] == vid].iloc[0].to_dict()
-    pc = PlanCtx(ctx, scope, owner, user or "—", vehicle, ctx.store.get_plan(scope, owner, vid))
-    who = f"{pc.row['updated_by'] or '—'}, {_fmt_time(pc.row['updated_at'])}" if pc.row else "plan jeszcze nie istnieje"
+
+    # --- trasy auta
+    routes = ctx.store.list_routes(scope, owner, vid)
+    if not routes:
+        empty_state("🧭", f"Auto {vehicle['name']} nie ma jeszcze tras.")
+        st.button("➕ Utwórz pierwszą trasę", key="ws_first_route", type="primary",
+                  on_click=_new_route, args=(ctx, scope, owner, vid, user or "—"))
+        return
+    rkey = f"ws_route_{scope}_{owner}_{vid}"
+    route_ids = [r["id"] for r in routes]
+    if st.session_state.get(rkey) not in route_ids:
+        st.session_state[rkey] = route_ids[0]
+    variants_of = {r["id"]: ctx.store.list_variants(r["id"]) for r in routes}
+    rlabels = {r["id"]: _route_label(r, variants_of[r["id"]]) for r in routes}
+    r1, r2, r3, r4, r5 = st.columns([5, 1.6, 1.2, 0.6, 0.6])
+    rid = r1.selectbox("Trasa", route_ids, key=rkey, format_func=rlabels.get,
+                       help="Trasy auta w kolejności jazdy: koniec poprzedniej jest początkiem następnej.")
+    route = next(r for r in routes if r["id"] == rid)
+    r2.button("➕ Nowa trasa", key="ws_new_route", on_click=_new_route, args=(ctx, scope, owner, vid, user or "—"),
+              help="Pusta trasa na końcu listy.")
+    with r3.popover("🗑 Usuń"):
+        st.caption(f"Usunąć trasę {route['code']} razem z wszystkimi jej wariantami?")
+        if st.button("Tak, usuń trasę", key=f"ws_del_route_{rid}", type="primary"):
+            ctx.store.delete_route(rid)
+            st.rerun()
+    pos = route_ids.index(rid)
+    if r4.button("↑", key="ws_route_up", disabled=pos == 0, help="Przesuń trasę wcześniej"):
+        ctx.store.move_route(rid, -1)
+        st.rerun()
+    if r5.button("↓", key="ws_route_down", disabled=pos == len(route_ids) - 1, help="Przesuń trasę później"):
+        ctx.store.move_route(rid, +1)
+        st.rerun()
+
+    # --- warianty trasy
+    variants = variants_of[rid]
+    vids = [x["id"] for x in variants]
+    vkey = f"ws_variant_{rid}"
+    if st.session_state.get(vkey) not in vids:
+        st.session_state[vkey] = route["active_variant_id"] if route["active_variant_id"] in vids else vids[0]
+    vlabels = {x["id"]: f"{x['label'] or 'Wariant'}{' ⭐' if x['id'] == route['active_variant_id'] else ''} ({x['n_orders']})"
+               for x in variants}
+    v1, v2, v3, v4 = st.columns([5, 1.8, 1.7, 1.2])
+    selected = v1.radio("Wariant", vids, key=vkey, format_func=vlabels.get, horizontal=True,
+                        help="⭐ = wariant aktywny (liczony w arkuszu całego auta). W nawiasie liczba zleceń.")
+    v2.button("➕ Nowy wariant", key=f"ws_new_var_{rid}", on_click=_new_variant, args=(ctx, rid, user or "—"),
+              help="Kopia wybranego wariantu - do przetestowania innego ułożenia.")
+    v3.button("⭐ Ustaw aktywny", key=f"ws_act_var_{rid}", on_click=_activate_variant, args=(ctx, rid),
+              disabled=selected == route["active_variant_id"])
+    with v4.popover("🗑 Usuń", help="Usuń wybrany wariant"):
+        if len(vids) < 2:
+            st.caption("Trasa musi mieć co najmniej jeden wariant.")
+        else:
+            st.caption("Usunąć wybrany wariant?")
+            if st.button("Tak, usuń wariant", key=f"ws_del_var_{selected}", type="primary"):
+                ctx.store.delete_variant(selected)
+                st.rerun()
+    row = ctx.store.get_variant(selected)
+    if row is None:
+        st.rerun()
+    pc = PlanCtx(ctx, scope, owner, user or "—", vehicle, route, routes, row)
     i1, i2 = st.columns([5, 1])
-    i1.caption(f"{'Plan osobisty' if scope == 'personal' else 'Plan grupowy'} pojazdu **{vehicle['name']}** · "
-               f"ostatnia zmiana: {who} · wersja {pc.version} · limit {vehicle['max_ldm']:g} LDM / {vehicle['max_weight_t']:g} t")
+    i1.caption(f"{'Osobista' if scope == 'personal' else 'Grupowa'} trasa **{route['code']}** auta **{vehicle['name']}** · "
+               f"wariant „{row['label']}” · ostatnia zmiana: {row['updated_by'] or '—'}, {_fmt_time(row['updated_at'])} · "
+               f"wersja {pc.version} · limit {vehicle['max_ldm']:g} LDM / {vehicle['max_weight_t']:g} t")
     if i2.button("🔄 Odśwież", key="ws_refresh", help="Wczytaj najnowszy stan z bazy (zmiany innych osób)."):
         pc.mark_seen()
         st.rerun()
-    default_section = SECTIONS[0] if pc.plan["orders"] else SECTIONS[3]
+    default_section = S_TABLE if pc.plan["orders"] else S_ADD
     st.session_state.setdefault("ws_section", default_section)
     section = st.segmented_control("Sekcja", SECTIONS, key="ws_section", label_visibility="collapsed") or default_section
+    if section == S_FLEET:
+        _section_fleet(pc)
+        pc.mark_seen()
+        return
     e, why, problems = _evaluate(pc)                 # koszty i trasa liczone po każdej zmianie, w każdej sekcji
     for prob in problems:
         st.warning(prob)
-    if e is not None:
+    if e is not None and section != S_TABLE:
         _cost_strip(pc, e)
-    if section == SECTIONS[0]:
+    if section == S_TABLE:
+        _section_table(pc, e, why)
+    elif section == S_ROUTE:
         _section_route(pc, e, why)
-    elif section == SECTIONS[1]:
+    elif section == S_ORDERS:
         _section_orders(pc)
-    elif section == SECTIONS[2]:
+    elif section == S_STOPS:
         _section_stops(pc)
-    elif section == SECTIONS[3]:
+    elif section == S_ADD:
         _section_add(pc)
     else:
-        _section_settings(pc, overview)
+        _section_settings(pc)
     pc.mark_seen()
 
 
@@ -300,10 +401,9 @@ class Eval:
     vias: list
 
 
-def _evaluate(pc: PlanCtx):
-    """(Eval | None, powód braku, lista problemów). Liczone od nowa przy każdym przebiegu; trasy są w pamięci
-    podręcznej, więc ponowne wyznaczanie następuje tylko po zmianie punktów."""
-    ctx, plan, vehicle = pc.ctx, pc.plan, pc.vehicle
+def _evaluate_plan(ctx: WsContext, plan: dict, vehicle: dict):
+    """(Eval | None, powód braku, lista problemów). Trasy są w pamięci podręcznej, więc ponowne wyznaczanie
+    następuje tylko po zmianie punktów. Płatne odcinki z planu (prom/pociąg/…) zwiększają koszty i obniżają zysk."""
     problems = ws.validate(plan, vehicle["max_ldm"], vehicle["max_weight_t"]) if (plan["orders"] or plan["stops"]) else []
     if not plan["orders"] and not plan["stops"]:
         return None, "empty", problems
@@ -316,10 +416,20 @@ def _evaluate(pc: PlanCtx):
     frame = ws.orders_frame(plan)
     time_ctx = TimeCtx(sched, order_windows(frame, sched))
     vias = _vias(plan)
-    with st.spinner("Przeliczanie trasy i kosztów…"):
-        route = ctx.get_route(v, vias)
-        ev = evaluate_route(v, route, ctx.cost, time_ctx)
+    route = ctx.get_route(v, vias)
+    ev = evaluate_route(v, route, ctx.cost, time_ctx)
+    manual = rsh.paid_total(plan)
+    if manual:
+        ev["total"] += manual
+        ev["profit"] -= manual
+        ev["fees"] += manual
+    ev["manual_fees"] = manual
     return Eval(v, route, ev, ev["schedule"], frame, vias), "", problems
+
+
+def _evaluate(pc: PlanCtx):
+    with st.spinner("Przeliczanie trasy i kosztów…"):
+        return _evaluate_plan(pc.ctx, pc.plan, pc.vehicle)
 
 
 def _cost_strip(pc: PlanCtx, e: Eval) -> None:
@@ -349,6 +459,151 @@ def _cost_strip(pc: PlanCtx, e: Eval) -> None:
                + ("" if plan.get("start_at") else " Wyjazd automatyczny (datę ustawisz w sekcji „⚙️ Plan”)."))
 
 
+# --- sekcja: tabela trasy i zleceń (układ arkusza)
+def _money_col(label: str, fmt: str = "%.2f") -> "st.column_config.NumberColumn":
+    return st.column_config.NumberColumn(label, format=fmt)
+
+
+def _sheet_config(editable: bool) -> dict:
+    cfg = {
+        "Nr trasy/zlecenia": st.column_config.TextColumn("Nr trasy/zlecenia", width=170, pinned=True),
+        "Skąd": st.column_config.TextColumn("Skąd", width=140), "Dokąd": st.column_config.TextColumn("Dokąd", width=140),
+        "Dni trasy": st.column_config.NumberColumn("Dni trasy", format="%d", width=70),
+        "Start/Załadunek": st.column_config.TextColumn("Start/Załadunek", width=105),
+        "Koniec/Rozładunek": st.column_config.TextColumn("Koniec/Rozładunek", width=115),
+        "Km": st.column_config.NumberColumn("Km", format="%d", width=70),
+        "Płatność do": st.column_config.TextColumn("Płatność do", width=100)}
+    for label in ("Frachty (€)", "Dodatkowe wynagrodzenie (€)", "Łącznie (€)", "Marża łącznie (€)", "Koszt razem (€)",
+                  "Koszt dzienny (€)", "Paliwo (€)", "Opłaty drogowe (€)", "Prom/tunel (€)"):
+        cfg[label] = st.column_config.NumberColumn(label, format="%.2f", width=105, **({"min_value": 0.0} if editable and label in rsh.EDITABLE else {}))
+    for label in ("Stawka €/km", "€/LDM", "Marża €/km"):
+        cfg[label] = st.column_config.NumberColumn(label, format="%.2f", width=85)
+    cfg["LDM"] = st.column_config.NumberColumn("LDM", format="%.1f", width=65)
+    cfg["Waga (t)"] = st.column_config.NumberColumn("Waga (t)", format="%.1f", width=75)
+    cfg["Zleceniodawca"] = st.column_config.TextColumn("Zleceniodawca", width=140)
+    cfg["Dyspozytor"] = st.column_config.TextColumn("Dyspozytor", width=115)
+    cfg["Płatność status"] = st.column_config.SelectboxColumn("Płatność status", options=list(ws.PAY_STATUSES), width=125,
+                                                              help="Nieopłacone, opłacone albo przeterminowane.")
+    cfg["Termin płatności"] = st.column_config.SelectboxColumn("Termin płatności", options=rsh.TERM_LABELS, width=115,
+                                                               help="Liczony od daty rozładunku zlecenia.")
+    return cfg
+
+
+def _marked(frame: pd.DataFrame) -> pd.DataFrame:
+    """Wiersze tras oznaczone „▶” (wiersze zleceń: numer kończy się „-01”, „-02”…)."""
+    out = frame.copy()
+    is_order = out["Nr trasy/zlecenia"].astype(str).str.contains(r"-\d{4}-\d{2}$")
+    out["Nr trasy/zlecenia"] = [c if o else f"▶ {c}" for c, o in zip(out["Nr trasy/zlecenia"], is_order)]
+    return out
+
+
+def _vehicle_start_place(pc_or_vehicle, ctx: WsContext) -> str:
+    v = pc_or_vehicle
+    return rsh.place_label(v.get("start_country", ""), v.get("start_postal", ""), v.get("start_city", ""), ctx.place)
+
+
+def _prev_end(ctx: WsContext, vehicle: dict, routes: list[dict], route: dict) -> dict:
+    """Koniec poprzedniej trasy auta (jej aktywnego wariantu); dla pierwszej trasy - miejsce startu auta."""
+    prev = None
+    for r in routes:
+        if r["id"] == route["id"]:
+            break
+        prev = r
+    if prev and prev["active_variant_id"]:
+        row = ctx.store.get_variant(prev["active_variant_id"])
+        if row:
+            end = rsh.end_of(ws.normalize_plan(row["data"]), ctx.place)
+            if end["place"] != "—":
+                return end
+    return {"place": _vehicle_start_place(vehicle, ctx) if vehicle.get("start_country") else "—", "date": None}
+
+
+def _calendar_days(e: Eval | None) -> int | None:
+    return int(math.ceil(e.sch.total_h / 24.0 - 1e-9)) if e is not None and e.sch.total_h > 0 else None
+
+
+def _section_table(pc: PlanCtx, e: Eval | None, why: str) -> None:
+    ctx, plan = pc.ctx, pc.plan
+    if not plan["orders"]:
+        empty_state("📊", "Wariant jest pusty. Dodaj zlecenia w sekcji „➕ Dodaj” albo wyślij tu wariant z zakładki „5 · Trasa”.")
+        return
+    if e is None:
+        st.info("Nie da się jeszcze policzyć kosztów trasy (za mało punktów albo brak współrzędnych) - "
+                "w tabeli są tylko dane ze zleceń.")
+    rsh.warm_places([plan], ctx.place)
+    prev = _prev_end(ctx, pc.vehicle, pc.routes, pc.route)
+    route_row, order_rows, _ = rsh.build_sheet(pc.route["code"], plan, e.ev if e else None, e.route.km if e else None,
+                                               _calendar_days(e), prev, ctx.place)
+    if e is not None:
+        _cost_strip(pc, e)
+    st.markdown(f"**Trasa {pc.route['code']}** - podsumowanie całej trasy")
+    st.dataframe(_marked(rsh.sheet_frame([route_row])), hide_index=True, width="stretch", column_config=_sheet_config(False))
+    st.markdown("**Zlecenia na trasie** - kolumny z ikoną ✎ (zleceniodawca, frachty, dodatkowe wynagrodzenie, dyspozytor, płatność, termin) edytujesz w tabeli; zapis i przeliczenie od razu")
+    frame = rsh.sheet_frame(order_rows)
+    edited = st.data_editor(
+        frame, key=f"ws_sheet_{pc.kid}_{pc.nonce}", hide_index=True, width="stretch", num_rows="fixed",
+        disabled=[c for c in rsh.COLUMNS if c not in rsh.EDITABLE], column_config=_sheet_config(True))
+    probe = copy.deepcopy(plan)
+    if rsh.apply_sheet_edits(probe, edited):
+        pc.apply(lambda p: rsh.apply_sheet_edits(p, edited), "Zapisano zmiany w zleceniach.")
+    st.caption("Wiersz zlecenia: Km z oferty (albo szacunek z mapy), marża zlecenia = jego przychód minus część kosztów trasy "
+               "proporcjonalna do km (suma marż zleceń = marża trasy). Skąd/Dokąd: kraj i miejscowość odczytana z kodu "
+               "pocztowego. Termin płatności liczy się od daty rozładunku.")
+
+    st.markdown("**Płatne odcinki trasy** (kolumna Prom/tunel)")
+    crossings = e.ev["crossings"] if e is not None else []
+    auto = [c for c in crossings if c.kind in ("channel_tunnel", "channel_ferry", "alpine_tunnel")]
+    if auto:
+        st.caption("Wykryte na trasie i wliczone automatycznie: " + "; ".join(c.label for c in auto)
+                   + ". Dodaj poniżej własne płatne odcinki (prom, pociąg, tunel, inne) - ich koszt zwiększa Prom/tunel i koszty trasy.")
+    else:
+        st.caption("Na trasie nie wykryto płatnych przepraw. Jeśli trasa ma prom, pociąg lub inny płatny odcinek - wybierz go z listy.")
+    cols = {"kind": "Rodzaj", "name": "Odcinek / opis", "cost_eur": "Koszt (€)"}
+    pdf = pd.DataFrame(plan["paid_sections"], columns=list(cols)).rename(columns=cols)
+    pedit = st.data_editor(
+        pdf, key=f"ws_paid_{pc.kid}_{pc.nonce}", num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={"Rodzaj": st.column_config.SelectboxColumn("Rodzaj", options=list(rsh.PAID_KINDS), width=120,
+                                                                   help="Prom, pociąg (np. Eurotunel), tunel albo inny płatny odcinek."),
+                       "Odcinek / opis": st.column_config.TextColumn("Odcinek / opis", width=260),
+                       "Koszt (€)": st.column_config.NumberColumn("Koszt (€)", min_value=0.0, format="%.2f", width=110)})
+    paid = rsh.clean_paid_sections(pedit.rename(columns={v: k for k, v in cols.items()}).to_dict("records"))
+    if paid != plan["paid_sections"]:
+        pc.apply(lambda p: p.__setitem__("paid_sections", paid), "Zapisano płatne odcinki.")
+
+
+def _section_fleet(pc: PlanCtx) -> None:
+    """Arkusz całego auta: aktywny wariant każdej trasy, trasy po kolei (koniec jednej = początek następnej)."""
+    ctx, vehicle = pc.ctx, pc.vehicle
+    st.caption("Wszystkie trasy auta w kolejności jazdy - dla każdej liczony jest jej aktywny wariant (⭐).")
+    plans = []
+    for r in pc.routes:
+        row = ctx.store.get_variant(r["active_variant_id"]) if r["active_variant_id"] else None
+        plans.append((r, ws.normalize_plan(row["data"]) if row else ws.new_plan()))
+    rsh.warm_places([p for _, p in plans], ctx.place)
+    rows, prev = [], {"place": _vehicle_start_place(vehicle, ctx) if vehicle.get("start_country") else "—", "date": None}
+    totals = {"rev": 0.0, "profit": 0.0, "km": 0.0}
+    with st.spinner("Przeliczanie tras auta…"):
+        for r, plan in plans:
+            e = _evaluate_plan(ctx, plan, vehicle)[0] if plan["orders"] else None
+            route_row, order_rows, end = rsh.build_sheet(r["code"], plan, e.ev if e else None, e.route.km if e else None,
+                                                         _calendar_days(e), prev, ctx.place)
+            rows += [route_row] + order_rows
+            if plan["orders"]:
+                prev = end if end["place"] != "—" else prev
+            if e is not None:
+                totals["rev"] += route_row["Łącznie (€)"]
+                totals["profit"] += route_row["Marża łącznie (€)"] or 0.0
+                totals["km"] += route_row["Km"] or 0
+    if not any(plan["orders"] for _, plan in plans):
+        empty_state("📚", "Trasy tego auta nie mają jeszcze zleceń.")
+        return
+    cards([("Przychód tras", f"{totals['rev']:,.0f} EUR".replace(",", " "), None, "", "Suma kolumny Łącznie tras z policzoną trasą."),
+           ("Marża łącznie", f"{totals['profit']:,.0f} EUR".replace(",", " "), None, "pos" if totals["profit"] >= 0 else "neg",
+            "Suma marż tras (przychód minus koszty)."),
+           ("Km razem", f"{totals['km']:,.0f}".replace(",", " "), None, "", "Suma km tras.")])
+    st.dataframe(_marked(rsh.sheet_frame(rows)), hide_index=True, width="stretch", column_config=_sheet_config(False))
+
+
 # --- sekcja: trasa i koszty (mapa, przebieg, tabele)
 def _section_route(pc: PlanCtx, e: Eval | None, why: str) -> None:
     ctx, plan, vehicle = pc.ctx, pc.plan, pc.vehicle
@@ -362,8 +617,8 @@ def _section_route(pc: PlanCtx, e: Eval | None, why: str) -> None:
     if ws.vehicle_start(vehicle, ctx.geocode) is None:
         st.info("Pojazd nie ma miejsca startu (zakładka „🚛 Pojazdy”) - trasa jest liczona od pierwszego punktu.")
     st.markdown("<div class='chain'>" + route_chain_html(v) + "</div>", unsafe_allow_html=True)
-    map_id = f"ws-{pc.scope}-{vehicle['id']}-{pc.version}"
-    event = route_map(v, route, vias, map_id=map_id, fit_id=map_id, height=560, key=f"ws_map_{pc.scope}_{vehicle['id']}")
+    map_id = f"ws-{pc.kid}-{pc.version}"
+    event = route_map(v, route, vias, map_id=map_id, fit_id=map_id, height=560, key=f"ws_map_{pc.kid}")
     seen = st.session_state.setdefault("ws_seen_nonce", set())
     if event and event.get("map_id") == map_id and event["nonce"] not in seen:
         seen.add(event["nonce"])
@@ -445,7 +700,7 @@ def _section_orders(pc: PlanCtx) -> None:
     st.caption("Popraw dane zleceń w tabeli (kody pocztowe, daty, LDM, wagę, cenę) - zmiany zapisują się i przeliczają koszty "
                "od razu. Nowy wiersz (numer zostaw pusty, dostanie M1, M2…) zapisze się, gdy uzupełnisz kraj i kod "
                "załadunku oraz rozładunku. Wiersz usuniesz zaznaczeniem i klawiszem Delete.")
-    key = f"ws_orders_{pc.scope}_{pc.vehicle['id']}_{pc.nonce}"
+    key = f"ws_orders_{pc.kid}_{pc.nonce}"
     edited = st.data_editor(
         _orders_editor_frame(plan), key=key, num_rows="dynamic", hide_index=True, width="stretch",
         column_config={
@@ -507,7 +762,7 @@ def _section_stops(pc: PlanCtx) -> None:
         "Miejsce": [_stop_place(pc, s) for s in plan["stops"]],
         "Uwaga": [s.get("note", "") if s["kind"] == "W" else "" for s in plan["stops"]],
         "Usuń": [False] * len(plan["stops"])})
-    key = f"ws_stops_{pc.scope}_{pc.vehicle['id']}_{pc.nonce}"
+    key = f"ws_stops_{pc.kid}_{pc.nonce}"
     edited = st.data_editor(df, key=key, hide_index=True, width="stretch", num_rows="fixed",
                             disabled=["Typ", "Zlecenie / punkt", "Miejsce"],
                             column_config={"Nr": st.column_config.NumberColumn("Nr", min_value=1, step=1, width=70),
@@ -543,25 +798,26 @@ def _section_add(pc: PlanCtx) -> None:
     else:
         have = set(ws.order_ids(plan))
         avail = pool[~pool["id"].isin(have)]
-        q = st.text_input("Szukaj (nr, zleceniodawca, kod, miasto)", key=f"ws_pool_q_{pc.scope}_{pc.vehicle['id']}").strip().lower()
+        q = st.text_input("Szukaj (nr, zleceniodawca, kod, miasto)", key=f"ws_pool_q_{pc.kid}").strip().lower()
         if q:
             hay = (avail["id"].astype(str) + " " + avail["client"].fillna("") + " " + avail["start_postal"].astype(str) + " "
                    + avail["end_postal"].astype(str) + " " + avail["start_city"].fillna("") + " " + avail["end_city"].fillna("")).str.lower()
             avail = avail[hay.str.contains(q, regex=False)]
         options = {r.id: _pool_label(r) for r in avail.head(400).itertuples()}
         picked = st.multiselect(f"Zlecenia do dodania ({len(avail)} dostępnych)", list(options), format_func=options.get,
-                                key=f"ws_pool_pick_{pc.scope}_{pc.vehicle['id']}_{pc.nonce}")
-        if st.button("➕ Dodaj wybrane na koniec trasy", disabled=not picked, key=f"ws_pool_add_{pc.scope}_{pc.vehicle['id']}",
+                                key=f"ws_pool_pick_{pc.kid}_{pc.nonce}")
+        if st.button("➕ Dodaj wybrane na koniec trasy", disabled=not picked, key=f"ws_pool_add_{pc.kid}",
                      type="primary"):
             rows = [r for r in pool.to_dict("records") if r["id"] in set(picked)]
 
             def mutate(p):
-                added = ws.add_orders(p, [{**r, "price_eur": r.get("price_used_eur", r.get("price_eur"))} for r in rows])
+                added = ws.add_orders(p, [{**r, "price_eur": r.get("price_used_eur", r.get("price_eur")),
+                                           "dispatcher": pc.user if pc.user != "—" else ""} for r in rows])
                 _flash("success", f"Dodano zlecenia: {', '.join(added) or 'brak (już są w planie)'}. Ustaw ich kolejność w sekcji „🧭 Kolejność punktów”.")
             pc.apply(mutate)
     st.divider()
     st.markdown("**Punkt dodatkowy** (miejsce do zahaczenia po drodze: magazyn, warsztat, odbiór)")
-    with st.form(f"ws_wp_{pc.scope}_{pc.vehicle['id']}", clear_on_submit=True):
+    with st.form(f"ws_wp_{pc.kid}", clear_on_submit=True):
         c1, c2, c3 = st.columns([1, 2, 3])
         country = c1.text_input("Kraj", "PL", max_chars=2)
         postal = c2.text_input("Kod pocztowy")
@@ -585,10 +841,10 @@ def _section_add(pc: PlanCtx) -> None:
 
 
 # --- sekcja: ustawienia planu, kopiowanie, czyszczenie
-def _section_settings(pc: PlanCtx, overview: dict) -> None:
+def _section_settings(pc: PlanCtx) -> None:
     ctx, plan = pc.ctx, pc.plan
-    with st.form(f"ws_settings_{pc.scope}_{pc.vehicle['id']}"):
-        name = st.text_input("Nazwa planu", plan.get("name", ""), max_chars=80, placeholder="np. Francja - czwartek")
+    with st.form(f"ws_settings_{pc.kid}"):
+        name = st.text_input("Nazwa wariantu", pc.row["label"], max_chars=60, placeholder="np. Francja - czwartek")
         note = st.text_area("Notatka", plan.get("note", ""), height=90)
         manual = st.checkbox("Podaj datę i godzinę wyjazdu", value=bool(plan.get("start_at")),
                              help="Bez tego pojazd rusza automatycznie, tak żeby zdążyć na pierwsze okno załadunku.")
@@ -596,50 +852,41 @@ def _section_settings(pc: PlanCtx, overview: dict) -> None:
         s1, s2 = st.columns(2)
         sd = s1.date_input("Data wyjazdu", cur.date(), format="DD.MM.YYYY")
         stm = s2.time_input("Godzina", cur.time(), step=900)
-        saved = st.form_submit_button("💾 Zapisz ustawienia planu", type="primary")
+        saved = st.form_submit_button("💾 Zapisz ustawienia wariantu", type="primary")
     if saved:
+        ctx.store.rename_variant(pc.vid, name.strip() or pc.row["label"])
+
         def mutate(p):
             p["name"], p["note"] = name.strip(), note
             p["start_at"] = datetime.combine(sd, stm).isoformat(timespec="minutes") if manual else None
-            _flash("success", "Zapisano ustawienia planu.")
+            _flash("success", "Zapisano ustawienia wariantu.")
         pc.apply(mutate)
     st.divider()
     other_scope = "group" if pc.scope == "personal" else "personal"
     other_label = "pracy grupowej" if other_scope == "group" else "pracy osobistej"
-    st.markdown(f"**Kopiuj ten plan do {other_label}** (tego samego pojazdu)")
-    if other_scope == "personal" and not pc.user:
+    st.markdown(f"**Kopiuj ten wariant do {other_label}** (jako nowa trasa tego samego auta)")
+    if other_scope == "personal" and pc.user == "—":
         st.caption("Wpisz swoje imię, aby kopiować do pracy osobistej.")
     else:
         other_owner = "" if other_scope == "group" else owner_key(pc.user)
-        existing = ctx.store.get_plan(other_scope, other_owner, pc.vehicle["id"])
-        ow = False
-        if existing and existing["data"].get("orders"):
-            ow = st.checkbox(f"Nadpisz istniejący plan w {other_label} ({len(existing['data']['orders'])} zleceń, "
-                             f"zmiana: {existing['updated_by'] or '—'}, {_fmt_time(existing['updated_at'])})",
-                             key=f"ws_copy_ow_{pc.scope}_{pc.vehicle['id']}")
-        if st.button(f"📋 Kopiuj do {other_label}", key=f"ws_copy_{pc.scope}_{pc.vehicle['id']}",
-                     disabled=bool(existing and existing["data"].get("orders") and not ow) or not plan["orders"]):
-            try:
-                ctx.store.save_plan(other_scope, other_owner, pc.vehicle["id"], plan,
-                                    existing["version"] if existing else 0, pc.user)
-                _flash("success", f"Skopiowano plan do {other_label}.")
-            except PlanConflict:
-                _flash("warning", "Plan docelowy właśnie się zmienił - spróbuj ponownie.")
+        if st.button(f"📋 Kopiuj do {other_label}", key=f"ws_copy_{pc.kid}", disabled=not plan["orders"]):
+            _rid, _vid = ctx.store.create_route(other_scope, other_owner, pc.vehicle["id"], plan, by=pc.user)
+            _flash("success", f"Skopiowano do {other_label} jako nowa trasa {ctx.store.list_routes(other_scope, other_owner, pc.vehicle['id'])[-1]['code']}.")
             st.rerun()
     st.divider()
-    st.markdown("**Wyczyść plan**")
-    sure = st.checkbox("Tak, usuń wszystkie zlecenia i punkty tego planu", key=f"ws_clear_ok_{pc.scope}_{pc.vehicle['id']}")
-    if st.button("🗑️ Wyczyść plan", disabled=not sure, key=f"ws_clear_{pc.scope}_{pc.vehicle['id']}"):
+    st.markdown("**Wyczyść wariant**")
+    sure = st.checkbox("Tak, usuń wszystkie zlecenia i punkty tego wariantu", key=f"ws_clear_ok_{pc.kid}")
+    if st.button("🗑️ Wyczyść wariant", disabled=not sure, key=f"ws_clear_{pc.kid}"):
         def mutate(p):
             p.update(ws.new_plan(p.get("name", "")))
             p["start_at"] = None
-            _flash("success", "Plan wyczyszczony.")
+            _flash("success", "Wariant wyczyszczony.")
         pc.apply(mutate)
 
 
 # ------------------------------------------------------------------ wysyłanie wariantu z wyszukiwarki
 def send_variant_ui(ctx: WsContext, variant, orders: pd.DataFrame, key: str) -> None:
-    """Sekcja w zakładce „Trasa”: wyślij wybrany wariant jako plan pojazdu (osobisty lub grupowy)."""
+    """Sekcja w zakładce „Trasa”: wyślij wybrany wariant do workspace - jako nową trasę auta albo jako nowy wariant istniejącej."""
     init_identity()
     vehicles = ctx.store.vehicles()
     if vehicles.empty:
@@ -652,29 +899,35 @@ def send_variant_ui(ctx: WsContext, variant, orders: pd.DataFrame, key: str) -> 
                      help="Praca osobista wymaga imienia (zakładka Workspace)." if not user else None)
     scope = modes[label]
     owner = owner_key(user) if scope == "personal" else ""
-    overview = ctx.store.plans_overview(scope, owner)
+    overview = ctx.store.routes_overview(scope, owner)
     ids = list(vehicles["id"])
     names = {v.id: _vehicle_label(v, overview) for v in vehicles.itertuples()}
-    vid = c2.selectbox("Pojazd", ids, key=f"send_vehicle_{key}", format_func=names.get)
-    existing = ctx.store.get_plan(scope, owner, vid)
-    has = bool(existing and existing["data"].get("orders"))
-    ow = st.checkbox("Nadpisz istniejący plan tego pojazdu", key=f"send_ow_{key}") if has else True
-    if has:
-        st.caption(f"Pojazd ma już plan: {len(existing['data']['orders'])} zleceń (zmiana: {existing['updated_by'] or '—'}, "
-                   f"{_fmt_time(existing['updated_at'])}).")
+    vid = c2.selectbox("Auto", ids, key=f"send_vehicle_{key}", format_func=names.get)
+    routes = ctx.store.list_routes(scope, owner, vid)
+    target = {0: "➕ Nowa trasa"}
+    for r in routes:
+        target[r["id"]] = f"Nowy wariant w trasie {r['code']}"
+    choice = st.selectbox("Dodaj jako", list(target), key=f"send_target_{key}_{scope}_{vid}", format_func=target.get)
 
     def do_send():
-        row = ctx.store.get_plan(scope, owner, vid)
         plan = ws.from_variant(variant, orders, ws.new_plan(f"Wariant {' + '.join(variant.order_ids)}"))
+        for o in plan["orders"]:
+            o["dispatcher"] = o["dispatcher"] or user
         try:
-            ctx.store.save_plan(scope, owner, vid, plan, row["version"] if row else 0, user or "—")
-        except PlanConflict:
-            _flash("warning", "Plan pojazdu właśnie się zmienił - spróbuj ponownie.")
+            if choice == 0:
+                rid, var = ctx.store.create_route(scope, owner, vid, plan, by=user or "—")
+            else:
+                rid = choice
+                var = ctx.store.add_variant(rid, plan, label="", by=user or "—")
+        except Exception:                                     # trasa mogła zostać usunięta przez kogoś innego
+            _flash("warning", "Nie udało się zapisać (trasa mogła zostać zmieniona) - spróbuj ponownie.")
             return
         st.session_state["ws_mode"] = label
         st.session_state["ws_vehicle"] = vid
-        st.session_state["ws_section"] = SECTIONS[0]
-        _flash("success", f"Wysłano wariant do planu pojazdu {names[vid].split(' · ')[0]}.")
+        st.session_state[f"ws_route_{scope}_{owner}_{vid}"] = rid
+        st.session_state[f"ws_variant_{rid}"] = var
+        st.session_state["ws_section"] = S_TABLE
+        _flash("success", f"Wysłano wariant do auta {names[vid].split(' · ')[0]}.")
         go_to(WORK_TAB_INDEX)
 
-    st.button("🧰 Wyślij do workspace", key=f"send_btn_{key}", on_click=do_send, disabled=not ow, type="primary")
+    st.button("🧰 Wyślij do workspace", key=f"send_btn_{key}", on_click=do_send, type="primary")

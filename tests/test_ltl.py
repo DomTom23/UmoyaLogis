@@ -1646,3 +1646,101 @@ def test_settings_sanitize_snapshot_and_store(tmp_path):
     assert st_.list_formats() == ["andrzej", "Ania"] and st_.get_format("Ania") == {"s_fuel": 1.9}
     st_.delete_format("Ania")
     assert st_.list_formats() == ["andrzej"]
+
+
+# ---------------------------------------------------------------- trasy, warianty i tabela w układzie arkusza
+def _sheet_plan():
+    from ltl import workspace as w
+    p = w.new_plan()
+    for i, (a, b, price, ld, ud) in enumerate([("GB", "DE", 1500, "2026-11-02", "2026-11-04"),
+                                               ("GB", "NL", 1000, "2026-11-03", "2026-11-05")]):
+        p["orders"].append(w.clean_order({"id": f"T{i}", "client": "abc", "start_country": a, "start_postal": "E1",
+                                          "end_country": b, "end_postal": "1000", "ldm": 5, "weight_t": 8, "price_eur": price,
+                                          "distance_km": 600 - 200 * i, "load_date": ld, "unload_date": ud, "pay_term_days": 30}))
+        p["stops"] += [{"kind": "L", "order_id": f"T{i}"}, {"kind": "U", "order_id": f"T{i}"}]
+    return p
+
+
+def test_sheet_rows_sums_and_margins():
+    from ltl import route_sheet as rs
+    plan = _sheet_plan()
+    ev = {"total": 1200.0, "profit": 1300.0, "fees": 100.0, "fuel": 500.0, "tolls": 300.0}
+    route, orders, end = rs.build_sheet("TR-2026/11-0001", plan, ev, 1100, 5, {"place": "PL · Poznań", "date": None},
+                                        lambda c, p: "Londyn")
+    assert [o["Nr trasy/zlecenia"] for o in orders] == ["TR-2026/11-0001-01", "TR-2026/11-0001-02"]
+    assert route["Frachty (€)"] == 2500 and route["LDM"] == 10 and route["Skąd"] == "PL · Poznań"
+    assert route["Dokąd"] == "NL · Londyn" and end["date"].isoformat() == "2026-11-05"
+    assert route["Koszt dzienny (€)"] == 240.0 and route["Stawka €/km"] == round(2500 / 1100, 2)
+    assert sum(o["Marża łącznie (€)"] for o in orders) == route["Marża łącznie (€)"] == 1300.0     # koszty rozdzielone bez reszty
+    assert orders[0]["Płatność do"] == "04.12.2026" and orders[0]["Termin płatności"] == "30 dni"
+    assert orders[0]["Skąd"] == "GB · Londyn" and orders[0]["Koszt razem (€)"] is None
+    assert not {"Status", "Tagi", "Odcinki", "Pojazd (zestaw)", "Kierowca"} & set(rs.COLUMNS) and "Marża łącznie (€)" in rs.COLUMNS
+
+
+def test_sheet_edits_roundtrip_and_paid_sections():
+    import copy
+    from ltl import route_sheet as rs
+    plan = _sheet_plan()
+    route, orders, _ = rs.build_sheet("TR-1", plan, None, None, None, None)
+    df = rs.sheet_frame(orders)
+    assert not rs.apply_sheet_edits(copy.deepcopy(plan), df)                      # bez zmian = bez zapisu
+    df.loc[0, ["Frachty (€)", "Płatność status", "Termin płatności", "Dyspozytor"]] = [1700, "opłacone", "45 dni", "Ala"]
+    df.loc[1, "Płatność status"] = "nieznany"                                       # spoza listy = bez zmiany
+    assert rs.apply_sheet_edits(plan, df)
+    o = plan["orders"][0]
+    assert (o["price_eur"], o["pay_status"], o["pay_term_days"], o["dispatcher"]) == (1700, "opłacone", 45, "Ala")
+    assert plan["orders"][1]["pay_status"] == "nieopłacone"
+    paid = rs.clean_paid_sections([{"kind": None, "name": "Dover-Calais", "cost_eur": 120}, {"kind": "Pociąg", "name": "", "cost_eur": None},
+                                   {"kind": None, "name": None, "cost_eur": None}])
+    assert paid == [{"kind": "Prom", "name": "Dover-Calais", "cost_eur": 120.0}, {"kind": "Pociąg", "name": "", "cost_eur": 0.0}]
+    plan["paid_sections"] = paid
+    assert rs.paid_total(plan) == 120.0
+
+
+def test_store_routes_variants_numbering_and_migration(tmp_path):
+    import sqlite3
+    from ltl.storage import PlanConflict, Store
+    path = str(tmp_path / "r.db")
+    s = Store(path)
+    v = s.save_vehicle(name="A")
+    s.save_plan("group", "", v, {"orders": [{"id": "T1"}], "stops": []}, 0, "ala")
+    with sqlite3.connect(path) as c:
+        c.execute("DELETE FROM meta")                                               # baza sprzed migracji
+    s = Store(path)
+    [r1] = s.list_routes("group", "", v)
+    assert r1["code"].endswith("-0001") and s.list_variants(r1["id"])[0]["n_orders"] == 1
+    r2, var2 = s.create_route("group", "", v)
+    assert s.list_routes("group", "", v)[-1]["code"].endswith("-0002")
+    v2 = s.add_variant(r2, label="B")
+    assert [x["label"] for x in s.list_variants(r2)] == ["Wariant 1", "B"]
+    assert s.delete_variant(v2) and not s.delete_variant(var2)                       # ostatniego wariantu nie usuniemy
+    assert s.save_variant(var2, {"orders": [1, 2]}, 1, "x") == 2
+    with pytest.raises(PlanConflict):
+        s.save_variant(var2, {}, 1, "y")
+    s.move_route(r2, -1)
+    assert [r["id"] for r in s.list_routes("group", "", v)] == [r2, r1["id"]]
+    assert s.routes_overview("group", "")[v]["n_routes"] == 2
+    s.delete_vehicle(v)
+    assert s.list_routes("group", "", v) == []
+
+
+def test_geocoder_place_name_uses_zippopotam_then_caches(tmp_path, monkeypatch):
+    import io, json as _json
+    from ltl import geo
+    calls = []
+
+    class Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(url, timeout=0):
+        calls.append(url)
+        return Resp(_json.dumps({"places": [{"place name": "Berlin", "latitude": "52.5", "longitude": "13.4"}]}).encode())
+
+    monkeypatch.setattr(geo.urllib.request, "urlopen", fake_urlopen)
+    g = geo.Geocoder(online=True, cache_path=tmp_path / "gc.json")
+    assert g.place_name("DE", "10115") == "Berlin" and len(calls) == 1
+    assert g.place_name("DE", "10115") == "Berlin" and len(calls) == 1            # drugi raz z cache
+    g.save()
+    assert geo.Geocoder(online=False, cache_path=tmp_path / "gc.json").place_name("DE", "10115") == "Berlin"
+    assert geo.Geocoder(online=False, cache_path=None).place_name("FR", "75001") == ""   # offline bez cache: puste
